@@ -1,7 +1,7 @@
 [project]
 name = "nexasalon-api"
 version = "0.1.0"
-description = "Backend do NexaSalon — Etapa 2B: modelos de domínio e migrations."
+description = "Backend do NexaSalon."
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.115",
@@ -10,10 +10,11 @@ dependencies = [
   "pydantic>=2.7",
   "pydantic-settings>=2.3",
   "psycopg[binary]>=3.1",
+  "uvicorn[standard]>=0.30",
 ]
 
 [project.optional-dependencies]
-dev = ["pgserver"]
+dev = ["pgserver", "pytest>=8", "httpx>=0.27"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

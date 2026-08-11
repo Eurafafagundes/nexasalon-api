@@ -6,6 +6,8 @@ __pycache__/
 !.env.example
 *.egg-info/
 .pgdata/
+.pgdata_test/
+.pytest_cache/
 *.pem
 *.key
 *.sqlite3
