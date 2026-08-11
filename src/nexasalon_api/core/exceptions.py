@@ -39,3 +39,27 @@ class ValidationDomainError(DomainError):
 
     status_code = 422
     error_type = "validation_error"
+
+
+class UnauthorizedError(DomainError):
+    """Credenciais ausentes, inválidas, expiradas ou token revogado —
+    quem está pedindo não está autenticado."""
+
+    status_code = 401
+    error_type = "unauthorized"
+
+
+class ForbiddenError(DomainError):
+    """Autenticado, mas sem a permissão/role necessária para a ação —
+    ou membership inativa/removida na organização atual."""
+
+    status_code = 403
+    error_type = "forbidden"
+
+
+class TooManyRequestsError(DomainError):
+    """Limite de tentativas excedido num endpoint sensível (login,
+    refresh, seleção de organização) — ver `core/rate_limit.py`."""
+
+    status_code = 429
+    error_type = "rate_limited"

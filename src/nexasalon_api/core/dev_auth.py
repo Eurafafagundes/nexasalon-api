@@ -20,7 +20,6 @@ autenticação real existir, ela é substituída inteiramente — não
 "desligada por flag" dentro da mesma função.
 """
 import uuid
-from dataclasses import dataclass
 
 from fastapi import HTTPException
 from sqlalchemy import text
@@ -28,8 +27,9 @@ from sqlalchemy import text
 from nexasalon_api.models.enums import MembershipStatus
 from nexasalon_api.models.identity import OrganizationMembership, User
 from nexasalon_api.models.organization import Organization
-from nexasalon_api.models.rbac import Role
+from nexasalon_api.models.rbac import Role, RolePermission
 
+from .actor import ActorContext  # noqa: F401 (reexportado — ver docstring de actor.py)
 from .config import settings
 from .db import SessionLocal
 
@@ -40,17 +40,6 @@ DEV_USER_ID = uuid.UUID("00000000-0000-0000-0000-0000000000f2")
 DEV_ROLE_ID = uuid.UUID("00000000-0000-0000-0000-0000000000f3")
 DEV_MEMBERSHIP_ID = uuid.UUID("00000000-0000-0000-0000-0000000000f4")
 DEV_ORG_SLUG = "dev-only-do-not-use-in-production"
-
-
-@dataclass(frozen=True)
-class ActorContext:
-    """Contexto do ator autenticado — organização + usuário + membership.
-    Em produção isso virá da sessão/JWT real; aqui vem fixo."""
-
-    organization_id: uuid.UUID
-    user_id: uuid.UUID
-    membership_id: uuid.UUID
-    role_id: uuid.UUID
 
 
 def _ensure_dev_seed() -> ActorContext:
@@ -105,6 +94,24 @@ def _ensure_dev_seed() -> ActorContext:
             )
             session.flush()
 
+        # "Dev Owner" recebe TODAS as permissions do catálogo — não porque
+        # isso reflita algum role real, mas porque o DEV ONLY actor precisa
+        # conseguir exercitar rotas protegidas por `require_permission`
+        # durante o desenvolvimento local. Idempotente: só insere as que
+        # ainda não existem para este role.
+        existing_keys = set(
+            session.scalars(
+                text("SELECT permission_key FROM role_permissions WHERE role_id = :rid").bindparams(
+                    rid=DEV_ROLE_ID
+                )
+            ).all()
+        )
+        all_keys = set(session.scalars(text("SELECT key FROM permissions")).all())
+        for key in all_keys - existing_keys:
+            session.add(RolePermission(role_id=DEV_ROLE_ID, permission_key=key))
+        if all_keys - existing_keys:
+            session.flush()
+
         session.commit()
 
     return ActorContext(
@@ -112,6 +119,9 @@ def _ensure_dev_seed() -> ActorContext:
         user_id=DEV_USER_ID,
         membership_id=DEV_MEMBERSHIP_ID,
         role_id=DEV_ROLE_ID,
+        role_name="Dev Owner",
+        permissions=frozenset(all_keys),
+        professional_id=None,
     )
 
 

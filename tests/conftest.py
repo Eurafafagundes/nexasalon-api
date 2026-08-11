@@ -61,6 +61,11 @@ os.environ["NEXASALON_DATABASE_URL"] = (
 )
 os.environ["NEXASALON_ENVIRONMENT"] = "test"
 os.environ["NEXASALON_DEV_AUTH_ENABLED"] = "true"
+# TestClient fala com o app via http (não https) — o atributo Secure do
+# cookie de refresh (core/config.py) faria o httpx simplesmente descartar
+# o cookie de volta, quebrando qualquer teste que dependa dele. Só testes
+# usam isto; o guard de produção em Settings recusa este valor fora daqui.
+os.environ["NEXASALON_REFRESH_COOKIE_SECURE"] = "false"
 
 # só agora é seguro importar qualquer coisa de nexasalon_api.
 import pytest  # noqa: E402
@@ -74,7 +79,7 @@ from nexasalon_api.main import app  # noqa: E402
 from nexasalon_api.models.enums import MembershipStatus  # noqa: E402
 from nexasalon_api.models.identity import OrganizationMembership, User  # noqa: E402
 from nexasalon_api.models.organization import Organization  # noqa: E402
-from nexasalon_api.models.rbac import Role  # noqa: E402
+from nexasalon_api.models.rbac import Role, RolePermission  # noqa: E402
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -84,7 +89,14 @@ def pytest_sessionfinish(session, exitstatus):
 def seed_organization(name: str, slug: str) -> ActorContext:
     """Cria uma organização de teste completa (org + role + user +
     membership) e devolve o ActorContext correspondente — usado pra
-    simular uma segunda empresa nos testes de isolamento multi-tenant."""
+    simular uma segunda empresa nos testes de isolamento multi-tenant.
+
+    O role "Owner" fabricado aqui recebe TODAS as permissions do catálogo
+    (mesmo truque do "Dev Owner" em `core/dev_auth.py`) — desde que as
+    rotas da Etapa 2C passaram a exigir `require_permission` (Etapa 2D),
+    um `ActorContext` sem permissões apanharia 403 em tudo. Estes testes
+    continuam validando regra de negócio/isolamento multi-tenant, não
+    RBAC — RBAC tem cobertura própria em `test_auth.py`."""
     org_id, user_id, role_id, membership_id = (uuid.uuid4() for _ in range(4))
     with SessionLocal() as session:
         session.execute(text("SELECT set_config('app.current_org_id', :oid, true)"), {"oid": str(org_id)})
@@ -93,6 +105,10 @@ def seed_organization(name: str, slug: str) -> ActorContext:
         session.add(User(id=user_id, email=f"{slug}@nexasalon.local", name=f"Usuário {name}"))
         session.flush()
         session.add(Role(id=role_id, organization_id=org_id, name="Owner", is_system=False))
+        session.flush()
+        all_keys = list(session.scalars(text("SELECT key FROM permissions")).all())
+        for key in all_keys:
+            session.add(RolePermission(role_id=role_id, permission_key=key))
         session.flush()
         session.add(
             OrganizationMembership(
@@ -104,7 +120,14 @@ def seed_organization(name: str, slug: str) -> ActorContext:
             )
         )
         session.commit()
-    return ActorContext(organization_id=org_id, user_id=user_id, membership_id=membership_id, role_id=role_id)
+    return ActorContext(
+        organization_id=org_id,
+        user_id=user_id,
+        membership_id=membership_id,
+        role_id=role_id,
+        role_name="Owner",
+        permissions=frozenset(all_keys),
+    )
 
 
 @pytest.fixture()

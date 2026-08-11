@@ -32,3 +32,10 @@ def create(session: Session, organization_id: uuid.UUID, **fields) -> Profession
 def save(session: Session, professional: Professional) -> Professional:
     session.flush()
     return professional
+
+
+def get_by_user(session: Session, organization_id: uuid.UUID, user_id: uuid.UUID) -> Professional | None:
+    stmt = select(Professional).where(
+        Professional.organization_id == organization_id, Professional.user_id == user_id
+    )
+    return session.scalars(stmt).first()

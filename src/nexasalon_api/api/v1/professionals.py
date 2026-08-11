@@ -3,8 +3,8 @@ import uuid
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
-from nexasalon_api.api.deps import get_current_actor, get_db
-from nexasalon_api.core.dev_auth import ActorContext
+from nexasalon_api.api.deps import get_db, require_permission
+from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.schemas.professional import (
     ProfessionalCreate,
     ProfessionalRead,
@@ -18,12 +18,15 @@ from nexasalon_api.services import professionals as professionals_service
 
 router = APIRouter(prefix="/professionals", tags=["professionals"])
 
+_view = require_permission("professionals.view")
+_manage = require_permission("professionals.manage")
+
 
 @router.get("", response_model=list[ProfessionalRead], summary="Listar profissionais")
 def list_professionals(
     include_inactive: bool = False,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_view),
 ) -> list[ProfessionalRead]:
     professionals = professionals_service.list_professionals(session, actor.organization_id, include_inactive)
     return [ProfessionalRead.model_validate(p) for p in professionals]
@@ -35,7 +38,7 @@ def list_professionals(
 def create_professional(
     payload: ProfessionalCreate,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_manage),
 ) -> ProfessionalRead:
     professional = professionals_service.create_professional(session, actor.organization_id, payload)
     return ProfessionalRead.model_validate(professional)
@@ -45,7 +48,7 @@ def create_professional(
 def get_professional(
     professional_id: uuid.UUID,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_view),
 ) -> ProfessionalRead:
     professional = professionals_service.get_professional(session, actor.organization_id, professional_id)
     return ProfessionalRead.model_validate(professional)
@@ -56,7 +59,7 @@ def update_professional(
     professional_id: uuid.UUID,
     payload: ProfessionalUpdate,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_manage),
 ) -> ProfessionalRead:
     professional = professionals_service.update_professional(
         session, actor.organization_id, professional_id, payload
@@ -68,7 +71,7 @@ def update_professional(
 def activate_professional(
     professional_id: uuid.UUID,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_manage),
 ) -> ProfessionalRead:
     professional = professionals_service.set_professional_active(
         session, actor.organization_id, professional_id, True
@@ -82,7 +85,7 @@ def activate_professional(
 def deactivate_professional(
     professional_id: uuid.UUID,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_manage),
 ) -> ProfessionalRead:
     professional = professionals_service.set_professional_active(
         session, actor.organization_id, professional_id, False
@@ -98,7 +101,7 @@ def deactivate_professional(
 def list_working_hours(
     professional_id: uuid.UUID,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_view),
 ) -> list[WorkingHourRead]:
     rows = professionals_service.list_working_hours(session, actor.organization_id, professional_id)
     return [WorkingHourRead.model_validate(r) for r in rows]
@@ -113,7 +116,7 @@ def replace_working_hours(
     professional_id: uuid.UUID,
     payload: WorkingHoursReplaceRequest,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_manage),
 ) -> list[WorkingHourRead]:
     rows = professionals_service.replace_working_hours(
         session, actor.organization_id, professional_id, payload.items
@@ -129,7 +132,7 @@ def replace_working_hours(
 def list_professional_services(
     professional_id: uuid.UUID,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_view),
 ) -> list[ProfessionalServiceRead]:
     rows = professionals_service.list_professional_services(session, actor.organization_id, professional_id)
     return [ProfessionalServiceRead.model_validate(r) for r in rows]
@@ -144,7 +147,7 @@ def replace_professional_services(
     professional_id: uuid.UUID,
     payload: ProfessionalServicesReplaceRequest,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_manage),
 ) -> list[ProfessionalServiceRead]:
     rows = professionals_service.replace_professional_services(
         session, actor.organization_id, professional_id, payload.items

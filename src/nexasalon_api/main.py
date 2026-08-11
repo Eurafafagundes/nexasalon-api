@@ -1,20 +1,39 @@
 from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 
 from nexasalon_api.api.v1.router import api_v1_router
+from nexasalon_api.core.config import settings
 from nexasalon_api.core.exceptions import DomainError
 
 app = FastAPI(
     title="NexaSalon API",
     description=(
-        "Backend do NexaSalon. Etapa 2C: primeira API funcional "
-        "(Organization/Branch, Professionals, Services, Clients). "
-        "Agenda/Appointment ainda não implementados."
+        "Backend do NexaSalon. Etapa 2D: autenticação real (JWT + refresh "
+        "token em cookie HttpOnly), RBAC completo, gestão de "
+        "usuários/memberships. Agenda/Appointment/Financeiro ainda não "
+        "implementados; frontend Next.js ainda não conectado."
     ),
     version="0.1.0",
+)
+
+# CORS: allowlist explícita (nunca "*"), obrigatória porque
+# `allow_credentials=True` é o que permite o browser enviar o cookie
+# HttpOnly do refresh token em requisições cross-origin — e os browsers
+# proíbem combinar allow_credentials com Access-Control-Allow-Origin
+# coringa. Quando o frontend (Next.js) estiver em outro domínio/subdomínio
+# da API, o origin dele precisa estar em NEXASALON_CORS_ALLOWED_ORIGINS.
+# Vazio por padrão: sem origins configuradas, nenhum browser consegue
+# fazer request cross-origin autenticado — falha fechada, não aberta.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", settings.csrf_header_name],
 )
 
 

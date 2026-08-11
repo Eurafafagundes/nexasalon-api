@@ -6,6 +6,7 @@ tabelas ao gerar/rodar migrations — cada módulo de model precisa estar
 importado aqui, senão fica invisível para o autogenerate.
 """
 from .base import Base  # noqa: F401
+from .auth import RefreshToken  # noqa: F401
 from .organization import Organization, Branch  # noqa: F401
 from .rbac import Role, Permission, RolePermission  # noqa: F401
 from .identity import User, OrganizationMembership, MembershipPermissionOverride  # noqa: F401
@@ -18,6 +19,7 @@ from .audit import AuditLog  # noqa: F401
 
 __all__ = [
     "Base",
+    "RefreshToken",
     "Organization",
     "Branch",
     "Role",

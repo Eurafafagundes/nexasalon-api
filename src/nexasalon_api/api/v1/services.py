@@ -7,8 +7,8 @@ import uuid
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
-from nexasalon_api.api.deps import get_current_actor, get_db
-from nexasalon_api.core.dev_auth import ActorContext
+from nexasalon_api.api.deps import get_db, require_permission
+from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.repositories import professional_service_repo
 from nexasalon_api.schemas.professional import ProfessionalServiceRead
 from nexasalon_api.schemas.service import ServiceCreate, ServiceRead, ServiceUpdate
@@ -16,12 +16,15 @@ from nexasalon_api.services import catalog
 
 router = APIRouter(prefix="/services", tags=["services"])
 
+_view = require_permission("services.view")
+_manage = require_permission("services.manage")
+
 
 @router.get("", response_model=list[ServiceRead], summary="Listar serviços")
 def list_services(
     include_inactive: bool = False,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_view),
 ) -> list[ServiceRead]:
     services = catalog.list_services(session, actor.organization_id, include_inactive)
     return [ServiceRead.model_validate(s) for s in services]
@@ -31,7 +34,7 @@ def list_services(
 def create_service(
     payload: ServiceCreate,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_manage),
 ) -> ServiceRead:
     service = catalog.create_service(session, actor.organization_id, payload)
     return ServiceRead.model_validate(service)
@@ -41,7 +44,7 @@ def create_service(
 def get_service(
     service_id: uuid.UUID,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_view),
 ) -> ServiceRead:
     service = catalog.get_service(session, actor.organization_id, service_id)
     return ServiceRead.model_validate(service)
@@ -52,7 +55,7 @@ def update_service(
     service_id: uuid.UUID,
     payload: ServiceUpdate,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_manage),
 ) -> ServiceRead:
     service = catalog.update_service(session, actor.organization_id, service_id, payload)
     return ServiceRead.model_validate(service)
@@ -62,7 +65,7 @@ def update_service(
 def activate_service(
     service_id: uuid.UUID,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_manage),
 ) -> ServiceRead:
     service = catalog.set_service_active(session, actor.organization_id, service_id, True)
     return ServiceRead.model_validate(service)
@@ -72,7 +75,7 @@ def activate_service(
 def deactivate_service(
     service_id: uuid.UUID,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_manage),
 ) -> ServiceRead:
     service = catalog.set_service_active(session, actor.organization_id, service_id, False)
     return ServiceRead.model_validate(service)
@@ -86,7 +89,7 @@ def deactivate_service(
 def list_service_professionals(
     service_id: uuid.UUID,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(get_current_actor),
+    actor: ActorContext = Depends(_view),
 ) -> list[ProfessionalServiceRead]:
     # confirma que o serviço é da org atual antes de listar (404 se não for/existir)
     catalog.get_service(session, actor.organization_id, service_id)
