@@ -40,6 +40,25 @@ def list_for_service(
     return list(session.scalars(stmt).all())
 
 
+def get_for_pair(
+    session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID, service_id: uuid.UUID
+) -> ProfessionalService | None:
+    """A ligação profissional<->serviço é a FONTE DA VERDADE de "este
+    profissional presta este serviço" — usada tanto pra validar um
+    agendamento quanto pra achar a duração/preço efetivos (override, se
+    houver, senão o default do Service)."""
+    stmt = (
+        select(ProfessionalService)
+        .join(Professional, Professional.id == ProfessionalService.professional_id)
+        .where(
+            ProfessionalService.professional_id == professional_id,
+            ProfessionalService.service_id == service_id,
+            Professional.organization_id == organization_id,
+        )
+    )
+    return session.scalars(stmt).first()
+
+
 def replace_all(
     session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID, items: list[dict]
 ) -> list[ProfessionalService]:

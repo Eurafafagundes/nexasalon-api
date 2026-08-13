@@ -140,6 +140,22 @@ def require_permission(permission_key: str):
     return _dependency
 
 
+def require_any_permission(*permission_keys: str):
+    """Como `require_permission`, mas passa se o ator tiver PELO MENOS
+    UMA das permissions informadas — uso típico: uma rota de leitura que
+    aceita tanto `agenda.view_own` quanto `agenda.view_all` (a diferença
+    de ESCOPO dentro da rota, não se ela é acessível, fica por conta do
+    service layer)."""
+
+    def _dependency(actor: ActorContext = Depends(get_current_actor)) -> ActorContext:
+        if not any(key in actor.permissions for key in permission_keys):
+            keys = "' ou '".join(permission_keys)
+            raise ForbiddenError(f"Permissão '{keys}' é necessária para esta ação.")
+        return actor
+
+    return _dependency
+
+
 def _client_ip(request: Request) -> str:
     # Atrás de um proxy/load balancer, isto precisará ler
     # `X-Forwarded-For` (primeiro IP da lista) em vez de `request.client`
