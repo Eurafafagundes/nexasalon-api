@@ -11,6 +11,7 @@ from nexasalon_api.core.exceptions import ValidationDomainError
 from nexasalon_api.models.enums import AppointmentStatus
 from nexasalon_api.repositories import branch_repo, organization_repo
 from nexasalon_api.schemas.agenda import AgendaItemRead, AvailabilitySlotRead
+from nexasalon_api.schemas.professional import ProfessionalRead
 from nexasalon_api.services import agenda as agenda_service
 from nexasalon_api.services import availability as availability_service
 
@@ -80,6 +81,25 @@ def get_agenda(
         professional_id=professional_id, service_id=service_id, status=status,
     )
     return [_to_agenda_item_read(item) for item in items]
+
+
+@router.get(
+    "/professionals",
+    response_model=list[ProfessionalRead],
+    summary="Colunas dinâmicas da Agenda principal (profissionais ativos com agenda habilitada)",
+)
+def get_schedule_columns(
+    branch_id: uuid.UUID | None = Query(None),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view_agenda),
+) -> list[ProfessionalRead]:
+    """Monta a lista de colunas 100% a partir do banco (`is_active` +
+    `has_schedule` + `show_on_main_schedule`, ordenado por
+    `display_order`) — nunca uma lista fixa. Cadastrar um profissional
+    novo e habilitar estas 3 flags é suficiente pra ele aparecer aqui
+    sem qualquer alteração de código."""
+    professionals = agenda_service.list_schedule_columns(session, actor, branch_id=branch_id)
+    return [ProfessionalRead.model_validate(p) for p in professionals]
 
 
 @router.get(

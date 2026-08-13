@@ -23,6 +23,17 @@ class Professional(Base, UUIDPKMixin, TimestampMixin):
 
     `user_id` é a única FK canônica do vínculo com login — ver ajuste 1 e
     o comentário em `OrganizationMembership.professional` (identity.py).
+
+    Revisão de domínio (Etapa 3B-prep): um Professional pode existir SEM
+    agenda própria (ex.: um gerente que não atende clientes) — por isso
+    `has_schedule` é uma flag separada de `is_active`. As quatro flags
+    abaixo controlam exclusivamente COMO ele aparece na Agenda, nunca O
+    QUE ele é — não têm significado especial pra nenhum nome/cargo
+    específico, servem igual pra qualquer tipo de negócio (salão,
+    barbearia, clínica de estética, nail designer etc.). A Agenda
+    principal monta suas colunas dinamicamente a partir destas flags
+    (ver `services/agenda.py::list_schedule_columns`), nunca de uma
+    lista fixa no código.
     """
 
     __tablename__ = "professionals"
@@ -52,6 +63,19 @@ class Professional(Base, UUIDPKMixin, TimestampMixin):
     title: Mapped[str | None] = mapped_column(String(120))
     agenda_color: Mapped[str] = mapped_column(String(7), nullable=False, server_default="#8B5CF6")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+
+    # Configuração de Agenda (revisão de domínio) — `agenda_color` acima
+    # JÁ cobre "cor configurável"; não duplicamos como `schedule_color`.
+    has_schedule: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )  # false = profissional sem agenda própria (ex.: gerente/back-office)
+    show_on_main_schedule: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )  # false = tem agenda, mas não aparece como coluna na Agenda principal
+    allow_online_booking: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )  # false = só agendável internamente, não aparece no agendamento público
+    display_order: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0")
 
     working_hours: Mapped[list["WorkingHours"]] = relationship(back_populates="professional")
 

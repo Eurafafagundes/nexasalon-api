@@ -25,6 +25,13 @@ class Organization(Base, UUIDPKMixin, TimestampMixin):
     email: Mapped[str | None] = mapped_column(String(255))
     phone: Mapped[str | None] = mapped_column(String(32))
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="America/Sao_Paulo")
+    # Texto livre de propósito, NUNCA um enum fechado — serve só de
+    # metadado pra onboarding/templates/linguagem de interface (ex.:
+    # "barbearia", "salao_beleza", "estetica", "nail_designer", "spa").
+    # Nenhuma regra de negócio, serviço ou funcionalidade pode ficar
+    # condicionada a este valor: uma barbearia pode cadastrar "Massagem",
+    # um salão pode cadastrar "Barba" — o sistema nunca impede.
+    business_type: Mapped[str | None] = mapped_column(String(50))
     status: Mapped[OrganizationStatus] = mapped_column(
         pg_enum(OrganizationStatus, "organization_status"),
         nullable=False,

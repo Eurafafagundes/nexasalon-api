@@ -15,7 +15,8 @@ from sqlalchemy.orm import Session
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.models.appointment import AppointmentItem
 from nexasalon_api.models.enums import AppointmentStatus
-from nexasalon_api.repositories import appointment_item_repo
+from nexasalon_api.models.professional import Professional
+from nexasalon_api.repositories import appointment_item_repo, professional_repo
 
 VIEW_ALL_PERMISSION = "agenda.view_all"
 VIEW_OWN_PERMISSION = "agenda.view_own"
@@ -55,3 +56,19 @@ def list_agenda(
         service_id=service_id,
         status=status,
     )
+
+
+def list_schedule_columns(
+    session: Session, actor: ActorContext, *, branch_id: uuid.UUID | None = None
+) -> list[Professional]:
+    """As colunas da Agenda PRINCIPAL — profissionais ativos com agenda
+    habilitada e visível na grade principal (ver
+    `professional_repo.list_schedule_columns`). Um ator só com
+    `agenda.view_own` recebe, no máximo, a própria coluna (nunca as dos
+    colegas) — mesma lógica anti-leak de `list_agenda`."""
+    columns = professional_repo.list_schedule_columns(session, actor.organization_id, branch_id)
+    if VIEW_ALL_PERMISSION in actor.permissions:
+        return columns
+    if VIEW_OWN_PERMISSION not in actor.permissions or actor.professional_id is None:
+        return []
+    return [p for p in columns if p.id == actor.professional_id]

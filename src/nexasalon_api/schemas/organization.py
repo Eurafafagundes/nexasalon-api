@@ -17,5 +17,6 @@ class OrganizationRead(BaseModel):
     phone: str | None
     timezone: str
     status: OrganizationStatus
+    business_type: str | None
     created_at: datetime
     updated_at: datetime

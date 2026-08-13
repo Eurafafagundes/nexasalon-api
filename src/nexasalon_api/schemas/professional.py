@@ -16,6 +16,14 @@ class ProfessionalBase(BaseModel):
     title: str | None = Field(default=None, max_length=120)
     agenda_color: str = Field(default="#8B5CF6", pattern=r"^#[0-9A-Fa-f]{6}$")
 
+    # Configuração de Agenda — controla exclusivamente COMO (e se) este
+    # profissional aparece na Agenda/agendamento público. Um profissional
+    # pode existir sem agenda própria (`has_schedule=False`, ex.: gerente).
+    has_schedule: bool = True
+    show_on_main_schedule: bool = True
+    allow_online_booking: bool = True
+    display_order: int = Field(default=0, ge=0, le=32767)
+
 
 class ProfessionalCreate(ProfessionalBase):
     pass

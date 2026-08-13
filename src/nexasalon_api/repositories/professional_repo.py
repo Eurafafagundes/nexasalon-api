@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from nexasalon_api.models.professional import Professional
@@ -39,3 +39,32 @@ def get_by_user(session: Session, organization_id: uuid.UUID, user_id: uuid.UUID
         Professional.organization_id == organization_id, Professional.user_id == user_id
     )
     return session.scalars(stmt).first()
+
+
+def list_schedule_columns(
+    session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID | None = None
+) -> list[Professional]:
+    """Profissionais que devem virar COLUNA na Agenda principal — monta
+    a lista dinamicamente a partir de 3 flags de configuração, nunca de
+    uma lista fixa: `is_active`, `has_schedule` (existe agenda pra ele) e
+    `show_on_main_schedule` (aparece na grade principal, não só em
+    agendas individuais). Ordenado por `display_order` (a ordem que a
+    própria organização escolheu), com o nome como desempate estável.
+
+    `branch_id`, se informado, inclui tanto quem atende SÓ naquela
+    unidade quanto quem atende em qualquer unidade (`branch_id IS NULL`
+    no Professional — mesma convenção usada na validação de
+    agendamento, ver `services/appointments.py`)."""
+    stmt = (
+        select(Professional)
+        .where(
+            Professional.organization_id == organization_id,
+            Professional.is_active.is_(True),
+            Professional.has_schedule.is_(True),
+            Professional.show_on_main_schedule.is_(True),
+        )
+    )
+    if branch_id is not None:
+        stmt = stmt.where(or_(Professional.branch_id.is_(None), Professional.branch_id == branch_id))
+    stmt = stmt.order_by(Professional.display_order, Professional.name)
+    return list(session.scalars(stmt).all())
