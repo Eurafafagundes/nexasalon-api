@@ -115,7 +115,10 @@ def _get_real_current_actor(
 def get_current_actor(
     credentials: HTTPAuthorizationCredentials | None = Security(_bearer_scheme),
 ) -> ActorContext:
-    if settings.dev_auth_enabled and settings.environment != "production":
+    # `not in (staging, production)` — mesma trava dupla de
+    # `core/config.py` (que já recusa a aplicação subir com dev_auth=true
+    # nesses ambientes), reforçada aqui em runtime como segunda barreira.
+    if settings.dev_auth_enabled and settings.environment not in ("staging", "production"):
         return get_current_actor_DEV_ONLY()
     return _get_real_current_actor(credentials)
 
@@ -157,10 +160,64 @@ def require_any_permission(*permission_keys: str):
 
 
 def _client_ip(request: Request) -> str:
-    # Atrás de um proxy/load balancer, isto precisará ler
-    # `X-Forwarded-For` (primeiro IP da lista) em vez de `request.client`
-    # — deixado como próximo passo junto do deploy real, documentado
-    # aqui de propósito pra não ser esquecido.
+    """IP do cliente para as chaves de rate limiting (`login:<ip>` etc.).
+
+    Isto NÃO é uma verdade genérica sobre `X-Forwarded-For` — é uma
+    decisão por PROVEDOR, por isso lida de `settings.client_ip_strategy`
+    (ver docstring do campo em `core/config.py`) em vez de fixa no
+    código. Revisão feita explicitamente a pedido do usuário: reavaliar
+    se é seguro confiar cegamente na primeira posição do header antes
+    de usá-la pra rate limiting.
+
+    NÃO usamos o `ProxyHeadersMiddleware`/`--proxy-headers` genérico do
+    uvicorn nem `--forwarded-allow-ips='*'`. Esse mecanismo assume a
+    topologia mais comum, onde o proxy ANEXA o IP real ao FINAL da
+    lista `X-Forwarded-For` e você configura quantos "saltos" confiar a
+    partir da direita — o oposto do que a Render faz (ver abaixo), o
+    que tornaria esse mecanismo genérico explorável aqui.
+
+    O QUE FOI VERIFICADO (Etapa 3C):
+    A topologia real, confirmada por documentação oficial da Render
+    ("How Render handles DDoS attacks", render.com/articles, abr/2026):
+    todo tráfego passa por Cloudflare e DEPOIS pelo Load Balancer da
+    Render antes de chegar no processo da aplicação — não há rota
+    direta até o uvicorn. O mesmo artigo (seção "Rate limiting"), ao
+    ensinar como fazer rate limiting por IP na própria Render, usa
+    exatamente `x-forwarded-for.split(',')[0]` como exemplo oficial —
+    ou seja, a própria Render instrui os clientes a confiar na primeira
+    posição do header pra esse fim. Um tópico do fórum de feedback da
+    Render descreve o mecanismo por trás disso: a borda grava o IP real
+    do cliente na primeira posição em toda requisição, mas NÃO limpa
+    nada que o cliente já tenha mandado depois dela — um cliente
+    malicioso pode mandar `X-Forwarded-For: 1.1.1.1, 2.2.2.2` e o header
+    que a aplicação recebe fica `<ip-real>, 1.1.1.1, 2.2.2.2`.
+
+    LIMITAÇÃO HONESTA: isso é documentação de produto/comunidade da
+    Render, não uma especificação formal e assinada do header — a
+    garantia depende da Render manter esse comportamento (posição 0
+    sempre escrita pela borda, nunca pelo cliente) e não temos como
+    validar isso de dentro da aplicação, só confiar no que está
+    documentado. Por isso a posição 0 é a ÚNICA posição usada (nunca a
+    última, nunca "N saltos a partir da direita", nunca a lista
+    inteira) — e por isso a estratégia é trocável por config
+    (`client_ip_strategy=socket_only`) sem alterar código, caso essa
+    suposição precise ser revista (mudança de provedor, ou dúvida sobre
+    a topologia atual). `socket_only` usa só o peer TCP direto
+    (`request.client`) — na Render isso é o IP do próprio Load
+    Balancer, igual pra todo mundo, o que faz o rate limiting por IP
+    virar, na prática, um limite global do serviço; é o preço de não
+    confiar em nenhum header.
+
+    Em ambiente local/testes (sem proxy na frente), o header
+    simplesmente não vem e o fallback pro peer TCP é o comportamento
+    correto e esperado em qualquer uma das duas estratégias.
+    """
+    if settings.client_ip_strategy == "trust_first_proxy_hop":
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            real_ip = forwarded_for.split(",")[0].strip()
+            if real_ip:
+                return real_ip
     return request.client.host if request.client else "unknown"
 
 

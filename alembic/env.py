@@ -7,7 +7,13 @@ from nexasalon_api.core.config import settings
 from nexasalon_api.models import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Etapa 3C: migrations preferem uma conexão ADMINISTRATIVA separada
+# (dono do schema), nunca o role restrito `nexasalon_app` que a API usa
+# em runtime — RLS não se aplica ao dono da tabela, então rodar DDL como
+# `nexasalon_app` simplesmente falharia (e não deveria "funcionar" por
+# acidente via bypass). Sem `NEXASALON_MIGRATIONS_DATABASE_URL` setada,
+# cai em `database_url` — comportamento local/testes inalterado.
+config.set_main_option("sqlalchemy.url", settings.migrations_database_url or settings.database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

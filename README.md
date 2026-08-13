@@ -32,13 +32,23 @@ alembic upgrade head
 - `0006` — amplia a policy RLS de `organization_memberships` com auto-acesso via `app.current_user_id`, pra permitir listar as próprias memberships entre organizações no login (antes de qualquer `app.current_org_id` existir)
 - `0007` — seed do catálogo de permissions (20 chaves, granularidade `*.view`/`*.manage` por recurso) e dos 4 roles de sistema (OWNER/ADMIN/RECEPTIONIST/PROFESSIONAL)
 - `0008` — corrige todas as policies RLS do projeto para usar `NULLIF(current_setting(...), '')::uuid` em vez do cast direto — parâmetros de sessão customizados do Postgres voltam pra string vazia (não `NULL`) depois do primeiro commit numa conexão reaproveitada por pool, o que quebrava algumas queries de auth com erro 500 não-determinístico antes desta correção
+- `0009` — dinamismo total do domínio (categorias de serviço, config de agenda por profissional/serviço, `business_type` como metadado)
+- `0010` — configuração de apresentação da Agenda por unidade (`agenda_view_start/end`, `agenda_slot_minutes`)
+
+### Rodando migrations em staging/produção
+
+`alembic upgrade head` deve rodar com `NEXASALON_MIGRATIONS_DATABASE_URL`
+apontando pro role administrativo (dono do schema), **nunca**
+automaticamente no boot de cada instância da API — ver seção "Ambientes
+(local/staging/produção)" mais abaixo para o fluxo completo.
 
 ## Papel de conexão da aplicação e RLS
 
 As migrations rodam como o usuário "dono" do schema. A API **não pode**
-se conectar com esse mesmo usuário em produção — RLS não é aplicado ao
-dono da tabela nem a superusuários, mesmo com `FORCE ROW LEVEL SECURITY`.
-Crie um role de aplicação restrito antes de apontar a API pro banco:
+se conectar com esse mesmo usuário em staging/produção — RLS não é
+aplicado ao dono da tabela nem a superusuários, mesmo com `FORCE ROW
+LEVEL SECURITY`. Crie um role de aplicação restrito antes de apontar a
+API pro banco:
 
 ```sql
 CREATE ROLE nexasalon_app LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
@@ -197,3 +207,124 @@ Docker nem de um Postgres já rodando), roda as migrations, cria o role
 `nexasalon_app` e testa a API real através dele — os testes de
 isolamento multi-tenant só valem alguma coisa rodando dessa forma (não
 como superusuário).
+
+## Ambientes (local / staging / produção)
+
+`NEXASALON_ENVIRONMENT` aceita `development`, `test`, `staging` e
+`production`. `staging` tem exatamente as mesmas travas de segurança de
+`production` em `core/config.py` (recusa subir com DEV ONLY ligado, JWT
+secret default, cookie inseguro ou rate limit desligado) — a diferença
+entre os dois é só operacional (banco, domínio, dados), nunca de
+postura de segurança. `development`/`test` são os únicos ambientes onde
+essas travas ficam de fora.
+
+### Comando de start (staging/produção)
+
+```bash
+uvicorn nexasalon_api.main:app --host 0.0.0.0 --port $PORT --proxy-headers
+```
+
+- `--host 0.0.0.0`: obrigatório em qualquer PaaS — o processo precisa
+  aceitar conexões do proxy do provedor, não só de `localhost`.
+- `--port $PORT`: a porta nunca é fixa; o provedor injeta via env var.
+- Sem `--reload` (é só para desenvolvimento local).
+- `--proxy-headers`: usado só para o uvicorn confiar no `X-Forwarded-Proto`
+  do Render (necessário pro FastAPI saber que a requisição original era
+  HTTPS mesmo chegando por HTTP internamente) — **não** é usado para
+  extrair o IP do cliente (ver próxima seção, é um mecanismo à parte e
+  deliberadamente não-genérico).
+
+### IP real do cliente e rate limiting (por trás do proxy do Render)
+
+`api/deps.py::_client_ip` não usa a lógica padrão de "confiar nos
+últimos N saltos de `X-Forwarded-For`" (a que `--forwarded-allow-ips`
+do uvicorn implementa) porque o Render tem um comportamento diferente
+do padrão mais comum: eles **inserem o IP real do cliente como o
+primeiro elemento** de `X-Forwarded-For`, mas **não limpam** o que o
+cliente já tiver mandado depois dele. Ou seja, um cliente pode forjar
+`X-Forwarded-For: 1.1.1.1` e a aplicação recebe `<ip-real>, 1.1.1.1` —
+confiar em qualquer posição que não seja a primeira (ou na lista
+inteira) permitiria spoofing do rate limiter.
+
+**Evidência verificada (revisão pedida explicitamente antes do
+commit):** todo tráfego do Render passa por Cloudflare e depois pelo
+Load Balancer da Render antes de chegar na aplicação — não existe rota
+direta até o processo uvicorn. O artigo oficial ["How Render handles
+DDoS attacks"](https://render.com/articles/how-render-handles-ddos-attacks)
+(abr/2026), na seção "Rate limiting", usa como exemplo oficial
+`req.headers['x-forwarded-for']?.split(',')[0]` — ou seja, a própria
+Render instrui a confiar na primeira posição do header pra esse fim.
+Isso é consistente com um tópico do fórum de feedback da Render que
+descreve o mecanismo: a borda grava o IP real na posição 0 em toda
+requisição, sem nunca deixar o cliente sobrescrevê-la.
+
+**Limitação honesta, documentada por pedido explícito:** essa é
+documentação de produto/comunidade da Render, não uma especificação
+formal e assinada do header — a garantia depende da Render manter esse
+comportamento, e não há como validar isso de dentro da aplicação. Por
+isso:
+
+- a extração é uma função pequena e explícita, não um middleware
+  genérico: sempre o primeiro elemento do header, nunca outra posição,
+  nunca a lista inteira, com fallback pro peer TCP direto quando o
+  header não existe (dev local, testes);
+- a estratégia é **configurável, não fixa no código**
+  (`NEXASALON_CLIENT_IP_STRATEGY`, default `trust_first_proxy_hop`).
+  Se essa suposição precisar ser revista — mudança de provedor, dúvida
+  sobre a topologia atual — trocar para `socket_only` desliga
+  totalmente a leitura de `X-Forwarded-For` e usa só o peer TCP direto
+  (na Render, o IP do próprio Load Balancer, igual pra todas as
+  requisições). É um modo deliberadamente conservador: nunca forjável,
+  mas o rate limiting por IP vira, na prática, um limite global do
+  serviço em vez de por cliente — não é "grátis", é o preço de não
+  confiar em nenhum header;
+- ao trocar de provedor de hospedagem, revisar a evidência e o valor
+  default de `NEXASALON_CLIENT_IP_STRATEGY` — não é seguro reaproveitar
+  sem confirmar de novo o comportamento do proxy do novo provedor.
+
+### Bootstrap do primeiro usuário
+
+Não existe (nem deve existir) uma rota HTTP para criar o primeiro
+usuário/organização — seria uma rota de escalada de privilégio exposta
+publicamente. Use o CLI administrativo, rodado manualmente, uma vez,
+por ambiente:
+
+```bash
+NEXASALON_DATABASE_URL=<url-do-ambiente-alvo> python -m nexasalon_api.cli.bootstrap_owner
+```
+
+Pede organização/unidade/OWNER interativamente; a senha é lida com
+`getpass` (nunca por argumento de linha de comando, nunca com default) e
+recebe o mesmo hash Argon2id de qualquer outro usuário. Usa o role de
+sistema `OWNER` já semeado pela migration `0007` — ver
+`src/nexasalon_api/cli/bootstrap_owner.py`.
+
+### Logging
+
+`core/logging.py` configura `logging` pro stdout (nível via
+`NEXASALON_LOG_LEVEL`) — o provedor de deploy coleta stdout como log
+stream, sem precisar de nada além disso para staging. O handler global
+de exceção (`main.py`) agora **loga de verdade** o erro inesperado
+(`logger.exception`, com stack trace) antes de devolver o 500 genérico
+ao cliente — antes da Etapa 3C essa exceção desaparecia silenciosamente.
+Cada request ganha um `X-Request-Id` (gerado ou ecoado do que o cliente
+mandar) que aparece nos logs de erro para correlação.
+
+**Nunca logar**: senha, JWT (access ou refresh), o valor do cookie de
+refresh, `invite_token`/`org_selection_token`, ou o header
+`Authorization` inteiro — nenhum `logger.*` do projeto faz isso hoje;
+manter essa regra ao adicionar logging novo em qualquer rota.
+
+### Healthcheck e readiness
+
+- `GET /healthz` — liveness pura, não toca banco, sempre rápida. Usada
+  como Health Check Path do provedor.
+- `GET /readyz` — readiness: faz um `SELECT 1` real no Postgres.
+  Nenhum dos dois expõe connection string, stack trace ou qualquer dado
+  interno na resposta — erros vão pro log, não pro corpo da resposta.
+
+### Pool de conexões
+
+`NEXASALON_DB_POOL_SIZE`/`NEXASALON_DB_MAX_OVERFLOW` (defaults 5/10,
+os mesmos que o SQLAlchemy já usava implicitamente) — ajustável sem
+mexer em código se o Postgres gerenciado limitar conexões simultâneas.
