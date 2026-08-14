@@ -463,6 +463,44 @@ def test_cancelar_finished_gera_erro(org_session):
         appointments.cancel_appointment(session, actor, appt.id)
 
 
+def test_transicao_finished_para_paid_e_permitida(org_session):
+    # Item "padronizar 8 status oficiais" — prepara o domínio pro fluxo
+    # Comanda/Caixa (ainda não implementado): FINISHED -> PAID passa a
+    # ser uma transição manual válida, mesmo sem nenhuma automação.
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    appt.status = AppointmentStatus.FINISHED
+    session.flush()
+
+    updated = appointments.update_status(session, actor, appt.id, AppointmentStatus.PAID)
+    assert updated.status == AppointmentStatus.PAID
+
+
+def test_paid_e_terminal_sem_transicoes_de_saida(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    appt.status = AppointmentStatus.PAID
+    session.flush()
+
+    with pytest.raises(ValidationDomainError):
+        appointments.update_status(session, actor, appt.id, AppointmentStatus.FINISHED)
+
+    with pytest.raises(ValidationDomainError):
+        appointments.cancel_appointment(session, actor, appt.id)
+
+
 def test_reagendamento_via_put_gera_auditoria_de_reschedule(org_session):
     session, org_id = org_session
     branch, prof, service, client = _setup_basic(session, org_id)

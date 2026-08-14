@@ -1,21 +1,28 @@
 """Máquina de estados do `Appointment.status`.
 
-Etapa 3A. Duas operações, de propósito SEPARADAS (não uma função
+Etapa 3A (+ ajuste na rodada de polimento da Agenda, item "8 status
+oficiais"). Duas operações, de propósito SEPARADAS (não uma função
 genérica "mude para qualquer status"):
 
   - `next_status(current, target)`: transições operacionais do dia a dia
     (confirmar, colocar em espera, iniciar atendimento, finalizar,
-    marcar não-comparecimento). NÃO inclui `CANCELLED` como destino —
-    cancelar é uma operação com significado e permissão próprios
-    (`agenda.cancel`, ver `services/appointments.py`), roteada só pelo
-    endpoint dedicado `POST /appointments/{id}/cancel`, nunca pelo PATCH
-    genérico de status. Isso evita duplicar a checagem de permissão
-    "isto é um cancelamento, exige agenda.cancel" dentro de uma função
-    que também serve pra outras transições.
+    marcar como pago, marcar não-comparecimento). NÃO inclui `CANCELLED`
+    como destino — cancelar é uma operação com significado e permissão
+    próprios (`agenda.cancel`, ver `services/appointments.py`), roteada
+    só pelo endpoint dedicado `POST /appointments/{id}/cancel`, nunca
+    pelo PATCH genérico de status. Isso evita duplicar a checagem de
+    permissão "isto é um cancelamento, exige agenda.cancel" dentro de
+    uma função que também serve pra outras transições.
   - `assert_cancellable(current)`: valida que dá pra cancelar a partir
     do status atual.
 
-Regra geral: nenhuma transição sai de um estado TERMINAL (`FINISHED`,
+Fluxo principal: SCHEDULED -> CONFIRMED -> WAITING -> IN_PROGRESS ->
+FINISHED -> PAID. Saídas alternativas: CANCELLED (via endpoint próprio)
+e NO_SHOW. `PAID` é, por ora, só mais um destino manual válido a partir
+de `FINISHED` — a definição AUTOMÁTICA desse status pela Comanda/Caixa
+fica pra uma etapa futura (não implementada aqui).
+
+Regra geral: nenhuma transição sai de um estado TERMINAL (`PAID`,
 `CANCELLED`, `NO_SHOW`) — inclusive o exemplo citado explicitamente,
 `FINISHED -> IN_PROGRESS`, nunca é permitido.
 """
@@ -23,7 +30,7 @@ from nexasalon_api.core.exceptions import ValidationDomainError
 from nexasalon_api.models.enums import AppointmentStatus
 
 TERMINAL_STATUSES = frozenset(
-    {AppointmentStatus.FINISHED, AppointmentStatus.CANCELLED, AppointmentStatus.NO_SHOW}
+    {AppointmentStatus.PAID, AppointmentStatus.CANCELLED, AppointmentStatus.NO_SHOW}
 )
 
 # Transições operacionais válidas (fora do cancelamento, que tem seu
@@ -37,7 +44,8 @@ _ALLOWED_TRANSITIONS: dict[AppointmentStatus, frozenset[AppointmentStatus]] = {
     ),
     AppointmentStatus.WAITING: frozenset({AppointmentStatus.IN_PROGRESS, AppointmentStatus.NO_SHOW}),
     AppointmentStatus.IN_PROGRESS: frozenset({AppointmentStatus.FINISHED}),
-    AppointmentStatus.FINISHED: frozenset(),
+    AppointmentStatus.FINISHED: frozenset({AppointmentStatus.PAID}),
+    AppointmentStatus.PAID: frozenset(),
     AppointmentStatus.CANCELLED: frozenset(),
     AppointmentStatus.NO_SHOW: frozenset(),
 }

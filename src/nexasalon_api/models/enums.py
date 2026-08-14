@@ -50,6 +50,12 @@ class AppointmentStatus(str, Enum):
     WAITING = "waiting"
     IN_PROGRESS = "in_progress"
     FINISHED = "finished"
+    # Preparado pro fluxo Comanda/Caixa (ainda não implementado, ver
+    # rodada de polimento da Agenda) — por ora é só mais um destino
+    # manual válido a partir de FINISHED (ver `appointment_state_machine.py`).
+    # Quando a Comanda existir, ela passará a ser quem normalmente
+    # dispara essa transição automaticamente.
+    PAID = "paid"
     CANCELLED = "cancelled"
     NO_SHOW = "no_show"
 
