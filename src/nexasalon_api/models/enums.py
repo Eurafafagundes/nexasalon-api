@@ -50,14 +50,51 @@ class AppointmentStatus(str, Enum):
     WAITING = "waiting"
     IN_PROGRESS = "in_progress"
     FINISHED = "finished"
-    # Preparado pro fluxo Comanda/Caixa (ainda não implementado, ver
-    # rodada de polimento da Agenda) — por ora é só mais um destino
-    # manual válido a partir de FINISHED (ver `appointment_state_machine.py`).
-    # Quando a Comanda existir, ela passará a ser quem normalmente
-    # dispara essa transição automaticamente.
+    # Continua sendo um destino manual válido a partir de FINISHED (ver
+    # `appointment_state_machine.py`, usado pelo PATCH de status
+    # genérico) — MAS na prática, com a Comanda implementada
+    # (`services/orders.py`), o caminho normal é essa transição
+    # acontecer AUTOMATICAMENTE ao fechar a comanda com pagamento
+    # registrado (`POST /orders/{id}/close`), reaproveitando a mesma
+    # `next_status`. O usuário não deveria precisar marcar "Pago"
+    # manualmente depois de finalizar a comanda.
     PAID = "paid"
     CANCELLED = "cancelled"
     NO_SHOW = "no_show"
+
+
+class OrderStatus(str, Enum):
+    """Status da Comanda (`Order`). Fluxo Atendimento -> Comanda ->
+    Pagamento -> Pago (Etapa "primeira versão funcional da Comanda"):
+    uma comanda nasce OPEN (itens copiados do Appointment, preço
+    editável por linha) e vira CLOSED quando o pagamento é registrado
+    (`POST /orders/{id}/close`) — o que também promove o `Appointment`
+    associado para `paid` automaticamente (ver `services/orders.py`).
+    Sem estado de cancelamento próprio nesta primeira versão (não
+    pedido, e cancelar comanda não é o mesmo domínio que cancelar
+    agendamento)."""
+
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+class PaymentMethod(str, Enum):
+    PIX = "pix"
+    CASH = "cash"
+    DEBIT = "debit"
+    CREDIT = "credit"
+    LOYALTY_CARD = "loyalty_card"
+    VOUCHER = "voucher"
+    BARTER = "barter"  # Permuta
+
+
+class CardBrand(str, Enum):
+    VISA = "visa"
+    MASTERCARD = "mastercard"
+    ELO = "elo"
+    AMEX = "amex"
+    HIPERCARD = "hipercard"
+    OTHER = "other"
 
 
 class AppointmentSource(str, Enum):

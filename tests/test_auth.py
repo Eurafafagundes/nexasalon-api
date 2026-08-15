@@ -501,15 +501,21 @@ def test_permissions_efetivas_por_role(client, scenario):
         "organization.manage", "users.manage", "branches.view", "branches.manage",
         "professionals.view", "professionals.manage", "services.view", "services.manage",
         "clients.view", "clients.manage", "agenda.view_own", "agenda.view_all", "agenda.create",
-        "agenda.edit", "agenda.cancel", "agenda.force_overlap", "finance.view", "finance.manage",
-        "reports.view", "settings.manage",
+        "agenda.edit", "agenda.cancel", "agenda.force_overlap", "agenda.manage_blocks",
+        "finance.view", "finance.manage", "reports.view", "settings.manage",
+        # Comanda/Pagamento (migration 0013) — OWNER recebe as 4.
+        "orders.view", "orders.manage", "orders.edit_price", "payments.register",
     }
 
     recep_body = _login(client, scenario.recep_email, scenario.password)
     recep_me = client.get("/api/v1/auth/me", headers=_auth_headers(recep_body["tokens"]["access_token"]))
     assert set(recep_me.json()["permissions"]) == {
         "clients.view", "clients.manage", "agenda.view_all", "agenda.create", "agenda.edit", "agenda.cancel",
-        "professionals.view", "services.view",
+        "professionals.view", "services.view", "agenda.manage_blocks",
+        # Comanda/Pagamento (migration 0013) — RECEPTIONIST fecha o
+        # caixa/comanda no balcão, mas não edita preço (orders.edit_price
+        # fica só com OWNER/ADMIN, ver docstring da migration 0013).
+        "orders.view", "orders.manage", "payments.register",
     }
 
     prof_body = _login(client, scenario.prof_email, scenario.password)

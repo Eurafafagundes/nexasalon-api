@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from . import agenda, appointments, auth, branches, clients, organizations, professionals, schedule_blocks, service_categories, services, users
+from . import agenda, appointments, auth, branches, clients, organizations, orders, professionals, schedule_blocks, service_categories, services, users
 
 api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(auth.router)
@@ -14,3 +14,4 @@ api_v1_router.include_router(users.router)
 api_v1_router.include_router(agenda.router)
 api_v1_router.include_router(appointments.router)
 api_v1_router.include_router(schedule_blocks.router)
+api_v1_router.include_router(orders.router)

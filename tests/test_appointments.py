@@ -464,9 +464,11 @@ def test_cancelar_finished_gera_erro(org_session):
 
 
 def test_transicao_finished_para_paid_e_permitida(org_session):
-    # Item "padronizar 8 status oficiais" — prepara o domínio pro fluxo
-    # Comanda/Caixa (ainda não implementado): FINISHED -> PAID passa a
-    # ser uma transição manual válida, mesmo sem nenhuma automação.
+    # Item "padronizar 8 status oficiais" — FINISHED -> PAID continua
+    # sendo uma transição manual válida (PATCH genérico de status). A
+    # Comanda (`services/orders.py`, `test_orders.py`) reaproveita esta
+    # MESMA validação pra promover automaticamente ao fechar o
+    # pagamento — não duplica a regra.
     session, org_id = org_session
     branch, prof, service, client = _setup_basic(session, org_id)
     actor = _actor(session, org_id)
