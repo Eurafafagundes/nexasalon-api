@@ -27,6 +27,12 @@ class OrderItemPriceUpdate(BaseModel):
 class PaymentCreate(BaseModel):
     method: PaymentMethod
     amount: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
+    # Obrigatório sempre (item "Caixa Diário") — pagamento nunca é
+    # criado sem um caixa aberto explicitamente selecionado. Validado
+    # no service (`services/cash_register.py::assert_register_open_and_in_org`),
+    # não só aqui: o schema só garante que o campo veio, não que aquele
+    # caixa específico existe/está aberto.
+    cash_register_id: uuid.UUID
     # Obrigatório só pra débito/crédito (bandeira) — validado abaixo,
     # mesmo padrão de consistência condicional do `ScheduleBlockCreate`.
     card_brand: CardBrand | None = None
@@ -69,6 +75,8 @@ class OrderItemRead(BaseModel):
     professional_id: uuid.UUID
     duration_minutes: int
     price: Decimal
+    service_name: str
+    professional_name: str
     created_at: datetime
     updated_at: datetime
 
@@ -78,11 +86,13 @@ class PaymentRead(BaseModel):
 
     id: uuid.UUID
     order_id: uuid.UUID
+    cash_register_id: uuid.UUID
     method: PaymentMethod
     card_brand: CardBrand | None
     installments: int | None
     amount: Decimal
     created_by: uuid.UUID | None
+    created_by_name: str | None
     created_at: datetime
 
 
@@ -100,6 +110,7 @@ class OrderRead(BaseModel):
 
     id: uuid.UUID
     organization_id: uuid.UUID
+    order_number: int
     appointment_id: uuid.UUID
     branch_id: uuid.UUID
     client_id: uuid.UUID
@@ -120,6 +131,7 @@ class OrderRead(BaseModel):
         return cls(
             id=order.id,
             organization_id=order.organization_id,
+            order_number=order.order_number,
             appointment_id=order.appointment_id,
             branch_id=order.branch_id,
             client_id=order.client_id,

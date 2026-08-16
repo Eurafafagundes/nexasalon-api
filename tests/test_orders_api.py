@@ -70,6 +70,9 @@ def _setup_finished_appointment(c):
 def test_fluxo_completo_via_api_comanda_ate_pago(client_as, org_a_actor):
     c = client_as(org_a_actor)
     appt = _setup_finished_appointment(c)
+    register = c.post(
+        "/api/v1/cash-registers", json={"branch_id": appt["branch_id"], "initial_amount": "0"}
+    ).json()
 
     created = c.post("/api/v1/orders", json={"appointment_id": appt["id"]})
     assert created.status_code == 201, created.text
@@ -82,7 +85,10 @@ def test_fluxo_completo_via_api_comanda_ate_pago(client_as, org_a_actor):
     assert edited.status_code == 200, edited.text
     assert edited.json()["total"] == "120.00"
 
-    closed = c.post(f"/api/v1/orders/{order['id']}/close", json={"payments": [{"method": "pix", "amount": "120.00"}]})
+    closed = c.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={"payments": [{"method": "pix", "amount": "120.00", "cash_register_id": register["id"]}]},
+    )
     assert closed.status_code == 200, closed.text
     assert closed.json()["status"] == "closed"
 
@@ -92,6 +98,29 @@ def test_fluxo_completo_via_api_comanda_ate_pago(client_as, org_a_actor):
     by_appt = c.get(f"/api/v1/orders/by-appointment/{appt['id']}")
     assert by_appt.status_code == 200
     assert by_appt.json()["id"] == order["id"]
+
+    # item "pagamento entra imediatamente no resumo do caixa"
+    register_detail = c.get(f"/api/v1/cash-registers/{register['id']}").json()
+    assert register_detail["total_revenue"] == "120.00"
+    pix_total = next(t for t in register_detail["totals_by_method"] if t["method"] == "pix")
+    assert pix_total["total"] == "120.00"
+    assert pix_total["count"] == 1
+
+
+def test_nao_fecha_comanda_sem_nenhum_caixa_aberto(client_as, org_a_actor):
+    """Item 'se não existir nenhum caixa aberto: impedir a confirmação
+    do pagamento' — via API, sem nenhum `POST /cash-registers` antes,
+    o fechamento é recusado (422, cash_register_id não existe/não está
+    aberto — nunca cria um caixa sozinho)."""
+    c = client_as(org_a_actor)
+    appt = _setup_finished_appointment(c)
+    order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
+
+    resp = c.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": str(uuid.uuid4())}]},
+    )
+    assert resp.status_code in (404, 422)
 
 
 def test_permissao_orders_manage_e_exigida_para_abrir_comanda(client_as, org_a_actor):
@@ -121,7 +150,8 @@ def test_permissao_payments_register_e_exigida_para_fechar(client_as, org_a_acto
 
     restricted = _restricted_actor(org_a_actor, permissions={"orders.view", "orders.manage"})
     resp = client_as(restricted).post(
-        f"/api/v1/orders/{order['id']}/close", json={"payments": [{"method": "pix", "amount": order["total"]}]}
+        f"/api/v1/orders/{order['id']}/close",
+        json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": str(uuid.uuid4())}]},
     )
     assert resp.status_code == 403
 

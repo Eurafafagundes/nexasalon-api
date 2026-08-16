@@ -1,10 +1,12 @@
 import uuid
+from datetime import datetime
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from nexasalon_api.api.deps import get_db, require_permission
 from nexasalon_api.core.actor import ActorContext
+from nexasalon_api.models.enums import OrderStatus
 from nexasalon_api.schemas.order import OrderClose, OrderCreate, OrderItemPriceUpdate, OrderRead
 from nexasalon_api.services import orders as orders_service
 
@@ -14,6 +16,28 @@ _view = require_permission("orders.view")
 _manage = require_permission("orders.manage")
 _edit_price = require_permission("orders.edit_price")
 _register_payment = require_permission("payments.register")
+
+
+@router.get(
+    "",
+    response_model=list[OrderRead],
+    summary="Listar comandas (Abertas/Finalizadas) com filtros",
+)
+def list_orders(
+    status_filter: OrderStatus | None = Query(None, alias="status"),
+    client_id: uuid.UUID | None = Query(None),
+    professional_id: uuid.UUID | None = Query(None),
+    order_number: int | None = Query(None),
+    date_from: datetime | None = Query(None),
+    date_to: datetime | None = Query(None),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> list[OrderRead]:
+    orders = orders_service.list_orders(
+        session, actor, status=status_filter, client_id=client_id, professional_id=professional_id,
+        order_number=order_number, date_from=date_from, date_to=date_to,
+    )
+    return [OrderRead.from_order(o) for o in orders]
 
 
 @router.post("", response_model=OrderRead, status_code=status.HTTP_201_CREATED, summary="Abrir comanda de um agendamento")

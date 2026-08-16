@@ -10,7 +10,12 @@ o Appointment pra `paid` automaticamente, reaproveitando a MESMA
 manualmente desde a rodada anterior — por isso `close_order` já herda
 de graça a regra "só dá pra pagar um agendamento `finished`" sem
 precisar duplicá-la aqui.
-"""
+
+`close_order` agora também exige, por lançamento de pagamento, um
+`cash_register_id` de um caixa ABERTO da mesma organização (item
+"Caixa Diário" — pagamento nunca é registrado sem caixa selecionado,
+reaproveitando `services/cash_register.py::assert_register_open_and_in_org`,
+nunca abre um caixa sozinho)."""
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -21,9 +26,19 @@ from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.exceptions import ConflictError, NotFoundError, ValidationDomainError
 from nexasalon_api.models.enums import AppointmentStatus, AuditAction, OrderStatus
 from nexasalon_api.models.order import Order
-from nexasalon_api.repositories import appointment_repo, audit_log_repo, order_item_repo, order_repo, payment_repo
+from nexasalon_api.repositories import (
+    appointment_repo,
+    audit_log_repo,
+    order_item_repo,
+    order_repo,
+    payment_repo,
+    professional_repo,
+    service_repo,
+    user_repo,
+)
 from nexasalon_api.schemas.order import OrderClose, OrderItemPriceUpdate
 from nexasalon_api.services import appointments as appointments_service
+from nexasalon_api.services import cash_register as cash_register_service
 
 
 def _get_order_or_404(session: Session, organization_id: uuid.UUID, order_id: uuid.UUID) -> Order:
@@ -62,6 +77,13 @@ def create_order(session: Session, actor: ActorContext, appointment_id: uuid.UUI
         # Copia o snapshot do AppointmentItem 1:1 na abertura — a partir
         # daqui os dois vivem independentes (editar o preço da comanda
         # não altera o item original do agendamento, nem vice-versa).
+        # `service_name`/`professional_name` são capturados AGORA
+        # (item "snapshot histórico") — nem `AppointmentItem` nem
+        # `Service`/`Professional` guardam esse nome já congelado, e
+        # ler o catálogo atual depois mudaria como uma venda antiga
+        # aparece se o serviço for renomeado ou o profissional sair.
+        service = service_repo.get(session, organization_id, item.service_id)
+        professional = professional_repo.get(session, organization_id, item.professional_id)
         order_item_repo.create(
             session,
             organization_id,
@@ -71,6 +93,8 @@ def create_order(session: Session, actor: ActorContext, appointment_id: uuid.UUI
             professional_id=item.professional_id,
             duration_minutes=item.duration_minutes,
             price=item.price,
+            service_name=service.name if service is not None else "Serviço removido",
+            professional_name=professional.name if professional is not None else "Profissional removido",
         )
     session.flush()
 
@@ -88,6 +112,24 @@ def create_order(session: Session, actor: ActorContext, appointment_id: uuid.UUI
 
 def get_order(session: Session, actor: ActorContext, order_id: uuid.UUID) -> Order:
     return _get_order_or_404(session, actor.organization_id, order_id)
+
+
+def list_orders(
+    session: Session,
+    actor: ActorContext,
+    *,
+    status: OrderStatus | None = None,
+    client_id: uuid.UUID | None = None,
+    professional_id: uuid.UUID | None = None,
+    order_number: int | None = None,
+    date_from=None,
+    date_to=None,
+) -> list[Order]:
+    """Financeiro > Comandas (Abertas/Finalizadas, item 13/14)."""
+    return order_repo.list_for_org(
+        session, actor.organization_id, status=status, client_id=client_id, professional_id=professional_id,
+        order_number=order_number, date_from=date_from, date_to=date_to,
+    )
 
 
 def get_order_by_appointment(session: Session, actor: ActorContext, appointment_id: uuid.UUID) -> Order | None:
@@ -138,16 +180,28 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
             f"Valor pago (R$ {paid_total}) é menor que o total da comanda (R$ {total})."
         )
 
+    # Valida TODOS os caixas informados antes de criar qualquer
+    # Payment — falha rápido (sem criar pagamento parcial) se algum
+    # dos lançamentos apontar pra um caixa de outra organização, que
+    # não existe, ou que já está fechado.
+    for payment_in in data.payments:
+        cash_register_service.assert_register_open_and_in_org(session, organization_id, payment_in.cash_register_id)
+
+    actor_user = user_repo.get(session, actor.user_id)
+    actor_name = actor_user.name if actor_user is not None else None
+
     for payment_in in data.payments:
         payment_repo.create(
             session,
             organization_id,
             order_id=order.id,
+            cash_register_id=payment_in.cash_register_id,
             method=payment_in.method,
             card_brand=payment_in.card_brand,
             installments=payment_in.installments,
             amount=payment_in.amount,
             created_by=actor.user_id,
+            created_by_name=actor_name,
         )
 
     # Promove o Appointment ANTES de marcar a comanda como fechada: se a

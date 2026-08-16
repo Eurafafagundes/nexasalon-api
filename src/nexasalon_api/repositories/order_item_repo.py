@@ -16,6 +16,8 @@ def create(
     professional_id: uuid.UUID,
     duration_minutes: int,
     price: Decimal,
+    service_name: str,
+    professional_name: str,
 ) -> OrderItem:
     item = OrderItem(
         organization_id=organization_id,
@@ -25,6 +27,8 @@ def create(
         professional_id=professional_id,
         duration_minutes=duration_minutes,
         price=price,
+        service_name=service_name,
+        professional_name=professional_name,
     )
     session.add(item)
     session.flush()

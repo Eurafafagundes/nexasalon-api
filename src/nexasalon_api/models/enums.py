@@ -86,6 +86,8 @@ class PaymentMethod(str, Enum):
     LOYALTY_CARD = "loyalty_card"
     VOUCHER = "voucher"
     BARTER = "barter"  # Permuta
+    TRANSFER = "transfer"  # Transferência
+    BANK_SLIP = "bank_slip"  # Boleto
 
 
 class CardBrand(str, Enum):
@@ -95,6 +97,66 @@ class CardBrand(str, Enum):
     AMEX = "amex"
     HIPERCARD = "hipercard"
     OTHER = "other"
+
+
+class CashRegisterStatus(str, Enum):
+    """Status do Caixa Diário (`CashRegister`). Um caixa ABERTO pode
+    receber pagamentos de comanda e movimentações (sangria/suprimento);
+    um caixa FECHADO nunca mais recebe nada — ver `services/cash_register.py`."""
+
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+class CashMovementType(str, Enum):
+    """Tipos de lançamento manual dentro de um caixa aberto — NÃO inclui
+    "payment": pagamentos de comanda já vivem em `payments`
+    (`Payment.cash_register_id`), então o resumo/histórico do caixa lê
+    `payments` diretamente em vez de duplicar cada pagamento aqui
+    também (ver docstring de `services/cash_register.py`).
+
+    `REVERSAL` existe no catálogo pra permitir uma futura tela de
+    estorno auditável (item "não apagar sangria/suprimento
+    silenciosamente — usar cancelamento/estorno") — nenhum endpoint
+    cria este tipo ainda nesta primeira versão."""
+
+    WITHDRAWAL = "withdrawal"  # sangria
+    SUPPLY = "supply"  # suprimento
+    REVERSAL = "reversal"  # estorno — reservado, sem fluxo implementado ainda
+
+
+class BrazilianState(str, Enum):
+    """UF controlada (item "Estado: prefira UF controlada em vez de
+    texto totalmente livre") — 26 estados + DF, sem lógica de negócio
+    associada, só evita erro de digitação livre."""
+
+    AC = "AC"
+    AL = "AL"
+    AP = "AP"
+    AM = "AM"
+    BA = "BA"
+    CE = "CE"
+    DF = "DF"
+    ES = "ES"
+    GO = "GO"
+    MA = "MA"
+    MT = "MT"
+    MS = "MS"
+    MG = "MG"
+    PA = "PA"
+    PB = "PB"
+    PR = "PR"
+    PE = "PE"
+    PI = "PI"
+    RJ = "RJ"
+    RN = "RN"
+    RS = "RS"
+    RO = "RO"
+    RR = "RR"
+    SC = "SC"
+    SP = "SP"
+    SE = "SE"
+    TO = "TO"
 
 
 class AppointmentSource(str, Enum):

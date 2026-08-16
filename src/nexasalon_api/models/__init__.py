@@ -14,6 +14,7 @@ from .professional import Professional, WorkingHours, ScheduleBlock  # noqa: F40
 from .service import Service, ServiceCategory, ProfessionalService  # noqa: F401
 from .client import Client  # noqa: F401
 from .appointment import Recurrence, Appointment, AppointmentItem  # noqa: F401
+from .cash_register import CashRegister, CashMovement  # noqa: F401
 from .order import Order, OrderItem, Payment  # noqa: F401
 from .tag import Tag, AppointmentTag  # noqa: F401
 from .audit import AuditLog  # noqa: F401
@@ -39,6 +40,8 @@ __all__ = [
     "Recurrence",
     "Appointment",
     "AppointmentItem",
+    "CashRegister",
+    "CashMovement",
     "Order",
     "OrderItem",
     "Payment",

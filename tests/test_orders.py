@@ -22,7 +22,7 @@ from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.service import ProfessionalService, Service
 from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate
 from nexasalon_api.schemas.order import OrderClose, OrderItemPriceUpdate, PaymentCreate
-from nexasalon_api.services import appointments, orders
+from nexasalon_api.services import appointments, cash_register, orders
 
 _ALL_AGENDA_PERMS = frozenset(
     {"agenda.view_own", "agenda.view_all", "agenda.create", "agenda.edit", "agenda.cancel"}
@@ -123,6 +123,18 @@ def _finished_appointment_with_two_services(session, org_id, actor):
     return appt, branch, prof, client
 
 
+def _open_register(session, actor, initial_amount=Decimal("0")):
+    """Caixa aberto, pronto pra receber pagamento — a maioria dos testes
+    de comanda/pagamento não testa o Caixa em si (isso vive em
+    `test_cash_register.py`), só precisa de UM caixa aberto válido pra
+    poder fechar a comanda (item "pagamento obrigatoriamente vinculado
+    ao caixa"). Cria sua PRÓPRIA unidade (regra desta rodada: 1 caixa
+    aberto por unidade) — não precisa ser a mesma unidade do
+    agendamento/comanda sendo testado."""
+    branch_id = _branch(session, actor.organization_id).id
+    return cash_register.open_register(session, actor, branch_id, initial_amount, None)
+
+
 # ---------------------------------------------------------------------
 # Criação da comanda (Atendimento -> Comanda)
 # ---------------------------------------------------------------------
@@ -219,8 +231,12 @@ def test_nao_edita_preco_de_comanda_ja_fechada(org_session):
     actor = _actor(session, org_id)
     appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
     order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
     total = sum((i.price for i in order.items), Decimal("0"))
-    orders.close_order(session, actor, order.id, OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total)]))
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
 
     with pytest.raises(ValidationDomainError):
         orders.update_item_price(session, actor, order.id, order.items[0].id, OrderItemPriceUpdate(price=Decimal("1.00")))
@@ -236,24 +252,30 @@ def test_fechar_comanda_com_pix_marca_paga_e_promove_agendamento_pra_paid(org_se
     actor = _actor(session, org_id)
     appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
     order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
     total = sum((i.price for i in order.items), Decimal("0"))
 
     closed = orders.close_order(
-        session, actor, order.id, OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total)])
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
     )
 
     assert closed.status == OrderStatus.CLOSED
     assert closed.closed_at is not None
     assert len(closed.payments) == 1
     assert closed.payments[0].method == PaymentMethod.PIX
+    assert closed.payments[0].cash_register_id == register.id
 
     session.refresh(appt)
     assert appt.status == AppointmentStatus.PAID
 
 
 def test_fechar_comanda_com_credito_exige_bandeira(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    register = _open_register(session, actor)
     with pytest.raises(ValueError):
-        PaymentCreate(method=PaymentMethod.CREDIT, amount=Decimal("100.00"))  # sem card_brand
+        PaymentCreate(method=PaymentMethod.CREDIT, amount=Decimal("100.00"), cash_register_id=register.id)  # sem card_brand
 
 
 def test_fechar_comanda_com_debito_e_bandeira_funciona_e_aceita_parcelas_so_no_credito(org_session):
@@ -261,21 +283,30 @@ def test_fechar_comanda_com_debito_e_bandeira_funciona_e_aceita_parcelas_so_no_c
     actor = _actor(session, org_id)
     appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
     order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
     total = sum((i.price for i in order.items), Decimal("0"))
 
     closed = orders.close_order(
         session, actor, order.id,
-        OrderClose(payments=[PaymentCreate(method=PaymentMethod.DEBIT, amount=total, card_brand=CardBrand.VISA)]),
+        OrderClose(payments=[
+            PaymentCreate(method=PaymentMethod.DEBIT, amount=total, card_brand=CardBrand.VISA, cash_register_id=register.id)
+        ]),
     )
     assert closed.payments[0].card_brand == CardBrand.VISA
     assert closed.payments[0].installments is None
 
     # installments só é aceito com method=credit.
     with pytest.raises(ValueError):
-        PaymentCreate(method=PaymentMethod.DEBIT, amount=Decimal("10.00"), card_brand=CardBrand.VISA, installments=3)
+        PaymentCreate(
+            method=PaymentMethod.DEBIT, amount=Decimal("10.00"), card_brand=CardBrand.VISA, installments=3,
+            cash_register_id=register.id,
+        )
 
     # com crédito, funciona.
-    payment = PaymentCreate(method=PaymentMethod.CREDIT, amount=Decimal("10.00"), card_brand=CardBrand.MASTERCARD, installments=3)
+    payment = PaymentCreate(
+        method=PaymentMethod.CREDIT, amount=Decimal("10.00"), card_brand=CardBrand.MASTERCARD, installments=3,
+        cash_register_id=register.id,
+    )
     assert payment.installments == 3
 
 
@@ -286,6 +317,7 @@ def test_fechar_comanda_com_pagamento_misto_pix_mais_credito(org_session):
     actor = _actor(session, org_id)
     appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
     order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
     total = sum((i.price for i in order.items), Decimal("0"))
     part_a = (total / 2).quantize(Decimal("0.01"))
     part_b = total - part_a
@@ -293,8 +325,8 @@ def test_fechar_comanda_com_pagamento_misto_pix_mais_credito(org_session):
     closed = orders.close_order(
         session, actor, order.id,
         OrderClose(payments=[
-            PaymentCreate(method=PaymentMethod.PIX, amount=part_a),
-            PaymentCreate(method=PaymentMethod.CREDIT, amount=part_b, card_brand=CardBrand.ELO, installments=2),
+            PaymentCreate(method=PaymentMethod.PIX, amount=part_a, cash_register_id=register.id),
+            PaymentCreate(method=PaymentMethod.CREDIT, amount=part_b, card_brand=CardBrand.ELO, installments=2, cash_register_id=register.id),
         ]),
     )
     assert len(closed.payments) == 2
@@ -306,10 +338,12 @@ def test_nao_fecha_comanda_com_valor_pago_menor_que_o_total(org_session):
     actor = _actor(session, org_id)
     appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
     order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
 
     with pytest.raises(ValidationDomainError):
         orders.close_order(
-            session, actor, order.id, OrderClose(payments=[PaymentCreate(method=PaymentMethod.CASH, amount=Decimal("1.00"))])
+            session, actor, order.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.CASH, amount=Decimal("1.00"), cash_register_id=register.id)]),
         )
 
 
@@ -318,11 +352,18 @@ def test_nao_fecha_comanda_ja_fechada(org_session):
     actor = _actor(session, org_id)
     appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
     order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
     total = sum((i.price for i in order.items), Decimal("0"))
-    orders.close_order(session, actor, order.id, OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total)]))
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
 
     with pytest.raises(ConflictError):
-        orders.close_order(session, actor, order.id, OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total)]))
+        orders.close_order(
+            session, actor, order.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+        )
 
 
 def test_nao_promove_pra_paid_se_agendamento_nao_estiver_finished(org_session):
@@ -336,10 +377,14 @@ def test_nao_promove_pra_paid_se_agendamento_nao_estiver_finished(org_session):
     order = orders.create_order(session, actor, appt.id)
     appt.status = AppointmentStatus.IN_PROGRESS  # comanda foi aberta, mas o atendimento "voltou"
     session.flush()
+    register = _open_register(session, actor)
     total = sum((i.price for i in order.items), Decimal("0"))
 
     with pytest.raises(ValidationDomainError):
-        orders.close_order(session, actor, order.id, OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total)]))
+        orders.close_order(
+            session, actor, order.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+        )
 
     # E a comanda continua aberta (não fechou parcialmente).
     session.refresh(order)
@@ -367,3 +412,148 @@ def test_isolamento_multiempresa_comanda_de_outra_org_nao_aparece(org_session):
         with pytest.raises(NotFoundError):
             orders.get_order(other_session, other_actor, order.id)
         other_session.rollback()
+
+
+# ---------------------------------------------------------------------
+# Pagamento obrigatoriamente vinculado a um Caixa aberto
+# ---------------------------------------------------------------------
+
+
+def test_nao_fecha_comanda_sem_caixa_selecionado(org_session):
+    """`cash_register_id` é campo obrigatório do schema — nem chega a
+    existir um `PaymentCreate` válido sem ele (a UI não deveria nem
+    conseguir montar a requisição)."""
+    with pytest.raises(ValueError):
+        PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("10.00"))
+
+
+def test_nao_fecha_comanda_com_caixa_fechado(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    cash_register.close_register(session, actor, register.id, None, None)
+    total = sum((i.price for i in order.items), Decimal("0"))
+
+    with pytest.raises(ValidationDomainError):
+        orders.close_order(
+            session, actor, order.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+        )
+
+
+def test_nao_fecha_comanda_com_caixa_de_outra_organizacao(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    total = sum((i.price for i in order.items), Decimal("0"))
+
+    other_org_id = uuid.uuid4()
+    with SessionLocal() as other_session:
+        other_session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(other_org_id)})
+        other_session.add(Organization(id=other_org_id, name="Outra org", slug=f"outra-{other_org_id.hex[:8]}"))
+        other_session.flush()
+        other_actor = _actor(other_session, other_org_id)
+        other_register = _open_register(other_session, other_actor)
+        other_register_id = other_register.id
+        other_session.commit()
+
+    with pytest.raises(NotFoundError):
+        orders.close_order(
+            session, actor, order.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=other_register_id)]),
+        )
+
+
+def test_pagamento_registra_caixa_e_nome_de_quem_registrou(org_session):
+    """Item 'auditoria dos pagamentos': cada Payment guarda o caixa
+    (`cash_register_id`) e um snapshot do nome de quem de fato
+    registrou o pagamento (`created_by_name`) — preservado mesmo que o
+    usuário troque de nome depois."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    total = sum((i.price for i in order.items), Decimal("0"))
+
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+
+    payment = closed.payments[0]
+    assert payment.cash_register_id == register.id
+    assert payment.created_by == actor.user_id
+    assert payment.created_by_name is not None and len(payment.created_by_name) > 0
+
+
+def test_pagamento_entra_imediatamente_no_resumo_do_caixa(org_session):
+    """Item 'integração com comandas': fechar a comanda faz o pagamento
+    aparecer no resumo do caixa sem nenhuma etapa extra."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    total = sum((i.price for i in order.items), Decimal("0"))
+
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+
+    summary = cash_register.get_register_summary(session, actor, register.id)
+    pix_total, pix_count = summary.totals_by_method[PaymentMethod.PIX]
+    assert pix_total == total
+    assert pix_count == 1
+    assert summary.total_revenue == total
+
+
+def test_order_number_e_sequencial_por_organizacao(org_session):
+    """Item 'número da comanda' — sequencial POR ORG, começa em 1,
+    incrementa a cada nova comanda aberta na mesma organização."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt1, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order1 = orders.create_order(session, actor, appt1.id)
+
+    branch = _branch(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    svc = _service(session, org_id, name="Escova", duration=30, price=Decimal("80.00"))
+    _link(session, prof.id, svc.id)
+    _working_hours(session, org_id, prof.id, _THURSDAY, time(9, 0), time(20, 0))
+    client2 = _client(session, org_id, name="Outro Cliente")
+    data2 = AppointmentCreate(
+        branch_id=branch.id, client_id=client2.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=svc.id, start_at=_dt(14, 0))],
+    )
+    appt2 = appointments.create_appointment(session, actor, data2)
+    appt2.status = AppointmentStatus.FINISHED
+    session.flush()
+    order2 = orders.create_order(session, actor, appt2.id)
+
+    assert order2.order_number == order1.order_number + 1
+
+
+def test_snapshot_de_nome_do_item_nao_muda_se_servico_for_renomeado(org_session):
+    """Item 16 'snapshot histórico' — renomear o serviço DEPOIS de a
+    comanda existir não pode mudar como a venda antiga aparece."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, branch, prof, client = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    original_names = {item.service_name for item in order.items}
+    assert original_names == {"Corte", "Coloração"}
+
+    # renomeia o serviço no catálogo DEPOIS de a comanda já existir
+    from nexasalon_api.repositories import service_repo
+
+    service = service_repo.get(session, org_id, order.items[0].service_id)
+    service.name = "Nome Novo Do Catálogo"
+    session.flush()
+
+    reloaded = orders.get_order(session, actor, order.id)
+    assert {item.service_name for item in reloaded.items} == original_names

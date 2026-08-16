@@ -73,27 +73,31 @@ def legacy_db():
 
 
 def _insert_legacy_payment(admin_url: str) -> dict:
-    """Monta a cadeia mínima de domínio via ORM (nenhum desses models
-    mudou na 0014 — só `Payment` mudou) e insere o `payment` em si via
-    SQL cru, restrito às colunas que já existiam na 0013. Devolve os ids
-    relevantes pra validação depois do upgrade."""
+    """Monta a cadeia mínima de domínio pra satisfazer as FKs. `Client`,
+    `Order`/`OrderItem` ganharam colunas novas em rodadas posteriores à
+    0013 (0015) — inserir/consultar essas tabelas via ORM ou via
+    services que as tocam (ex.: `appointments.create_appointment`, que
+    faz `client_repo.get`) falharia com "column does not exist" nesta
+    revisão congelada do schema. Por isso TODA a cadeia (org, role,
+    user, membership, branch, client, professional, service, agendamento
+    + item, comanda + item, pagamento) é montada via SQL cru, restrita
+    às colunas que já existiam na 0013 — só os models que realmente não
+    mudaram desde então (`Organization`, `User`, `OrganizationMembership`,
+    `Branch`, `Professional`, `Service`, `ProfessionalService`,
+    `WorkingHours`, `Role`) continuam via ORM. Devolve os ids relevantes
+    pra validação depois do upgrade."""
     # Import tardio: só depois que `NEXASALON_DATABASE_URL` do processo
     # de teste principal já foi fixada pelo `conftest.py` (não usamos
     # esse valor aqui — construímos nossa própria engine/session — mas
     # os models em si não têm estado de engine, então importar aqui ou
     # no topo do arquivo dá no mesmo; mantido aqui só por clareza de que
     # este helper é o único lugar que efetivamente usa os models).
-    from nexasalon_api.core.actor import ActorContext
-    from nexasalon_api.models.client import Client
-    from nexasalon_api.models.enums import AppointmentStatus, MembershipStatus, OrderStatus
     from nexasalon_api.models.identity import OrganizationMembership, User
-    from nexasalon_api.models.order import Order, OrderItem
+    from nexasalon_api.models.enums import MembershipStatus
     from nexasalon_api.models.organization import Branch, Organization
     from nexasalon_api.models.professional import Professional, WorkingHours
     from nexasalon_api.models.rbac import Role
     from nexasalon_api.models.service import ProfessionalService, Service
-    from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate
-    from nexasalon_api.services import appointments
 
     engine = create_engine(admin_url)
     Session = sessionmaker(bind=engine)
@@ -117,8 +121,18 @@ def _insert_legacy_payment(admin_url: str) -> dict:
 
         branch = Branch(organization_id=org.id, name="Unidade", slug=f"unidade-{uuid.uuid4().hex[:8]}")
         session.add(branch)
-        client = Client(organization_id=org.id, name="Cliente Legado")
-        session.add(client)
+        session.flush()
+        # SQL cru, de propósito: `Client` ganhou colunas novas na 0015
+        # (cpf/cep/state/...) que não existem ainda nesta revisão do
+        # schema (0013) — inserir via ORM tentaria incluí-las e falharia
+        # com "column does not exist". Mesma lógica do `payments` abaixo.
+        client_id = uuid.uuid4()
+        session.execute(
+            text("INSERT INTO clients (id, organization_id, name, created_at, updated_at) "
+                 "VALUES (:id, :org, :name, now(), now())"),
+            {"id": client_id, "org": org.id, "name": "Cliente Legado"},
+        )
+        session.flush()
         professional = Professional(organization_id=org.id, branch_id=branch.id, name="Profissional Legado")
         session.add(professional)
         service = Service(
@@ -139,51 +153,69 @@ def _insert_legacy_payment(admin_url: str) -> dict:
         )
         session.flush()
 
-        actor = ActorContext(
-            organization_id=org.id, user_id=user.id, membership_id=uuid.uuid4(), role_id=owner_role.id,
-            role_name="OWNER", permissions=frozenset({"agenda.create", "agenda.edit", "orders.manage"}),
-        )
         session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org.id)})
 
-        appt_data = AppointmentCreate(
-            branch_id=branch.id,
-            client_id=client.id,
-            items=[
-                AppointmentItemCreate(
-                    professional_id=professional.id, service_id=service.id,
-                    start_at=datetime(2026, 8, 13, 9, 0, tzinfo=timezone(timedelta(hours=-3))),
-                )
-            ],
+        # Agendamento + item via SQL cru (mesma razão do `clients`
+        # acima: evita qualquer caminho de código — ORM ou service —
+        # que leia/escreva `Client` por baixo).
+        start_at = datetime(2026, 8, 13, 9, 0, tzinfo=timezone(timedelta(hours=-3)))
+        end_at = start_at + timedelta(minutes=60)
+        appt_id = uuid.uuid4()
+        session.execute(
+            text(
+                "INSERT INTO appointments (id, organization_id, branch_id, client_id, status, source, "
+                "created_at, updated_at) "
+                "VALUES (:id, :org, :branch, :client, 'finished', 'internal', now(), now())"
+            ),
+            {"id": appt_id, "org": org.id, "branch": branch.id, "client": client_id},
         )
-        appt = appointments.create_appointment(session, actor, appt_data)
-        appt.status = AppointmentStatus.FINISHED
+        appt_item_id = uuid.uuid4()
+        session.execute(
+            text(
+                "INSERT INTO appointment_items (id, organization_id, appointment_id, service_id, "
+                "professional_id, start_at, end_at, duration_minutes, price, created_at, updated_at) "
+                "VALUES (:id, :org, :appt, :service, :prof, :start_at, :end_at, :duration, :price, now(), now())"
+            ),
+            {
+                "id": appt_item_id, "org": org.id, "appt": appt_id, "service": service.id, "prof": professional.id,
+                "start_at": start_at, "end_at": end_at, "duration": 60, "price": Decimal("100.00"),
+            },
+        )
         session.flush()
 
-        # Comanda montada direto via ORM (não `services/orders.py::create_order`):
-        # aquele service devolve o Order recarregado via `order_repo.get`,
-        # que faz eager-load de `Order.payments` — e isso dispararia um
-        # SELECT em `payments` incluindo `cash_register_id`, coluna que
-        # ainda não existe nesta revisão do schema (0013). Construir o
-        # Order/OrderItem manualmente evita tocar nesse relationship.
-        order = Order(
-            organization_id=org.id, appointment_id=appt.id, branch_id=branch.id, client_id=client.id,
-            status=OrderStatus.OPEN, created_by=user.id,
+        # Comanda montada via SQL cru, de propósito: `Order` ganhou
+        # `order_number` e `OrderItem` ganhou `service_name`/
+        # `professional_name` na 0015 — nenhuma dessas colunas existe
+        # ainda nesta revisão do schema (0013), então construir via ORM
+        # (que sempre inclui todas as colunas mapeadas no INSERT)
+        # falharia com "column does not exist", igual ao caso do
+        # `clients`/`payments` acima. Também evita o eager-load de
+        # `Order.payments` (que já tocaria em `cash_register_id`).
+        order_id = uuid.uuid4()
+        session.execute(
+            text(
+                "INSERT INTO orders (id, organization_id, appointment_id, branch_id, client_id, status, "
+                "created_by, created_at, updated_at) "
+                "VALUES (:id, :org, :appt, :branch, :client, 'open', :uid, now(), now())"
+            ),
+            {"id": order_id, "org": org.id, "appt": appt_id, "branch": branch.id, "client": client_id, "uid": user.id},
         )
-        session.add(order)
-        session.flush()
-        total = Decimal("0")
-        for item in appt.items:
-            session.add(
-                OrderItem(
-                    organization_id=org.id, order_id=order.id, appointment_item_id=item.id,
-                    service_id=item.service_id, professional_id=item.professional_id,
-                    duration_minutes=item.duration_minutes, price=item.price,
-                )
-            )
-            total += item.price
-        order.status = OrderStatus.CLOSED
-        order.closed_at = datetime.now(timezone.utc)
-        order.closed_by = user.id
+        total = Decimal("100.00")
+        session.execute(
+            text(
+                "INSERT INTO order_items (id, organization_id, order_id, appointment_item_id, service_id, "
+                "professional_id, duration_minutes, price, created_at, updated_at) "
+                "VALUES (:id, :org, :order, :appt_item, :service, :prof, :duration, :price, now(), now())"
+            ),
+            {
+                "id": uuid.uuid4(), "org": org.id, "order": order_id, "appt_item": appt_item_id,
+                "service": service.id, "prof": professional.id, "duration": 60, "price": total,
+            },
+        )
+        session.execute(
+            text("UPDATE orders SET status = 'closed', closed_at = now(), closed_by = :uid WHERE id = :id"),
+            {"uid": user.id, "id": order_id},
+        )
         session.flush()
 
         payment_id = uuid.uuid4()
@@ -197,12 +229,12 @@ def _insert_legacy_payment(admin_url: str) -> dict:
                 "INSERT INTO payments (id, organization_id, order_id, method, amount, created_by, created_at, updated_at) "
                 "VALUES (:id, :org, :order, 'pix', :amount, :uid, now(), now())"
             ),
-            {"id": payment_id, "org": org.id, "order": order.id, "amount": total, "uid": user.id},
+            {"id": payment_id, "org": org.id, "order": order_id, "amount": total, "uid": user.id},
         )
         session.commit()
 
         ids = {
-            "org": org.id, "user": user.id, "order": order.id, "payment": payment_id, "amount": total,
+            "org": org.id, "user": user.id, "order": order_id, "payment": payment_id, "amount": total,
         }
 
     engine.dispose()

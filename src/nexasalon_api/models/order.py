@@ -1,5 +1,5 @@
 """Comanda (`Order`) e Pagamento (`Payment`) — primeira versão funcional
-do fluxo Atendimento -> Comanda -> Pagamento -> Pago.
+do fluxo Atendimento -> Comanda -> Pagamento -> Caixa -> Pago.
 
 Escopo deliberadamente pequeno (ver docstring do módulo de migration
 `0013`): isto NÃO é o Financeiro completo (sem contas a pagar/receber,
@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, ForeignKey, Integer, Numeric, String
+from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -41,11 +41,19 @@ class Order(Base, UUIDPKMixin, TimestampMixin):
             "(status = 'open' AND closed_at IS NULL) OR (status = 'closed' AND closed_at IS NOT NULL)",
             name="closed_at_matches_status",
         ),
+        UniqueConstraint("organization_id", "order_number", name="uq_orders_organization_order_number"),
     )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
     )
+    # Número sequencial POR ORGANIZAÇÃO ("#1048" nas telas de Comandas/
+    # Extrato/histórico do cliente) — nunca o `id` (UUID) exposto pra
+    # recepção. Calculado em `order_repo.create` (MAX+1 por org); risco
+    # pequeno de corrida sob abertura de comanda simultânea, aceito
+    # nesta rodada (volume baixo) e documentado como limitação — ver
+    # `services/orders.py`.
+    order_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
     appointment_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="RESTRICT"), nullable=False, unique=True
     )
@@ -106,6 +114,12 @@ class OrderItem(Base, UUIDPKMixin, TimestampMixin):
     )
     duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    # Snapshot de NOME (item "snapshot histórico") — capturado na
+    # criação da comanda, igual a `price`. Sem isso, renomear/inativar
+    # um serviço ou profissional mudaria como uma venda ANTIGA aparece
+    # no histórico do cliente/Extrato, o que quebraria a auditoria.
+    service_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    professional_name: Mapped[str] = mapped_column(String(255), nullable=False)
 
     order: Mapped["Order"] = relationship(back_populates="items")
 
@@ -115,7 +129,15 @@ class Payment(Base, UUIDPKMixin, TimestampMixin):
     não um único método/valor na própria `Order`: já preparado pra
     pagamento misto (ex.: R$200 Pix + R$180 Crédito) sem precisar de
     outra migration depois. Nesta primeira versão a UI só cria um
-    lançamento por fechamento, mas o domínio já suporta vários."""
+    lançamento por fechamento, mas o domínio já suporta vários.
+
+    `cash_register_id` é OBRIGATÓRIO (item "Caixa Diário" — pagamento
+    de comanda sempre vinculado a um caixa aberto, nunca criado sem
+    ação explícita de selecionar/abrir um). `created_by_name` é
+    snapshot do usuário que REGISTROU o pagamento — pode ser diferente
+    do responsável pelo caixa (`CashRegister.opened_by_name`); os dois
+    são preservados separadamente pra auditoria (ver
+    `models/cash_register.py`)."""
 
     __tablename__ = "payments"
     __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)
@@ -125,6 +147,9 @@ class Payment(Base, UUIDPKMixin, TimestampMixin):
     )
     order_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("orders.id", ondelete="CASCADE"), nullable=False
+    )
+    cash_register_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("cash_registers.id", ondelete="RESTRICT"), nullable=False
     )
     method: Mapped[PaymentMethod] = mapped_column(pg_enum(PaymentMethod, "payment_method"), nullable=False)
     # Só preenchido quando method=debit/credit (validado no schema Pydantic).
@@ -137,5 +162,6 @@ class Payment(Base, UUIDPKMixin, TimestampMixin):
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
+    created_by_name: Mapped[str | None] = mapped_column(String(255))
 
     order: Mapped["Order"] = relationship(back_populates="payments")

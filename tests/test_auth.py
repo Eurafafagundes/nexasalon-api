@@ -516,6 +516,11 @@ def test_permissions_efetivas_por_role(client, scenario):
         # caixa/comanda no balcão, mas não edita preço (orders.edit_price
         # fica só com OWNER/ADMIN, ver docstring da migration 0013).
         "orders.view", "orders.manage", "payments.register",
+        # Caixa Diário (migration 0014) — RECEPTIONIST ganha finance.view
+        # pra poder selecionar um caixa aberto ao registrar pagamento;
+        # finance.manage (abrir/fechar caixa, sangria, suprimento)
+        # continua só com OWNER/ADMIN.
+        "finance.view",
     }
 
     prof_body = _login(client, scenario.prof_email, scenario.password)
