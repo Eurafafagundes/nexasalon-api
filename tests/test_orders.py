@@ -123,6 +123,27 @@ def _finished_appointment_with_two_services(session, org_id, actor):
     return appt, branch, prof, client
 
 
+def _scheduled_appointment_with_one_service(session, org_id, actor):
+    """Agendamento com 1 serviço (Corte R$100), ainda no status
+    default `SCHEDULED` — item "não condicione a Comanda a ter passado
+    por todos os status": abrir/fechar comanda não deve exigir
+    `FINISHED`."""
+    branch = _branch(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    corte = _service(session, org_id, name="Corte", duration=60, price=Decimal("100.00"))
+    _link(session, prof.id, corte.id)
+    _working_hours(session, org_id, prof.id, _THURSDAY, time(9, 0), time(20, 0))
+    client = _client(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=corte.id, start_at=_dt(9, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    assert appt.status == AppointmentStatus.SCHEDULED
+    return appt, branch, prof, client
+
+
 def _open_register(session, actor, initial_amount=Decimal("0")):
     """Caixa aberto, pronto pra receber pagamento — a maioria dos testes
     de comanda/pagamento não testa o Caixa em si (isso vive em
@@ -366,16 +387,48 @@ def test_nao_fecha_comanda_ja_fechada(org_session):
         )
 
 
-def test_nao_promove_pra_paid_se_agendamento_nao_estiver_finished(org_session):
-    """`close_order` reaproveita `next_status` — um agendamento que
-    ainda não passou por `finished` não pode virar `paid` só porque
-    alguém tentou fechar a comanda (a comanda nem deveria existir nesse
-    caso, mas a trava vale mesmo que exista)."""
+def test_abre_comanda_com_agendamento_ainda_scheduled(org_session):
+    """Item "se ainda não existe comanda -> Abrir Comanda sempre
+    disponível": não exige nenhum status prévio do Appointment."""
     session, org_id = org_session
     actor = _actor(session, org_id)
-    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    appt, *_ = _scheduled_appointment_with_one_service(session, org_id, actor)
+
     order = orders.create_order(session, actor, appt.id)
-    appt.status = AppointmentStatus.IN_PROGRESS  # comanda foi aberta, mas o atendimento "voltou"
+    assert order.status == OrderStatus.OPEN
+    assert appt.status == AppointmentStatus.SCHEDULED  # abrir comanda não muda o status operacional
+
+
+def test_finaliza_comanda_sem_passar_pelos_outros_status(org_session):
+    """Exemplo do pedido: Agendado -> Abrir Comanda -> Finalizar
+    pagamento -> Pago, sem precisar passar por Confirmado/Aguardando/
+    Em Atendimento/Finalizado."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _scheduled_appointment_with_one_service(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    total = sum((i.price for i in order.items), Decimal("0"))
+
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+    assert closed.status == OrderStatus.CLOSED
+
+    session.refresh(appt)
+    assert appt.status == AppointmentStatus.PAID
+
+
+def test_nao_fecha_comanda_de_agendamento_cancelado(org_session):
+    """Trava de segurança: um agendamento cancelado não vira `paid`
+    mesmo que a comanda (aberta antes do cancelamento) continue aberta
+    — `appointments_service.mark_paid` recusa `current == CANCELLED`."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _scheduled_appointment_with_one_service(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    appt.status = AppointmentStatus.CANCELLED
     session.flush()
     register = _open_register(session, actor)
     total = sum((i.price for i in order.items), Decimal("0"))

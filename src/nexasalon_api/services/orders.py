@@ -1,15 +1,17 @@
 """Comanda/Pagamento — primeira versão funcional (item 3 da rodada
 "Agenda visual/status, jornada por profissional e Comanda").
 
-Fluxo: Appointment finalizado -> `create_order` copia os itens do
-Appointment pra dentro da comanda (preço editável por linha, sem tocar
-no catálogo nem no snapshot original) -> `update_item_price` edita uma
-linha (auditado) -> `close_order` registra o(s) pagamento(s) e PROMOVE
-o Appointment pra `paid` automaticamente, reaproveitando a MESMA
-`appointment_state_machine.next_status` que já validava essa transição
-manualmente desde a rodada anterior — por isso `close_order` já herda
-de graça a regra "só dá pra pagar um agendamento `finished`" sem
-precisar duplicá-la aqui.
+Fluxo: `create_order` copia os itens do Appointment pra dentro da
+comanda (preço editável por linha, sem tocar no catálogo nem no
+snapshot original) -> `update_item_price` edita uma linha (auditado) ->
+`close_order` registra o(s) pagamento(s) e PROMOVE o Appointment pra
+`paid` automaticamente via `appointments_service.mark_paid`.
+
+Rodada "status livre + Comanda desacoplada da sequência": a Comanda
+pode ser aberta e fechada em QUALQUER status operacional do Appointment
+(não exige ter passado por `finished` antes — `mark_paid` só recusa se
+o Appointment já está `paid` ou `cancelled`). "Pago" nunca é um clique
+manual na Agenda: só existe como consequência de `close_order`.
 
 `close_order` agora também exige, por lançamento de pagamento, um
 `cash_register_id` de um caixa ABERTO da mesma organização (item
@@ -24,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.exceptions import ConflictError, NotFoundError, ValidationDomainError
-from nexasalon_api.models.enums import AppointmentStatus, AuditAction, OrderStatus
+from nexasalon_api.models.enums import AuditAction, OrderStatus
 from nexasalon_api.models.order import Order
 from nexasalon_api.repositories import (
     appointment_repo,
@@ -205,13 +207,15 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
         )
 
     # Promove o Appointment ANTES de marcar a comanda como fechada: se a
-    # transição falhar (ex.: agendamento ainda não está `finished` —
-    # `next_status` recusa `finished -> paid` fora dessa origem), a
-    # comanda não fica fechada/com pagamento registrado sem o
-    # agendamento ter virado `paid` — evita os dois ficarem
-    # inconsistentes entre si. O usuário nunca precisa marcar "Pago"
-    # manualmente à parte: fechar a comanda já faz isso.
-    appointments_service.update_status(session, actor, order.appointment_id, AppointmentStatus.PAID)
+    # transição falhar (ex.: agendamento já `paid` ou `cancelled` — ver
+    # `appointment_state_machine.mark_paid`), a comanda não fica
+    # fechada/com pagamento registrado sem o agendamento ter virado
+    # `paid` — evita os dois ficarem inconsistentes entre si. Item
+    # "não condicione a Comanda a ter passado por todos os status":
+    # `mark_paid` promove de QUALQUER status operacional direto pra
+    # `paid`, não exige `finished` antes. O usuário nunca precisa
+    # marcar "Pago" manualmente à parte: fechar a comanda já faz isso.
+    appointments_service.mark_paid(session, actor, order.appointment_id)
 
     order.status = OrderStatus.CLOSED
     order.closed_at = datetime.now(timezone.utc)

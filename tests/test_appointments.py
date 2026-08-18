@@ -21,6 +21,7 @@ from nexasalon_api.models.professional import Professional, ScheduleBlock, Worki
 from nexasalon_api.models.service import ProfessionalService, Service
 from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate, AppointmentReplace
 from nexasalon_api.services import appointments
+from nexasalon_api.services import appointment_state_machine
 from nexasalon_api.services.appointment_state_machine import next_status
 
 _ALL_AGENDA_PERMS = frozenset(
@@ -485,7 +486,12 @@ def test_transicao_de_status_valida(org_session):
     assert updated.status == AppointmentStatus.CONFIRMED
 
 
-def test_transicao_finished_para_in_progress_e_bloqueada(org_session):
+def test_regressao_manual_de_status_operacional_e_permitida(org_session):
+    """Item "status livre": não existe mais sequência linear obrigatória
+    entre os 6 status operacionais — regredir manualmente (ex.:
+    FINISHED -> IN_PROGRESS, CONFIRMED -> SCHEDULED, IN_PROGRESS ->
+    WAITING) é permitido pra quem tem `agenda.edit`, sem precisar de
+    nenhum fluxo especial."""
     session, org_id = org_session
     branch, prof, service, client = _setup_basic(session, org_id)
     actor = _actor(session, org_id)
@@ -497,8 +503,77 @@ def test_transicao_finished_para_in_progress_e_bloqueada(org_session):
     appt.status = AppointmentStatus.FINISHED
     session.flush()
 
-    with pytest.raises(ValidationDomainError):
-        appointments.update_status(session, actor, appt.id, AppointmentStatus.IN_PROGRESS)
+    updated = appointments.update_status(session, actor, appt.id, AppointmentStatus.IN_PROGRESS)
+    assert updated.status == AppointmentStatus.IN_PROGRESS
+
+    updated = appointments.update_status(session, actor, appt.id, AppointmentStatus.CONFIRMED)
+    assert updated.status == AppointmentStatus.CONFIRMED
+
+    updated = appointments.update_status(session, actor, appt.id, AppointmentStatus.SCHEDULED)
+    assert updated.status == AppointmentStatus.SCHEDULED
+
+
+def test_avanco_direto_sem_passar_pelos_intermediarios_e_permitido(org_session):
+    """Item "status livre": avançar direto (ex.: SCHEDULED -> FINISHED,
+    pulando CONFIRMED/WAITING/IN_PROGRESS) também é permitido — o grafo
+    é livre nos dois sentidos, não só "avançar em ordem"."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    assert appt.status == AppointmentStatus.SCHEDULED
+
+    updated = appointments.update_status(session, actor, appt.id, AppointmentStatus.FINISHED)
+    assert updated.status == AppointmentStatus.FINISHED
+
+
+def test_no_show_tambem_e_regressivel_manualmente(org_session):
+    """Exemplo explícito do pedido: "Faltou -> Confirmado" precisa ser
+    permitido manualmente quando fizer sentido — NO_SHOW não é mais um
+    terminal do grafo livre (só PAID e CANCELLED continuam sendo)."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    appt.status = AppointmentStatus.NO_SHOW
+    session.flush()
+
+    updated = appointments.update_status(session, actor, appt.id, AppointmentStatus.CONFIRMED)
+    assert updated.status == AppointmentStatus.CONFIRMED
+
+
+def test_auditoria_de_mudanca_manual_de_status_e_registrada(org_session):
+    """Preserva auditoria (item explícito do pedido) mesmo com o grafo
+    livre — cada mudança manual de status continua gerando um
+    `AuditLog` com o status antigo/novo."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    appt.status = AppointmentStatus.CONFIRMED
+    session.flush()
+
+    appointments.update_status(session, actor, appt.id, AppointmentStatus.SCHEDULED)
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == appt.id
+    ).all()
+    manual_logs = [log for log in logs if log.new_values and log.new_values.get("change_type") == "manual_status_change"]
+    assert len(manual_logs) == 1
+    assert manual_logs[0].old_values == {"status": "confirmed"}
+    assert manual_logs[0].new_values["status"] == "scheduled"
 
 
 def test_patch_generico_nao_cancela(org_session):
@@ -549,12 +624,11 @@ def test_cancelar_finished_gera_erro(org_session):
         appointments.cancel_appointment(session, actor, appt.id)
 
 
-def test_transicao_finished_para_paid_e_permitida(org_session):
-    # Item "padronizar 8 status oficiais" — FINISHED -> PAID continua
-    # sendo uma transição manual válida (PATCH genérico de status). A
-    # Comanda (`services/orders.py`, `test_orders.py`) reaproveita esta
-    # MESMA validação pra promover automaticamente ao fechar o
-    # pagamento — não duplica a regra.
+def test_patch_generico_nao_marca_pago_manualmente(org_session):
+    """Item "não misture status operacional com status financeiro":
+    `PAID` nunca é um destino do PATCH genérico, nem a partir de
+    FINISHED — só chega lá via `POST /orders/{id}/close`
+    (`test_orders.py`)."""
     session, org_id = org_session
     branch, prof, service, client = _setup_basic(session, org_id)
     actor = _actor(session, org_id)
@@ -566,11 +640,14 @@ def test_transicao_finished_para_paid_e_permitida(org_session):
     appt.status = AppointmentStatus.FINISHED
     session.flush()
 
-    updated = appointments.update_status(session, actor, appt.id, AppointmentStatus.PAID)
-    assert updated.status == AppointmentStatus.PAID
+    with pytest.raises(ValidationDomainError):
+        appointments.update_status(session, actor, appt.id, AppointmentStatus.PAID)
 
 
 def test_paid_e_terminal_sem_transicoes_de_saida(org_session):
+    """Item "Pago é diferente": nenhuma regressão/avanço manual sai de
+    `PAID` — desfazer exige um fluxo financeiro de estorno, não
+    implementado nesta rodada."""
     session, org_id = org_session
     branch, prof, service, client = _setup_basic(session, org_id)
     actor = _actor(session, org_id)
@@ -586,7 +663,83 @@ def test_paid_e_terminal_sem_transicoes_de_saida(org_session):
         appointments.update_status(session, actor, appt.id, AppointmentStatus.FINISHED)
 
     with pytest.raises(ValidationDomainError):
+        appointments.update_status(session, actor, appt.id, AppointmentStatus.SCHEDULED)
+
+    with pytest.raises(ValidationDomainError):
         appointments.cancel_appointment(session, actor, appt.id)
+
+
+def test_mark_paid_promove_de_qualquer_status_operacional(org_session):
+    """`appointments.mark_paid` (chamado só por `services/orders.py`) não
+    exige `FINISHED` — item "não condicione a Comanda a ter passado por
+    todos os status"."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    assert appt.status == AppointmentStatus.SCHEDULED
+
+    updated = appointments.mark_paid(session, actor, appt.id)
+    assert updated.status == AppointmentStatus.PAID
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == appt.id
+    ).all()
+    change_types = {log.new_values.get("change_type") for log in logs if log.new_values}
+    assert "payment_settled" in change_types
+
+
+def test_mark_paid_recusa_agendamento_ja_pago_ou_cancelado(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    appt.status = AppointmentStatus.PAID
+    session.flush()
+    with pytest.raises(ValidationDomainError):
+        appointments.mark_paid(session, actor, appt.id)
+
+    data2 = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(16, 0))],
+    )
+    appt2 = appointments.create_appointment(session, actor, data2)
+    appt2.status = AppointmentStatus.CANCELLED
+    session.flush()
+    with pytest.raises(ValidationDomainError):
+        appointments.mark_paid(session, actor, appt2.id)
+
+
+def test_state_machine_next_status_grafo_livre_operacional(org_session):
+    """Unidade pura da máquina de estados: qualquer par operacional é
+    válido nos dois sentidos; `CANCELLED`/`PAID` como alvo e `PAID`
+    como origem continuam recusados."""
+    session, org_id = org_session  # fixture só pra manter o padrão do arquivo, não usada aqui.
+    assert next_status(AppointmentStatus.IN_PROGRESS, AppointmentStatus.WAITING) == AppointmentStatus.WAITING
+    assert next_status(AppointmentStatus.NO_SHOW, AppointmentStatus.CONFIRMED) == AppointmentStatus.CONFIRMED
+
+    with pytest.raises(ValidationDomainError):
+        next_status(AppointmentStatus.SCHEDULED, AppointmentStatus.CANCELLED)
+    with pytest.raises(ValidationDomainError):
+        next_status(AppointmentStatus.FINISHED, AppointmentStatus.PAID)
+    with pytest.raises(ValidationDomainError):
+        next_status(AppointmentStatus.PAID, AppointmentStatus.SCHEDULED)
+    with pytest.raises(ValidationDomainError):
+        next_status(AppointmentStatus.CANCELLED, AppointmentStatus.SCHEDULED)
+
+    assert appointment_state_machine.mark_paid(AppointmentStatus.SCHEDULED) == AppointmentStatus.PAID
+    with pytest.raises(ValidationDomainError):
+        appointment_state_machine.mark_paid(AppointmentStatus.PAID)
+    with pytest.raises(ValidationDomainError):
+        appointment_state_machine.mark_paid(AppointmentStatus.CANCELLED)
 
 
 def test_reagendamento_via_put_gera_auditoria_de_reschedule(org_session):

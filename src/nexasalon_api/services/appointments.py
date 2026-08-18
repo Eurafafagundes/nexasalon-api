@@ -30,6 +30,7 @@ from nexasalon_api.repositories import (
 from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate, AppointmentReplace
 from nexasalon_api.services import availability
 from nexasalon_api.services.appointment_state_machine import assert_cancellable, next_status
+from nexasalon_api.services.appointment_state_machine import mark_paid as _mark_paid_transition
 
 FORCE_OVERLAP_PERMISSION = "agenda.force_overlap"
 VIEW_ALL_PERMISSION = "agenda.view_all"
@@ -381,6 +382,10 @@ def _diff_change_types(old_items: list[dict], new_snapshots: list[_ItemSnapshot]
 def update_status(
     session: Session, actor: ActorContext, appointment_id: uuid.UUID, target_status: AppointmentStatus
 ) -> Appointment:
+    """PATCH genérico de status — grafo LIVRE entre os 6 status
+    operacionais (avançar ou regredir manualmente, sem sequência
+    obrigatória). `CANCELLED` e `PAID` nunca são destino aqui (ver
+    `appointment_state_machine.next_status`)."""
     appointment = get_appointment(session, actor, appointment_id)
     old_status = appointment.status
     new_status = next_status(old_status, target_status)
@@ -392,7 +397,31 @@ def update_status(
         session, organization_id=actor.organization_id, user_id=actor.user_id, entity_type="appointment",
         entity_id=appointment_id, action=AuditAction.UPDATE,
         old_values={"status": old_status.value},
-        new_values={"status": new_status.value, "change_type": "status_change"},
+        new_values={"status": new_status.value, "change_type": "manual_status_change"},
+    )
+    return _reload(session, actor.organization_id, appointment_id)
+
+
+def mark_paid(session: Session, actor: ActorContext, appointment_id: uuid.UUID) -> Appointment:
+    """Promove pra `PAID` — chamado SÓ por `services/orders.py::close_order`
+    ao registrar o pagamento que fecha a Comanda, nunca pelo PATCH
+    genérico de status (item "não misture status operacional com
+    status financeiro"). Funciona a partir de QUALQUER status
+    operacional — a Comanda não exige ter passado por `FINISHED` antes
+    (item "não condicione a Comanda a ter passado por todos os
+    status")."""
+    appointment = get_appointment(session, actor, appointment_id)
+    old_status = appointment.status
+    new_status = _mark_paid_transition(old_status)
+    appointment.status = new_status
+    appointment.updated_by = actor.user_id
+    session.flush()
+
+    audit_log_repo.create(
+        session, organization_id=actor.organization_id, user_id=actor.user_id, entity_type="appointment",
+        entity_id=appointment_id, action=AuditAction.UPDATE,
+        old_values={"status": old_status.value},
+        new_values={"status": new_status.value, "change_type": "payment_settled"},
     )
     return _reload(session, actor.organization_id, appointment_id)
 

@@ -50,14 +50,13 @@ class AppointmentStatus(str, Enum):
     WAITING = "waiting"
     IN_PROGRESS = "in_progress"
     FINISHED = "finished"
-    # Continua sendo um destino manual válido a partir de FINISHED (ver
-    # `appointment_state_machine.py`, usado pelo PATCH de status
-    # genérico) — MAS na prática, com a Comanda implementada
-    # (`services/orders.py`), o caminho normal é essa transição
-    # acontecer AUTOMATICAMENTE ao fechar a comanda com pagamento
-    # registrado (`POST /orders/{id}/close`), reaproveitando a mesma
-    # `next_status`. O usuário não deveria precisar marcar "Pago"
-    # manualmente depois de finalizar a comanda.
+    # NÃO é um destino do PATCH genérico de status (ver
+    # `appointment_state_machine.py`) — só é atingido AUTOMATICAMENTE ao
+    # fechar a Comanda com pagamento registrado (`POST
+    # /orders/{id}/close`, `services/orders.py::close_order` ->
+    # `appointments_service.mark_paid`). Item "status financeiro não se
+    # mistura com status operacional": o usuário nunca marca "Pago" na
+    # Agenda à mão, isso reflete um pagamento de fato registrado.
     PAID = "paid"
     CANCELLED = "cancelled"
     NO_SHOW = "no_show"
