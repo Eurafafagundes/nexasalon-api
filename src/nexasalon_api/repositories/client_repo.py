@@ -1,9 +1,12 @@
+import re
 import uuid
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from nexasalon_api.models.client import Client
+
+_DIGITS = re.compile(r"\D+")
 
 
 def get(session: Session, organization_id: uuid.UUID, client_id: uuid.UUID) -> Client | None:
@@ -21,8 +24,19 @@ def list_all(
     if not include_inactive:
         stmt = stmt.where(Client.is_active.is_(True))
     if search:
-        pattern = f"%{search}%"
-        stmt = stmt.where(or_(Client.name.ilike(pattern), Client.phone.ilike(pattern)))
+        # Campo único (item "não quero seletor Nome/CPF/Telefone"): o
+        # texto digitado é comparado ao nome (ilike, texto livre) e,
+        # quando contém algum dígito, também ao telefone/CPF já
+        # NORMALIZADOS no banco (só dígitos) — "11 99999-0000",
+        # "11999990000" e "111.444.777-35" encontram o cliente sem
+        # precisar de nenhum modo de busca separado.
+        conditions = [Client.name.ilike(f"%{search}%")]
+        digits = _DIGITS.sub("", search)
+        if digits:
+            digit_pattern = f"%{digits}%"
+            conditions.append(Client.phone.ilike(digit_pattern))
+            conditions.append(Client.cpf.ilike(digit_pattern))
+        stmt = stmt.where(or_(*conditions))
     return list(session.scalars(stmt.order_by(Client.name)).all())
 
 

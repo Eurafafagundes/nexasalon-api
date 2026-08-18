@@ -29,6 +29,7 @@ def create(
     client_id: uuid.UUID,
     notes: str | None,
     created_by: uuid.UUID,
+    fit_in: bool = False,
 ) -> Appointment:
     appointment = Appointment(
         organization_id=organization_id,
@@ -37,6 +38,7 @@ def create(
         notes=notes,
         created_by=created_by,
         updated_by=created_by,
+        fit_in=fit_in,
     )
     session.add(appointment)
     session.flush()

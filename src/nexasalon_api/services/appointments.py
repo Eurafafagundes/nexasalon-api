@@ -101,7 +101,13 @@ def _build_item_snapshot(
     if professional_service is None or not professional_service.is_active:
         raise ValidationDomainError("Este profissional não executa este serviço.")
 
-    duration_minutes, price = availability.effective_duration_and_price(service, professional_service)
+    duration_minutes, catalog_price = availability.effective_duration_and_price(service, professional_service)
+    # `price_override` (item "valor editável por serviço") substitui só
+    # o PREÇO efetivo deste item — nunca a duração, e nunca escreve de
+    # volta em `Service.default_price`/`ProfessionalService.price_override`.
+    # Mesmo padrão de snapshot já usado por `OrderItem.price` (ver
+    # docstring de `AppointmentItemCreate`).
+    price = item_in.price_override if item_in.price_override is not None else catalog_price
     start_at = item_in.start_at
     end_at = start_at + timedelta(minutes=duration_minutes)
 
@@ -248,7 +254,7 @@ def create_appointment(session: Session, actor: ActorContext, data: AppointmentC
 
     appointment = appointment_repo.create(
         session, organization_id, branch_id=data.branch_id, client_id=data.client_id,
-        notes=data.notes, created_by=actor.user_id,
+        notes=data.notes, created_by=actor.user_id, fit_in=data.fit_in,
     )
     _insert_items(session, organization_id, appointment.id, snapshots)
     session.flush()
@@ -331,6 +337,7 @@ def replace_appointment(
     appointment.branch_id = data.branch_id
     appointment.client_id = data.client_id
     appointment.notes = data.notes
+    appointment.fit_in = data.fit_in
     appointment.updated_by = actor.user_id
     session.flush()
 

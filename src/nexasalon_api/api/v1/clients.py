@@ -15,7 +15,7 @@ _view = require_permission("clients.view")
 _manage = require_permission("clients.manage")
 
 
-@router.get("", response_model=list[ClientRead], summary="Listar/buscar clientes (nome ou telefone)")
+@router.get("", response_model=list[ClientRead], summary="Listar/buscar clientes (nome, telefone ou CPF — campo único)")
 def list_clients(
     search: str | None = None,
     include_inactive: bool = False,

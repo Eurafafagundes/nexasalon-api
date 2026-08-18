@@ -130,6 +130,92 @@ def test_criar_agendamento_simples(org_session):
     assert appt.ends_at == _dt(15, 0)
 
 
+def test_price_override_substitui_preco_do_catalogo_sem_alterar_service(org_session):
+    """Item "valor editável por serviço": `price_override` vale só PARA
+    ESTE agendamento — o catálogo (`Service.default_price`) não muda."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[
+            AppointmentItemCreate(
+                professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0),
+                price_override=Decimal("77.50"),
+            )
+        ],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    assert appt.items[0].price == Decimal("77.50")
+    # duração continua vindo do catálogo — override é só de preço.
+    assert appt.items[0].duration_minutes == 60
+    session.refresh(service)
+    assert service.default_price == 100
+
+
+def test_sem_price_override_usa_preco_efetivo_do_catalogo(org_session):
+    """Comportamento antigo preservado: sem `price_override`, o preço
+    continua vindo de `effective_duration_and_price` normalmente."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    assert appt.items[0].price == Decimal("100.00")
+
+
+def test_price_override_negativo_e_rejeitado():
+    with pytest.raises(Exception):
+        AppointmentItemCreate(
+            professional_id=uuid.uuid4(), service_id=uuid.uuid4(),
+            start_at=_dt(14, 0), price_override=Decimal("-1"),
+        )
+
+
+def test_fit_in_e_gravado_mas_nao_pula_nenhuma_validacao(org_session):
+    """Item "encaixe conservador": `fit_in=true` é gravado no
+    agendamento, mas jornada/bloqueio/conflito continuam validando
+    exatamente igual — encaixe NÃO é um passe livre."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id, fit_in=True,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    assert appt.fit_in is True
+
+    # Um segundo "encaixe" sobre o MESMO horário continua 409 — fit_in
+    # não contorna a checagem de conflito (só force_overlap+permissão
+    # faz isso, e isto aqui não usa force_overlap).
+    conflicting = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id, fit_in=True,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    with pytest.raises(ConflictError):
+        appointments.create_appointment(session, actor, conflicting)
+
+
+def test_fit_in_default_e_false(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    assert appt.fit_in is False
+
+
 def test_criar_agendamento_multiplos_servicos_e_profissionais(org_session):
     """Réplica do exemplo do enunciado: Cliente Maria, 14:00-16:00
     Manutenção com Ianka, 16:00-17:30 Mechas com João."""

@@ -3,6 +3,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     ARRAY,
+    Boolean,
     CheckConstraint,
     Date,
     ForeignKey,
@@ -87,6 +88,15 @@ class Appointment(Base, UUIDPKMixin, TimestampMixin):
         server_default=AppointmentSource.INTERNAL.value,
     )
     notes: Mapped[str | None] = mapped_column(String)
+    # Encaixe (migration 0016) — CARACTERÍSTICA do agendamento, não um
+    # status paralelo: convive com qualquer `status` (ex.: um encaixe
+    # pode estar `confirmed` normalmente). Só serve pra IDENTIFICAR/
+    # MEDIR encaixes hoje — marcar `fit_in=True` não pula nenhuma
+    # validação de disponibilidade (jornada/bloqueio/conflito continuam
+    # rodando exatamente igual, ver `services/appointments.py`). "Forçar"
+    # um encaixe sobre um conflito real é um passo futuro deliberadamente
+    # fora de escopo aqui — ver decisão registrada na migration 0016.
+    fit_in: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     # cache derivado — ver docstring da classe. Nunca escrito pela API.
     starts_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     ends_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))

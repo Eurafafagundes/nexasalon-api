@@ -36,6 +36,23 @@ def test_buscar_por_nome_e_telefone(client_as, org_a_actor):
     assert any(cl["phone"] == "11999990000" for cl in resp.json())
 
 
+def test_busca_em_campo_unico_tambem_encontra_por_cpf(client_as, org_a_actor):
+    """Item "busca de cliente por nome/telefone/CPF num único campo,
+    sem seletor" — digitar um CPF (formatado ou só dígitos) encontra o
+    cliente pelo mesmo parâmetro `search`."""
+    c = client_as(org_a_actor)
+    c.post("/api/v1/clients", json={"name": "Cliente CPF", "cpf": "111.444.777-35"})
+    c.post("/api/v1/clients", json={"name": "Outro Cliente"})
+
+    resp = c.get("/api/v1/clients", params={"search": "111.444.777-35"})
+    assert resp.status_code == 200
+    names = [cl["name"] for cl in resp.json()]
+    assert names == ["Cliente CPF"]
+
+    resp = c.get("/api/v1/clients", params={"search": "11144477735"})
+    assert [cl["name"] for cl in resp.json()] == ["Cliente CPF"]
+
+
 def test_desativar_cliente_nao_apaga(client_as, org_a_actor):
     c = client_as(org_a_actor)
     client_id = c.post("/api/v1/clients", json={"name": "Cliente Temporário"}).json()["id"]
