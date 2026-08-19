@@ -175,16 +175,43 @@ class DashboardOverviewResponse(BaseModel):
     heatmap: list[HeatmapCell]
 
 
+class RevenueReconciliation(BaseModel):
+    """Só populada no drill-down do KPI `revenue` — compara o que foi
+    VENDIDO (Faturamento, `OrderItem`) com o que foi EFETIVAMENTE
+    RECEBIDO (`Payment.amount`). Ver docstring de
+    `services/dashboard.py` (seção "TRÊS CONCEITOS") pro raciocínio
+    completo — granularidades diferentes que nunca se misturam:
+    Faturamento não aumenta por causa de pagamento em duplicidade/a
+    mais, e uma comanda paga a mais nunca "compensa" outra paga a
+    menos no total (`pending_amount`/`overpaid_amount` são somas de
+    diferenças calculadas POR COMANDA, não a diferença agregada)."""
+
+    revenue: Decimal
+    received: Decimal
+    # soma, por comanda, de (total - recebido) quando positivo — venda
+    # ainda sem cobertura total de pagamento registrado.
+    pending_amount: Decimal
+    # soma, por comanda, de (recebido - total) quando positivo —
+    # dinheiro registrado além do valor vendido daquela comanda (erro
+    # de lançamento/troco não registrado). NUNCA contado como
+    # faturamento adicional (Faturamento continua vindo só de
+    # `OrderItem`, nunca de `Payment`).
+    overpaid_amount: Decimal
+
+
 class DashboardKpiDetailResponse(BaseModel):
     """Drill-down de UM card. `series` usa o MESMO shape de
     `revenue_series` pra qualquer KPI (não só faturamento) — cada
     métrica tem sua própria série por bucket alinhada atual×comparativo.
     `insights` é reservado pra explicações automáticas futuras (item
     16 — "arquitetura para futuro BI"): sempre `[]` nesta versão, mas
-    já faz parte do contrato pra não exigir mudança de schema depois."""
+    já faz parte do contrato pra não exigir mudança de schema depois.
+    `reconciliation` só vem preenchida quando `key == "revenue"` — ver
+    `RevenueReconciliation`."""
 
     key: str
     kpi: KpiValue
     granularity: str
     series: list[SeriesPoint]
     insights: list[str] = Field(default_factory=list)
+    reconciliation: RevenueReconciliation | None = None

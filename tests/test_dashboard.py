@@ -568,6 +568,241 @@ def test_top_servicos_agrega_por_servico_sem_duplicar_faturamento(org_session):
     assert payment_total == Decimal("380")  # formas de pagamento também não duplica.
 
 
+# ---------------------------------------------------------------------------
+# Faturamento × Recebido — reconciliação (`RevenueReconciliation`, drill-down
+# de `revenue`). Três conceitos que NUNCA se misturam: Faturamento
+# (`OrderItem`, o que foi vendido) sempre vem do drill-down `revenue`;
+# Recebido (`Payment.amount`, o que entrou de fato) só aparece aqui — a
+# soma de pagamentos nunca altera o valor de Faturamento, só sinaliza
+# pendência/excedente.
+# ---------------------------------------------------------------------------
+
+
+def _revenue_detail(session, actor):
+    return dashboard_service.get_kpi_detail(
+        session, actor, key="revenue", branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+        compare_from=None, compare_to=None,
+    )
+
+
+def test_reconciliacao_comanda_paga_exatamente_o_total(org_session):
+    """Comanda de R$800 paga R$800 (um único pagamento) — sem
+    pendência, sem excedente."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("800")}],
+        payments=[{"method": PaymentMethod.CASH, "amount": Decimal("800")}],
+        cash_register_id=cr.id,
+    )
+
+    detail = _revenue_detail(session, actor)
+    assert detail.kpi.value == Decimal("800")
+    assert detail.reconciliation is not None
+    assert detail.reconciliation.revenue == Decimal("800")
+    assert detail.reconciliation.received == Decimal("800")
+    assert detail.reconciliation.pending_amount == Decimal("0")
+    assert detail.reconciliation.overpaid_amount == Decimal("0")
+
+
+def test_reconciliacao_pagamento_misto_nao_duplica_faturamento_nem_gera_diferenca(org_session):
+    """R$300 Pix + R$500 Crédito numa comanda de R$800 — Faturamento
+    continua R$800 (nunca 1600, nunca a soma de linhas de pagamento
+    tratada como se fosse item vendido), Recebido bate exatamente,
+    sem pendência nem excedente."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("800")}],
+        payments=[
+            {"method": PaymentMethod.PIX, "amount": Decimal("300")},
+            {"method": PaymentMethod.CREDIT, "amount": Decimal("500")},
+        ],
+        cash_register_id=cr.id,
+    )
+
+    detail = _revenue_detail(session, actor)
+    assert detail.kpi.value == Decimal("800")
+    assert detail.reconciliation.revenue == Decimal("800")
+    assert detail.reconciliation.received == Decimal("800")
+    assert detail.reconciliation.pending_amount == Decimal("0")
+    assert detail.reconciliation.overpaid_amount == Decimal("0")
+
+
+def test_reconciliacao_pagamento_abaixo_do_total_vira_pendencia_sem_reduzir_faturamento(org_session):
+    """Comanda de R$800 com só R$600 registrados em `Payment` (dado
+    inconsistente, fora do fluxo normal de `close_order`) — Faturamento
+    continua R$800 (o que foi VENDIDO não muda), Recebido reflete os
+    R$600 reais, e a diferença aparece como pendência, nunca reduz o
+    Faturamento."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("800")}],
+        payments=[{"method": PaymentMethod.CASH, "amount": Decimal("600")}],
+        cash_register_id=cr.id,
+    )
+
+    detail = _revenue_detail(session, actor)
+    assert detail.kpi.value == Decimal("800")  # Faturamento não cai por causa de pagamento parcial.
+    assert detail.reconciliation.revenue == Decimal("800")
+    assert detail.reconciliation.received == Decimal("600")
+    assert detail.reconciliation.pending_amount == Decimal("200")
+    assert detail.reconciliation.overpaid_amount == Decimal("0")
+
+
+def test_reconciliacao_pagamento_acima_do_total_nao_infla_faturamento(org_session):
+    """Comanda de R$800 com R$850 registrados em `Payment` (troco não
+    lançado / erro de lançamento) — Faturamento continua exatamente
+    R$800 (NUNCA lê `Payment`, item 6 do pedido), o excedente de R$50
+    aparece só como `overpaid_amount`, nunca como faturamento
+    adicional."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("800")}],
+        payments=[{"method": PaymentMethod.CASH, "amount": Decimal("850")}],
+        cash_register_id=cr.id,
+    )
+
+    detail = _revenue_detail(session, actor)
+    assert detail.kpi.value == Decimal("800")  # NUNCA 850 — Faturamento não lê Payment.
+    assert detail.reconciliation.revenue == Decimal("800")
+    assert detail.reconciliation.received == Decimal("850")
+    assert detail.reconciliation.pending_amount == Decimal("0")
+    assert detail.reconciliation.overpaid_amount == Decimal("50")
+
+
+def test_reconciliacao_multiplos_servicos_na_mesma_comanda_soma_corretamente(org_session):
+    """Comanda com 2 serviços (R$120 + R$680 = R$800) e pagamento exato
+    — Faturamento soma os 2 itens sem duplicar por causa do JOIN com
+    Payment, Recebido bate, sem pendência/excedente."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    corte_id = _service(session, org_id, name="Corte").id
+    coloracao_id = _service(session, org_id, name="Coloração").id
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, corte_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[
+            {"service_id": corte_id, "professional_id": prof.id, "price": Decimal("120"), "service_name": "Corte"},
+            {"service_id": coloracao_id, "professional_id": prof.id, "price": Decimal("680"), "service_name": "Coloração"},
+        ],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("800")}],
+        cash_register_id=cr.id,
+    )
+
+    detail = _revenue_detail(session, actor)
+    assert detail.kpi.value == Decimal("800")
+    assert detail.reconciliation.revenue == Decimal("800")
+    assert detail.reconciliation.received == Decimal("800")
+    assert detail.reconciliation.pending_amount == Decimal("0")
+    assert detail.reconciliation.overpaid_amount == Decimal("0")
+
+
+def test_reconciliacao_nao_faz_netting_entre_comandas_diferentes(org_session):
+    """Uma comanda paga R$50 A MAIS e outra paga R$30 A MENOS não podem
+    se cancelar num único "diferença líquida" — cada uma é uma
+    inconsistência distinta, calculada POR COMANDA (item explícito:
+    "não misture essas granularidades")."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    client_over = _client(session, org_id, name="Cliente Pagou a Mais")
+    appt_over = _appointment(session, org_id, branch.id, client_over.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client_over.id, appt_over.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("200")}],
+        payments=[{"method": PaymentMethod.CASH, "amount": Decimal("250")}],
+        cash_register_id=cr.id,
+    )
+
+    client_under = _client(session, org_id, name="Cliente Pagou a Menos")
+    appt_under = _appointment(session, org_id, branch.id, client_under.id, prof.id, service_id, start_at=_dt(2026, 8, 12, 9))
+    _closed_order(
+        session, org_id, branch.id, client_under.id, appt_under.id, closed_at=_dt(2026, 8, 12, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("200")}],
+        payments=[{"method": PaymentMethod.CASH, "amount": Decimal("170")}],
+        cash_register_id=cr.id,
+    )
+
+    detail = _revenue_detail(session, actor)
+    assert detail.kpi.value == Decimal("400")  # 200 + 200, Faturamento nunca lê Payment.
+    assert detail.reconciliation.revenue == Decimal("400")
+    assert detail.reconciliation.received == Decimal("420")  # 250 + 170
+    # Nunca (420 - 400) = 20 líquido: são R$30 pendentes de uma comanda
+    # e R$50 excedentes de outra, cada um pertence à sua granularidade.
+    assert detail.reconciliation.pending_amount == Decimal("30")
+    assert detail.reconciliation.overpaid_amount == Decimal("50")
+
+
+def test_reconciliacao_so_aparece_no_drill_down_de_revenue(org_session):
+    """Nenhum outro KPI carrega `reconciliation` — é específico do
+    drill-down de Faturamento."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 8, 10), price=Decimal("100"))
+
+    ticket_detail = dashboard_service.get_kpi_detail(
+        session, actor, key="ticket_average", branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+        compare_from=None, compare_to=None,
+    )
+    assert ticket_detail.reconciliation is None
+
+    received_detail = dashboard_service.get_kpi_detail(
+        session, actor, key="received", branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+        compare_from=None, compare_to=None,
+    )
+    assert received_detail.kpi.value == Decimal("100")
+    assert received_detail.reconciliation is None
+
+
 def test_desempenho_por_profissional_agrega_clientes_servicos_faturamento_e_ticket(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)

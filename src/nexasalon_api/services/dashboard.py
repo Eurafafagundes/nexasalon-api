@@ -4,6 +4,42 @@ faturamento diferentes entre Dashboard e Financeiro). Este módulo é a
 ÚNICA fonte de verdade de cada KPI abaixo — o frontend só apresenta.
 
 ===========================================================================
+TRÊS CONCEITOS — NUNCA MISTURAR AS GRANULARIDADES (item explícito de
+uma correção posterior ao desenho original deste módulo)
+===========================================================================
+
+VENDAS/FATURAMENTO = valor efetivamente VENDIDO em comandas fechadas
+válidas (`OrderItem`, ver definição abaixo). Mede o que foi vendido,
+independente de como/quando o dinheiro entrou.
+
+RECEBIDO = soma dos pagamentos efetivamente REGISTRADOS (`Payment.amount`)
+das mesmas comandas fechadas. Mede o que de fato entrou via `Payment`,
+independente de bater exatamente com o total vendido daquela comanda
+(pode ser menor — pagamento parcial registrado incorretamente — ou
+maior — pagamento em duplicidade/troco não registrado no domínio
+atual).
+
+MOVIMENTO DE CAIXA = movimentações monetárias reais do caixa
+(`CashRegister`/`CashMovement` — abertura, sangria, suprimento,
+fechamento). Granularidade de TESOURARIA, não de venda: um Recebido
+pode entrar em um caixa e nunca ter uma contrapartida de Movimento (ex.:
+pagamento fora do caixa) ou vice-versa. Este módulo NÃO calcula
+Movimento de Caixa — quem precisar dele usa `services/cash_register.py`
+diretamente; não duplicamos essa conta aqui.
+
+Faturamento e Recebido são as DUAS únicas granularidades calculadas por
+este módulo, e nunca se misturam: nenhuma função abaixo soma
+`Payment.amount` dentro do cálculo de Faturamento, nem soma
+`OrderItem.price` dentro do cálculo de Recebido. O KPI card principal
+("Faturamento") sempre reflete o que foi VENDIDO — é a métrica correta
+pra "como o salão está performando" (item 1 do pedido original). Um
+pagamento em duplicidade/a mais numa comanda NUNCA infla o Faturamento
+(estruturalmente impossível, já que Faturamento nem lê `Payment`); essa
+diferença aparece só como `overpaid_amount` no drill-down de
+Faturamento (`RevenueReconciliation`, `schemas/dashboard.py`), nunca
+como faturamento adicional.
+
+===========================================================================
 FONTE DE VERDADE DE CADA MÉTRICA (documentado aqui porque é o único
 lugar que efetivamente calcula cada uma)
 ===========================================================================
@@ -12,12 +48,21 @@ FATURAMENTO = soma de `OrderItem.price` de comandas (`Order`) com
 `status=CLOSED` e `closed_at` dentro do período. Não é
 `AppointmentItem.price` (valor no momento da RESERVA, pode nunca virar
 venda) nem `Payment.amount` somado direto (existe só pra "Formas de
-Pagamento", ver abaixo). Uma comanda só fica CLOSED depois que
-`services/orders.py::close_order` confere que o total pago cobre o
-total da comanda — ou seja, é dinheiro EFETIVAMENTE registrado, não
-estimativa. Esta é EXATAMENTE a mesma fórmula que `services/extract.py`
-(Financeiro > Extrato) já usa pra "Receitas" — escolhida de propósito
-pra o Dashboard nunca discordar do Financeiro.
+Pagamento" e pra "Recebido", ver abaixo/acima). Uma comanda só fica
+CLOSED depois que `services/orders.py::close_order` confere que o total
+pago cobre o total da comanda — ou seja, é dinheiro EFETIVAMENTE
+registrado, não estimativa. Esta é EXATAMENTE a mesma fórmula que
+`services/extract.py` (Financeiro > Extrato) já usa pra "Receitas" —
+escolhida de propósito pra o Dashboard nunca discordar do Financeiro.
+
+RECEBIDO = soma de `Payment.amount` das mesmas comandas fechadas no
+período (mesmo filtro de organização/unidade/data que o Faturamento,
+calculado sobre a MESMA população de `_PeriodData`, nunca uma query
+separada que poderia divergir de quais comandas entram). Exposto como
+KPI de drill-down (`GET /dashboard/kpi/received`) e, dentro do
+drill-down de Faturamento, como parte de `RevenueReconciliation` —
+nunca como um 7º card na visão geral (mantém os 6 KPIs principais como
+definidos, ver item 2 do pedido original).
 
 TICKET MÉDIO = Faturamento / quantidade de comandas fechadas no
 período (uma comanda com 2 serviços continua sendo 1 no denominador —
@@ -56,13 +101,16 @@ isso; o dado correto pra "quem gerou a venda" é sempre o da comanda).
 
 FORMAS DE PAGAMENTO = `Payment.amount` agrupado por `Payment.method`
 (bucketizado em 5 categorias — ver `PaymentMethodBucket`), das comandas
-fechadas no período. Esta é a ÚNICA métrica que usa `Payment`
-diretamente (é a única tabela com o método de pagamento). Na grande
-maioria dos casos o total bate exatamente com FATURAMENTO acima
-(`close_order` exige `paid_total >= total` da comanda); se algum dia
-existir pagamento MAIOR que o total (troco não fica registrado no
-domínio atual), os dois números podem divergir por essa diferença —
-ver limitação no relatório final.
+fechadas no período. Junto com RECEBIDO (acima), são as duas únicas
+métricas que usam `Payment` diretamente (é a única tabela com o método
+de pagamento e o valor efetivamente registrado como entrada). Na
+grande maioria dos casos o total bate exatamente com FATURAMENTO acima
+(`close_order` exige `paid_total >= total` da comanda); quando não bate
+— pagamento MAIOR que o total (troco não fica registrado no domínio
+atual) ou, numa comanda construída fora do fluxo normal, pagamento
+MENOR — a diferença fica explícita em `RevenueReconciliation`
+(`pending_amount`/`overpaid_amount`), nunca escondida nem absorvida
+silenciosamente pelo Faturamento.
 
 RETENÇÃO 90 DIAS: ver docstring de `_compute_retention_rate` — cuidado
 extra com censura temporal (não pode confundir "cliente não voltou"
@@ -101,6 +149,7 @@ from nexasalon_api.schemas.dashboard import (
     PaymentMethodRow,
     ProfessionalPerformanceRow,
     RetentionSummary,
+    RevenueReconciliation,
     SeriesPoint,
     StatusDistributionRow,
     TopServiceRow,
@@ -122,7 +171,14 @@ _PAYMENT_METHOD_BUCKET: dict[PaymentMethod, PaymentMethodBucket] = {
     PaymentMethod.BANK_SLIP: PaymentMethodBucket.OTHER,
 }
 
-_KPI_KEYS = {"revenue", "ticket_average", "clients_served", "appointments_count", "no_show_rate", "new_clients"}
+_KPI_KEYS = {
+    "revenue", "ticket_average", "clients_served", "appointments_count", "no_show_rate", "new_clients",
+    # "received" não é um dos 6 cards da visão geral (mantém o layout
+    # executivo original) — só é acessível via drill-down próprio
+    # (`GET /dashboard/kpi/received`) e embutido no drill-down de
+    # `revenue` via `RevenueReconciliation`.
+    "received",
+}
 
 
 @dataclass(frozen=True)
@@ -140,7 +196,8 @@ class _OrderRow:
     order_id: uuid.UUID
     client_id: uuid.UUID
     closed_at: datetime
-    total: Decimal
+    total: Decimal  # FATURAMENTO desta comanda — soma de `OrderItem.price`, nunca `Payment`.
+    received: Decimal  # RECEBIDO desta comanda — soma de `Payment.amount`, granularidade separada (ver docstring do módulo).
 
 
 @dataclass
@@ -191,8 +248,35 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
     )
     if filters.branch_id is not None:
         order_stmt = order_stmt.where(Order.branch_id == filters.branch_id)
+
+    # RECEBIDO por comanda — query SEPARADA (nunca um join único com
+    # OrderItem+Payment na mesma consulta, que duplicaria por causa do
+    # produto cartesiano itens×pagamentos; ver
+    # `test_top_servicos_agrega_por_servico_sem_duplicar_faturamento`).
+    # Mesmo filtro de organização/unidade/status/data que `order_stmt`,
+    # pra somar Payment só das comandas que também entram no Faturamento.
+    received_stmt = (
+        select(Payment.order_id, func.coalesce(func.sum(Payment.amount), 0))
+        .join(Order, Order.id == Payment.order_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Order.status == OrderStatus.CLOSED,
+            Order.closed_at >= date_from,
+            Order.closed_at < date_to,
+        )
+        .group_by(Payment.order_id)
+    )
+    if filters.branch_id is not None:
+        received_stmt = received_stmt.where(Order.branch_id == filters.branch_id)
+    received_by_order: dict[uuid.UUID, Decimal] = {
+        row[0]: Decimal(row[1]) for row in session.execute(received_stmt).all()
+    }
+
     orders = [
-        _OrderRow(order_id=row[0], client_id=row[1], closed_at=row[2], total=Decimal(row[3]))
+        _OrderRow(
+            order_id=row[0], client_id=row[1], closed_at=row[2], total=Decimal(row[3]),
+            received=received_by_order.get(row[0], Decimal("0")),
+        )
         for row in session.execute(order_stmt).all()
     ]
 
@@ -361,6 +445,34 @@ def _kpi_value(kind: KpiKind, current: Decimal, previous: Decimal | None) -> Kpi
 
 def _revenue(data: _PeriodData) -> Decimal:
     return sum((row.total for row in data.orders), Decimal("0"))
+
+
+def _received(data: _PeriodData) -> Decimal:
+    """RECEBIDO — soma de `Payment.amount` das mesmas comandas fechadas
+    (granularidade separada de Faturamento, ver docstring do módulo).
+    Número CRU (transparente) — não capado por comanda; inconsistências
+    por comanda aparecem em `_revenue_reconciliation_totals`, nunca
+    escondidas aqui."""
+    return sum((row.received for row in data.orders), Decimal("0"))
+
+
+def _revenue_reconciliation_totals(data: _PeriodData) -> tuple[Decimal, Decimal]:
+    """`(pending_total, overpaid_total)` — calculado POR COMANDA, nunca
+    a partir da diferença agregada (`_revenue(data) - _received(data)`).
+    Uma comanda paga R$50 a mais e outra paga R$50 a menos não podem se
+    cancelar num único "diferença = 0": são duas inconsistências
+    diferentes, cada uma pertence à sua própria comanda (item explícito
+    do pedido: "não misture essas granularidades"). `overpaid_total`
+    nunca é somado ao Faturamento em nenhum lugar deste módulo."""
+    pending_total = Decimal("0")
+    overpaid_total = Decimal("0")
+    for row in data.orders:
+        diff = row.total - row.received
+        if diff > 0:
+            pending_total += diff
+        elif diff < 0:
+            overpaid_total += -diff
+    return pending_total, overpaid_total
 
 
 def _orders_count(data: _PeriodData) -> int:
@@ -673,6 +785,18 @@ def _revenue_series_values(buckets: list[tuple[datetime, datetime]], data: _Peri
     return totals
 
 
+def _received_series_values(buckets: list[tuple[datetime, datetime]], data: _PeriodData) -> list[Decimal]:
+    """RECEBIDO por bucket — mesmo bucketing por `row.closed_at` que
+    `_revenue_series_values` (a comanda é a mesma, o que muda é qual
+    campo somamos: `received` em vez de `total`)."""
+    totals = [Decimal("0")] * len(buckets)
+    for row in data.orders:
+        idx = _bucket_index(buckets, row.closed_at)
+        if idx is not None:
+            totals[idx] += row.received
+    return totals
+
+
 # ---------------------------------------------------------------------------
 # Orquestração pública.
 # ---------------------------------------------------------------------------
@@ -835,6 +959,8 @@ def get_kpi_detail(
             return None
         if key == "revenue":
             return _revenue_series_values(bucket_list, period_data)
+        if key == "received":
+            return _received_series_values(bucket_list, period_data)
         if key in ("clients_served", "appointments_count", "ticket_average", "no_show_rate"):
             return _generic_bucket_values(key, bucket_list, period_data)
         if key == "new_clients":
@@ -848,7 +974,23 @@ def get_kpi_detail(
     kind, current_total, previous_total = _kpi_totals(session, filters, key, current, comparison)
     kpi = _kpi_value(kind, current_total, previous_total)
 
-    return DashboardKpiDetailResponse(key=key, kpi=kpi, granularity=granularity, series=series, insights=[])
+    # Reconciliação Faturamento×Recebido — só no drill-down de `revenue`
+    # (item explícito do pedido, granularidade do PERÍODO ATUAL; não faz
+    # sentido "comparar" pendência/excedente entre dois períodos, é um
+    # instantâneo de conciliação, não uma métrica de tendência).
+    reconciliation = None
+    if key == "revenue":
+        pending_total, overpaid_total = _revenue_reconciliation_totals(current)
+        reconciliation = RevenueReconciliation(
+            revenue=_revenue(current),
+            received=_received(current),
+            pending_amount=pending_total,
+            overpaid_amount=overpaid_total,
+        )
+
+    return DashboardKpiDetailResponse(
+        key=key, kpi=kpi, granularity=granularity, series=series, insights=[], reconciliation=reconciliation,
+    )
 
 
 def _generic_bucket_values(key: str, buckets: list[tuple[datetime, datetime]], data: _PeriodData) -> list[Decimal]:
@@ -916,6 +1058,8 @@ def _kpi_totals(
 ) -> tuple[KpiKind, Decimal, Decimal | None]:
     if key == "revenue":
         return KpiKind.CURRENCY, _revenue(current), (_revenue(comparison) if comparison else None)
+    if key == "received":
+        return KpiKind.CURRENCY, _received(current), (_received(comparison) if comparison else None)
     if key == "ticket_average":
         return KpiKind.CURRENCY, _ticket_average(current), (_ticket_average(comparison) if comparison else None)
     if key == "clients_served":
