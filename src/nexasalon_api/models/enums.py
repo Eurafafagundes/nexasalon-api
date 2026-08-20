@@ -207,6 +207,88 @@ class AgendaAccessScope(str, Enum):
     SELECTED = "selected"
 
 
+class ProductUnit(str, Enum):
+    """Unidade de medida do Produto — catálogo fechado (item "prefira
+    enum controlado em vez de texto livre", mesma filosofia de
+    `BrazilianState`) grande o bastante pra cobrir cosmético/insumo de
+    salão sem precisar de tabela de unidades customizável nesta etapa."""
+
+    UNIT = "unit"  # unidade (ex.: escova, esmalte)
+    ML = "ml"
+    LITER = "liter"
+    GRAM = "gram"
+    KG = "kg"
+    BOX = "box"  # caixa
+    PACK = "pack"  # pacote
+    METER = "meter"
+    DOSE = "dose"
+    PAIR = "pair"  # par (ex.: luvas)
+
+
+class StockMovementDirection(str, Enum):
+    """ENTRADA/SAÍDA — a movimentação sempre aumenta (`IN`) ou diminui
+    (`OUT`) o estoque de UM produto em UMA unidade; nunca as duas coisas
+    na mesma linha (ver `models/stock.py`)."""
+
+    IN = "in"
+    OUT = "out"
+
+
+class StockMovementReason(str, Enum):
+    """Motivo da movimentação — catálogo fechado por direção (ver
+    `STOCK_MOVEMENT_REASONS_BY_DIRECTION` abaixo). `ADJUSTMENT` existe
+    nas duas direções (correção manual, pra mais ou pra menos);
+    `INVENTORY_COUNT` também existe nas duas direções mas é reservado
+    exclusivamente ao fechamento de um `InventoryCount` (nunca criado
+    manualmente por uma rota de movimentação avulsa) — separar os dois
+    motivos preserva a distinção "ajuste manual pontual" vs "resultado
+    de uma contagem formal de inventário" no histórico."""
+
+    PURCHASE = "purchase"  # compra (IN)
+    RETURN = "return"  # devolução (IN)
+    ADJUSTMENT = "adjustment"  # ajuste manual (IN ou OUT)
+    INVENTORY_COUNT = "inventory_count"  # ajuste de inventário (IN ou OUT)
+    TRANSFER_IN = "transfer_in"  # transferência recebida (IN)
+    SALE = "sale"  # venda (OUT) — reservado para a integração da Etapa C
+    INTERNAL_USE = "internal_use"  # uso interno (OUT)
+    DAMAGE = "damage"  # perda/avaria (OUT)
+    TRANSFER_OUT = "transfer_out"  # transferência enviada (OUT)
+
+
+STOCK_MOVEMENT_REASONS_BY_DIRECTION: dict[StockMovementDirection, frozenset[StockMovementReason]] = {
+    StockMovementDirection.IN: frozenset(
+        {
+            StockMovementReason.PURCHASE,
+            StockMovementReason.RETURN,
+            StockMovementReason.ADJUSTMENT,
+            StockMovementReason.INVENTORY_COUNT,
+            StockMovementReason.TRANSFER_IN,
+        }
+    ),
+    StockMovementDirection.OUT: frozenset(
+        {
+            StockMovementReason.SALE,
+            StockMovementReason.INTERNAL_USE,
+            StockMovementReason.DAMAGE,
+            StockMovementReason.ADJUSTMENT,
+            StockMovementReason.INVENTORY_COUNT,
+            StockMovementReason.TRANSFER_OUT,
+        }
+    ),
+}
+
+
+class InventoryCountStatus(str, Enum):
+    """Um inventário `OPEN` ainda recebe contagens (`counted_quantity`)
+    linha a linha; ao fechar (`CLOSED`) vira somente-leitura — as
+    movimentações de ajuste já foram geradas e o estoque já reflete a
+    contagem, sem novas edições retroativas (mesma filosofia de
+    `CashRegister`: fechado nunca recebe novo lançamento)."""
+
+    OPEN = "open"
+    CLOSED = "closed"
+
+
 def pg_enum(enum_cls, name: str):
     """Enum nativo do Postgres, tipo já criado na migration 0001.
 

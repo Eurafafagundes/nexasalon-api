@@ -505,6 +505,8 @@ def test_permissions_efetivas_por_role(client, scenario):
         "finance.view", "finance.manage", "reports.view", "settings.manage",
         # Comanda/Pagamento (migration 0013) — OWNER recebe as 4.
         "orders.view", "orders.manage", "orders.edit_price", "payments.register",
+        # Estoque (migration 0020) — OWNER recebe as 3.
+        "inventory.view", "inventory.view_cost", "inventory.manage",
     }
 
     recep_body = _login(client, scenario.recep_email, scenario.password)
@@ -521,6 +523,10 @@ def test_permissions_efetivas_por_role(client, scenario):
         # finance.manage (abrir/fechar caixa, sangria, suprimento)
         # continua só com OWNER/ADMIN.
         "finance.view",
+        # Estoque (migration 0020) — RECEPTIONIST só vê (precisa saber o
+        # que tem em estoque pra vender/avisar o cliente), nunca gerencia
+        # nem vê custo (ver docstring da migration 0020).
+        "inventory.view",
     }
 
     prof_body = _login(client, scenario.prof_email, scenario.password)

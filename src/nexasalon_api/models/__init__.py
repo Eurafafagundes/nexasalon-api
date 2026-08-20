@@ -18,6 +18,8 @@ from .appointment import Recurrence, Appointment, AppointmentItem  # noqa: F401
 from .appointment_status_style import AppointmentStatusStyle  # noqa: F401
 from .cash_register import CashRegister, CashMovement  # noqa: F401
 from .order import Order, OrderItem, Payment  # noqa: F401
+from .product import Product, StockLevel  # noqa: F401
+from .stock import StockMovement, StockTransfer, InventoryCount, InventoryCountItem  # noqa: F401
 from .tag import Tag, AppointmentTag  # noqa: F401
 from .audit import AuditLog  # noqa: F401
 
@@ -49,6 +51,12 @@ __all__ = [
     "Order",
     "OrderItem",
     "Payment",
+    "Product",
+    "StockLevel",
+    "StockMovement",
+    "StockTransfer",
+    "InventoryCount",
+    "InventoryCountItem",
     "Tag",
     "AppointmentTag",
     "AuditLog",
