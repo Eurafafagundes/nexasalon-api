@@ -53,16 +53,24 @@ from nexasalon_api.models.order import Order
 from nexasalon_api.repositories import (
     appointment_repo,
     audit_log_repo,
+    client_repo,
     order_item_repo,
     order_product_item_repo,
     order_repo,
+    organization_repo,
     payment_repo,
     product_repo,
     professional_repo,
     service_repo,
     user_repo,
 )
-from nexasalon_api.schemas.order import OrderClose, OrderItemUpdate, OrderProductItemCreate, OrderProductItemUpdate
+from nexasalon_api.schemas.order import (
+    OrderClose,
+    OrderItemUpdate,
+    OrderProductItemCreate,
+    OrderProductItemUpdate,
+    OrderReceiptRead,
+)
 from nexasalon_api.services import appointments as appointments_service
 from nexasalon_api.services import cash_register as cash_register_service
 from nexasalon_api.services import stock as stock_service
@@ -168,6 +176,25 @@ def list_orders(
 
 def get_order_by_appointment(session: Session, actor: ActorContext, appointment_id: uuid.UUID) -> Order | None:
     return order_repo.get_by_appointment(session, actor.organization_id, appointment_id)
+
+
+def get_order_receipt(session: Session, actor: ActorContext, order_id: uuid.UUID) -> OrderReceiptRead:
+    """Comprovante de Atendimento (Etapa D) — ver docstring de
+    `schemas/order.py::OrderReceiptRead` pro raciocínio completo
+    (snapshot-only, nunca NF/NFS-e, sem observações internas). Só
+    comandas FECHADAS emitem comprovante — item do pedido "em uma
+    Comanda fechada/paga, disponibilizar 'Imprimir comprovante'"; uma
+    comanda aberta ainda não tem pagamento registrado pra mostrar."""
+    order = _get_order_or_404(session, actor.organization_id, order_id)
+    if order.status != OrderStatus.CLOSED:
+        raise ValidationDomainError("Comprovante só está disponível para comandas fechadas.")
+    client = client_repo.get(session, actor.organization_id, order.client_id)
+    if client is None:
+        raise NotFoundError("Cliente da comanda não encontrado.")
+    organization = organization_repo.get(session, actor.organization_id)
+    if organization is None:
+        raise NotFoundError("Organização não encontrada.")
+    return OrderReceiptRead.build(order, client, organization)
 
 
 def update_order_item(

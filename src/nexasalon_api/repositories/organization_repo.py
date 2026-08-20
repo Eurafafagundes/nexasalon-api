@@ -16,3 +16,11 @@ def create(session: Session, **fields) -> Organization:
     session.add(organization)
     session.flush()
     return organization
+
+
+def save(session: Session, organization: Organization) -> Organization:
+    """`organization` já deve ter os atributos alterados via `setattr`
+    (ver `services/organizations.py::update_organization`) — mesmo
+    padrão de `client_repo.save`."""
+    session.flush()
+    return organization

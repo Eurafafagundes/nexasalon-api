@@ -6,7 +6,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, TimestampMixin, UUIDPKMixin
-from .enums import OrganizationStatus, pg_enum
+from .enums import BrazilianState, OrganizationStatus, pg_enum
 
 
 class Organization(Base, UUIDPKMixin, TimestampMixin):
@@ -16,12 +16,41 @@ class Organization(Base, UUIDPKMixin, TimestampMixin):
     `OrganizationMembership.role = owner` — um segundo ponteiro de "dono"
     seria mais uma fonte de verdade duplicada (mesmo problema que o
     ajuste 1 resolveu para Professional/Membership).
+
+    Etapa D ("Informações do Estabelecimento") — antes de adicionar
+    colunas novas, o modelo existente foi inspecionado (item explícito
+    "não duplique o que já existir", mesmo raciocínio já aplicado ao
+    Client na Etapa C.1). Mapeamento decidido:
+
+      REUSADOS (já existiam, sem uso concreto em código antes desta
+      etapa — `document`/`business_type` nunca eram lidos/escritos em
+      lugar nenhum, confirmado por grep):
+        - `name`       -> nome fantasia (já é o nome de exibição da org)
+        - `document`   -> CNPJ (genérico o bastante, cabe perfeitamente)
+        - `business_type` -> categoria do estabelecimento
+        - `phone`, `email`, `timezone` -> mesmos campos, reusados direto
+
+      NOVOS (conceito que não existia antes):
+        - `legal_name` (razão social — distinto de `name`/nome fantasia)
+        - `logo_url` (upload via `core/storage.py`)
+        - `cep`/`state`/`city`/`neighborhood`/`address_line`/
+          `address_number`/`complement` (Organization não tinha NENHUM
+          campo de endereço — `Branch` tem os seus, propositalmente
+          separados, ver docstring de `Branch` abaixo)
+        - `whatsapp` (só existia `phone`/`email` genéricos)
+        - `instagram`, `website`
+
+    Todos os campos novos são NULLABLE/opcionais — "campos devem ser
+    opcionais quando não forem tecnicamente indispensáveis" e "não
+    impedir operação do salão porque CNPJ/endereço não foi preenchido"
+    são requisitos explícitos do pedido.
     """
 
     __tablename__ = "organizations"
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     slug: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    # Reusado como CNPJ nesta etapa — ver docstring da classe.
     document: Mapped[str | None] = mapped_column(String(32))
     email: Mapped[str | None] = mapped_column(String(255))
     phone: Mapped[str | None] = mapped_column(String(32))
@@ -31,13 +60,31 @@ class Organization(Base, UUIDPKMixin, TimestampMixin):
     # "barbearia", "salao_beleza", "estetica", "nail_designer", "spa").
     # Nenhuma regra de negócio, serviço ou funcionalidade pode ficar
     # condicionada a este valor: uma barbearia pode cadastrar "Massagem",
-    # um salão pode cadastrar "Barba" — o sistema nunca impede.
+    # um salão pode cadastrar "Barba" — o sistema nunca impede. Reusado
+    # nesta etapa como "categoria do estabelecimento".
     business_type: Mapped[str | None] = mapped_column(String(50))
     status: Mapped[OrganizationStatus] = mapped_column(
         pg_enum(OrganizationStatus, "organization_status"),
         nullable=False,
         server_default=OrganizationStatus.TRIAL.value,
     )
+
+    # --- Etapa D: campos novos ---
+    legal_name: Mapped[str | None] = mapped_column(String(255))
+    logo_url: Mapped[str | None] = mapped_column(String(500))
+    cep: Mapped[str | None] = mapped_column(String(8))
+    # Reusa o MESMO tipo enum `brazilian_state` já criado pra
+    # `Client.state` na migration 0015 — nunca cria um segundo enum
+    # equivalente.
+    state: Mapped[BrazilianState | None] = mapped_column(pg_enum(BrazilianState, "brazilian_state"))
+    city: Mapped[str | None] = mapped_column(String(120))
+    neighborhood: Mapped[str | None] = mapped_column(String(120))
+    address_line: Mapped[str | None] = mapped_column(String(255))
+    address_number: Mapped[str | None] = mapped_column(String(20))
+    complement: Mapped[str | None] = mapped_column(String(120))
+    whatsapp: Mapped[str | None] = mapped_column(String(32))
+    instagram: Mapped[str | None] = mapped_column(String(120))
+    website: Mapped[str | None] = mapped_column(String(255))
 
     branches: Mapped[list["Branch"]] = relationship(back_populates="organization")
 

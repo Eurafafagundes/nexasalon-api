@@ -114,6 +114,38 @@ class Settings(BaseSettings):
     rate_limit_select_organization_max_attempts: int = 20
     rate_limit_select_organization_window_seconds: int = 300
 
+    # --- Storage de arquivos (Etapa D — logo do estabelecimento) ---
+    # Nenhuma infraestrutura de storage existia no projeto antes desta
+    # etapa (grep confirmado em pyproject.toml/src/). Escolha: um
+    # backend S3-COMPATÍVEL (`core/storage.py::S3StorageBackend`, via
+    # `boto3`) — funciona com AWS S3, Cloudflare R2, DigitalOcean
+    # Spaces ou MinIO trocando só `storage_endpoint_url`, sem exigir um
+    # provedor específico. Explicitamente NUNCA: disco local
+    # improvisado (não sobrevive a deploy/múltiplas instâncias) nem
+    # base64 grande em coluna do banco (item proibido no pedido).
+    # Todos os campos são opcionais/`None` por padrão — a aplicação
+    # sobe normalmente sem storage configurado; upload de logo
+    # simplesmente fica indisponível (o campo `Organization.logo_url`
+    # já é opcional, então o salão opera 100% sem logo cadastrada).
+    storage_endpoint_url: str | None = None
+    storage_region: str | None = None
+    storage_bucket: str | None = None
+    storage_access_key_id: str | None = None
+    storage_secret_access_key: str | None = None
+    # URL pública base pra montar o link final do arquivo (ex.: um CDN
+    # na frente do bucket, ou a própria URL pública do bucket/endpoint).
+    # Quando `None`, cai no padrão `{endpoint}/{bucket}/{key}`.
+    storage_public_base_url: str | None = None
+    # Content-types aceitos e tamanho máximo pro upload de logo —
+    # validado no backend (nunca confiar só no `accept` do <input> do
+    # frontend, mesmo raciocínio já aplicado ao CPF na Etapa C.1).
+    storage_logo_max_bytes: int = 5 * 1024 * 1024
+    storage_logo_allowed_content_types: Annotated[list[str], NoDecode] = [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+    ]
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="NEXASALON_", extra="ignore")
 
     @field_validator("cors_allowed_origins", mode="before")
@@ -128,6 +160,18 @@ class Settings(BaseSettings):
             return []
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
+
+    @field_validator("storage_logo_allowed_content_types", mode="before")
+    @classmethod
+    def _parse_storage_logo_allowed_content_types(cls, value):
+        # Mesmo raciocínio de `_parse_cors_origins` acima — `NoDecode`
+        # desliga o parsing JSON automático pra aceitar uma lista
+        # comma-separated simples via env.
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            return [v.strip() for v in value.split(",") if v.strip()]
         return value
 
     @model_validator(mode="after")

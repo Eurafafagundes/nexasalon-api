@@ -14,6 +14,7 @@ from nexasalon_api.schemas.order import (
     OrderProductItemCreate,
     OrderProductItemUpdate,
     OrderRead,
+    OrderReceiptRead,
 )
 from nexasalon_api.services import orders as orders_service
 
@@ -82,6 +83,25 @@ def get_order(
 ) -> OrderRead:
     order = orders_service.get_order(session, actor, order_id)
     return OrderRead.from_order(order)
+
+
+@router.get(
+    "/{order_id}/receipt",
+    response_model=OrderReceiptRead,
+    summary="Comprovante de Atendimento (não fiscal) — só comandas fechadas",
+)
+def get_order_receipt(
+    order_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> OrderReceiptRead:
+    """Reusa `orders.view` — mesma permissão que já controla ver a
+    Comanda (item do pedido "respeitar as permissões existentes...
+    emitir/imprimir comprovante"). Ver docstring de
+    `schemas/order.py::OrderReceiptRead` pra tudo que este endpoint
+    deliberadamente NÃO retorna (observações internas, custo, dados
+    administrativos)."""
+    return orders_service.get_order_receipt(session, actor, order_id)
 
 
 @router.patch(

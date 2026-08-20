@@ -63,3 +63,13 @@ class TooManyRequestsError(DomainError):
 
     status_code = 429
     error_type = "rate_limited"
+
+
+class ServiceUnavailableError(DomainError):
+    """Dependência externa opcional não configurada neste ambiente —
+    ex.: upload de logo (Etapa D) quando nenhum storage foi
+    configurado. Diferente de `ValidationDomainError`: não é o cliente
+    que errou o payload, é o ambiente que não tem o recurso ligado."""
+
+    status_code = 503
+    error_type = "service_unavailable"

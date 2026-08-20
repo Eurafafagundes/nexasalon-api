@@ -6,8 +6,10 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import CardBrand, OrderStatus, PaymentMethod
 from nexasalon_api.models.order import Order
+from nexasalon_api.models.organization import Organization
 
 _CARD_METHODS = frozenset({PaymentMethod.DEBIT, PaymentMethod.CREDIT})
 
@@ -224,4 +226,144 @@ class OrderRead(BaseModel):
             closed_at=order.closed_at,
             created_by=order.created_by,
             closed_by=order.closed_by,
+        )
+
+
+# --- Comprovante de Atendimento (Etapa D) -----------------------------
+#
+# NÃO é nota fiscal / NFS-e — item explícito do pedido ("nunca chamar
+# de NF"). É um documento não fiscal, construído inteiramente a partir
+# dos SNAPSHOTS já existentes de `OrderItem`/`OrderProductItem`/
+# `Payment` (preço/nome/profissional/forma de pagamento no momento da
+# venda) — NUNCA consulta o catálogo atual (`Service.default_price`/
+# `Product.sale_price`) pra reconstruir uma venda antiga. Se o catálogo
+# mudar amanhã, um comprovante de uma comanda fechada hoje continua
+# mostrando exatamente os valores que ela tinha no fechamento.
+#
+# Deliberadamente NÃO inclui: `Client.notes` (observações internas do
+# estabelecimento — nunca aparecem no comprovante), custo de estoque
+# (`Product.cost_price`/`StockMovement.unit_cost`), `created_by`/
+# `created_by_name` de pagamento nem qualquer outro dado administrativo
+# interno — só o que o cliente final pode legitimamente ver.
+#
+# Nenhuma permission nova: reusa `orders.view` (mesma permissão que já
+# controla ver a Comanda) tanto pra visualizar quanto pra
+# emitir/imprimir o comprovante — item do pedido "respeitar as
+# permissões existentes", sem inventar uma chave nova sem necessidade
+# comprovada (mesmo raciocínio já aplicado à CPF/unicidade na Etapa C.1).
+
+
+class ReceiptClient(BaseModel):
+    name: str
+    phone: str | None
+    email: str | None
+
+
+class ReceiptEstablishment(BaseModel):
+    """Todos os campos opcionais — "quando disponível" (item explícito
+    do pedido). Um estabelecimento sem CNPJ/logo/endereço ainda emite
+    comprovante normalmente, só com esses campos ausentes."""
+
+    name: str
+    legal_name: str | None
+    document: str | None
+    logo_url: str | None
+    phone: str | None
+    whatsapp: str | None
+    email: str | None
+    cep: str | None
+    state: str | None
+    city: str | None
+    neighborhood: str | None
+    address_line: str | None
+    address_number: str | None
+    complement: str | None
+
+
+class ReceiptItem(BaseModel):
+    kind: str  # "service" | "product"
+    name: str
+    professional_name: str | None  # só serviços
+    quantity: Decimal
+    unit_price: Decimal
+    total: Decimal
+
+
+class ReceiptPayment(BaseModel):
+    method: PaymentMethod
+    card_brand: CardBrand | None
+    installments: int | None
+    amount: Decimal
+
+
+class OrderReceiptRead(BaseModel):
+    """Ver docstring da seção acima — construído 100% de snapshots já
+    persistidos, nunca do catálogo vivo."""
+
+    model_config = ConfigDict(from_attributes=False)
+
+    order_number: int
+    closed_at: datetime | None
+    client: ReceiptClient
+    establishment: ReceiptEstablishment
+    items: list[ReceiptItem]
+    payments: list[ReceiptPayment]
+    subtotal: Decimal
+    total: Decimal
+
+    @classmethod
+    def build(cls, order: Order, client: Client, organization: Organization) -> "OrderReceiptRead":
+        service_items = [
+            ReceiptItem(
+                kind="service",
+                name=item.service_name,
+                professional_name=item.professional_name,
+                quantity=Decimal("1"),
+                unit_price=item.price,
+                total=item.price,
+            )
+            for item in order.items
+        ]
+        product_items = [
+            ReceiptItem(
+                kind="product",
+                name=item.product_name,
+                professional_name=None,
+                quantity=item.quantity,
+                unit_price=item.unit_price,
+                total=item.quantity * item.unit_price,
+            )
+            for item in order.product_items
+        ]
+        items = service_items + product_items
+        subtotal = sum((i.total for i in items), Decimal("0"))
+        return cls(
+            order_number=order.order_number,
+            closed_at=order.closed_at,
+            client=ReceiptClient(name=client.name, phone=client.phone, email=client.email),
+            establishment=ReceiptEstablishment(
+                name=organization.name,
+                legal_name=organization.legal_name,
+                document=organization.document,
+                logo_url=organization.logo_url,
+                phone=organization.phone,
+                whatsapp=organization.whatsapp,
+                email=organization.email,
+                cep=organization.cep,
+                state=organization.state.value if organization.state else None,
+                city=organization.city,
+                neighborhood=organization.neighborhood,
+                address_line=organization.address_line,
+                address_number=organization.address_number,
+                complement=organization.complement,
+            ),
+            items=items,
+            payments=[
+                ReceiptPayment(
+                    method=p.method, card_brand=p.card_brand, installments=p.installments, amount=p.amount
+                )
+                for p in order.payments
+            ],
+            subtotal=subtotal,
+            total=subtotal,
         )
