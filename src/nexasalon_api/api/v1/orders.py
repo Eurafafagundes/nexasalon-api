@@ -7,7 +7,14 @@ from sqlalchemy.orm import Session
 from nexasalon_api.api.deps import get_db, require_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.models.enums import OrderStatus
-from nexasalon_api.schemas.order import OrderClose, OrderCreate, OrderItemPriceUpdate, OrderRead
+from nexasalon_api.schemas.order import (
+    OrderClose,
+    OrderCreate,
+    OrderItemUpdate,
+    OrderProductItemCreate,
+    OrderProductItemUpdate,
+    OrderRead,
+)
 from nexasalon_api.services import orders as orders_service
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -16,6 +23,13 @@ _view = require_permission("orders.view")
 _manage = require_permission("orders.manage")
 _edit_price = require_permission("orders.edit_price")
 _register_payment = require_permission("payments.register")
+
+# Produto na comanda reaproveita as MESMAS fronteiras de autorização de
+# serviço na comanda — adicionar/remover produto é "gerenciar a
+# comanda" (`orders.manage`), editar quantidade/preço de uma linha já
+# adicionada é "editar valor da comanda" (`orders.edit_price`, mesma
+# permission que já protege editar preço de serviço). Nenhuma
+# permission nova (ver docstring da migration 0021).
 
 
 @router.get(
@@ -70,15 +84,66 @@ def get_order(
     return OrderRead.from_order(order)
 
 
-@router.patch("/{order_id}/items/{item_id}", response_model=OrderRead, summary="Editar preço de uma linha da comanda")
-def update_item_price(
+@router.patch(
+    "/{order_id}/items/{item_id}",
+    response_model=OrderRead,
+    summary="Editar preço e/ou duração de uma linha de serviço da comanda",
+)
+def update_order_item(
     order_id: uuid.UUID,
     item_id: uuid.UUID,
-    payload: OrderItemPriceUpdate,
+    payload: OrderItemUpdate,
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_edit_price),
 ) -> OrderRead:
-    order = orders_service.update_item_price(session, actor, order_id, item_id, payload)
+    order = orders_service.update_order_item(session, actor, order_id, item_id, payload)
+    return OrderRead.from_order(order)
+
+
+@router.post(
+    "/{order_id}/products",
+    response_model=OrderRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Adicionar produto à comanda aberta",
+)
+def add_product_item(
+    order_id: uuid.UUID,
+    payload: OrderProductItemCreate,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_manage),
+) -> OrderRead:
+    order = orders_service.add_product_item(session, actor, order_id, payload)
+    return OrderRead.from_order(order)
+
+
+@router.patch(
+    "/{order_id}/products/{item_id}",
+    response_model=OrderRead,
+    summary="Editar quantidade e/ou preço de uma linha de produto da comanda",
+)
+def update_product_item(
+    order_id: uuid.UUID,
+    item_id: uuid.UUID,
+    payload: OrderProductItemUpdate,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_edit_price),
+) -> OrderRead:
+    order = orders_service.update_product_item(session, actor, order_id, item_id, payload)
+    return OrderRead.from_order(order)
+
+
+@router.delete(
+    "/{order_id}/products/{item_id}",
+    response_model=OrderRead,
+    summary="Remover produto da comanda aberta (nunca gera baixa de estoque)",
+)
+def remove_product_item(
+    order_id: uuid.UUID,
+    item_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_manage),
+) -> OrderRead:
+    order = orders_service.remove_product_item(session, actor, order_id, item_id)
     return OrderRead.from_order(order)
 
 

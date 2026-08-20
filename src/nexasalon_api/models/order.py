@@ -14,7 +14,21 @@ Três camadas de preço, cada uma imutável pela camada seguinte:
   3. `OrderItem.price`            — snapshot da COMANDA, começa igual ao
                                      item 2 mas é editável (lápis na UI)
                                      independentemente dos outros dois.
-"""
+
+Etapa C (Estoque ↔ Comanda): `OrderProductItem` é uma linha de PRODUTO
+dentro da comanda — deliberadamente uma tabela separada de `OrderItem`
+(item explícito "separar claramente item de serviço e item de
+produto"), nunca um `service_id`/`professional_id` nulável enxertado em
+`OrderItem`. `unit_price` é snapshot de `Product.sale_price` no momento
+em que o produto é adicionado à comanda (mesma filosofia de
+`OrderItem.price`: editar aqui nunca escreve de volta no catálogo).
+`stock_movement_id` fica `NULL` enquanto a comanda está aberta —
+produto removido antes do fechamento nunca gerou baixa (não há
+movimentação pra desfazer, porque nenhuma foi criada ainda); só é
+preenchido no FECHAMENTO da comanda (`services/orders.py::close_order`
+-> `services/stock.py::record_sale_movement`), e funciona como o
+marcador de idempotência que impede uma segunda baixa pro mesmo item
+(ver docstring de `close_order`)."""
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -77,6 +91,9 @@ class Order(Base, UUIDPKMixin, TimestampMixin):
     items: Mapped[list["OrderItem"]] = relationship(
         back_populates="order", cascade="all, delete-orphan", order_by="OrderItem.created_at"
     )
+    product_items: Mapped[list["OrderProductItem"]] = relationship(
+        back_populates="order", cascade="all, delete-orphan", order_by="OrderProductItem.created_at"
+    )
     payments: Mapped[list["Payment"]] = relationship(
         back_populates="order", cascade="all, delete-orphan", order_by="Payment.created_at"
     )
@@ -122,6 +139,45 @@ class OrderItem(Base, UUIDPKMixin, TimestampMixin):
     professional_name: Mapped[str] = mapped_column(String(255), nullable=False)
 
     order: Mapped["Order"] = relationship(back_populates="items")
+
+
+class OrderProductItem(Base, UUIDPKMixin, TimestampMixin):
+    """Uma linha de PRODUTO dentro da comanda — ver docstring do módulo
+    pro raciocínio de por que isto é uma tabela separada de `OrderItem`.
+    `quantity`/`unit_price` são editáveis (auditado, ver
+    `services/orders.py::update_product_item`) enquanto a comanda
+    estiver `OPEN`; congelados dali em diante."""
+
+    __tablename__ = "order_product_items"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_order_product_items_quantity_positive"),
+        CheckConstraint("unit_price >= 0", name="ck_order_product_items_unit_price_not_negative"),
+    )
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    order_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("orders.id", ondelete="CASCADE"), nullable=False
+    )
+    # RESTRICT — mesmo raciocínio de `OrderItem.service_id`: um Produto
+    # referenciado por uma linha de comanda (aberta OU fechada) nunca
+    # pode ser apagado por baixo (desativar continua permitido).
+    product_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("products.id", ondelete="RESTRICT"), nullable=False
+    )
+    quantity: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    # Snapshot de NOME — mesmo padrão de `OrderItem.service_name`.
+    product_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    # NULL = ainda não baixou estoque (comanda aberta, ou item removido
+    # antes do fechamento). Preenchido UMA vez, no fechamento — nunca
+    # sobrescrito depois (ver docstring do módulo).
+    stock_movement_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("stock_movements.id", ondelete="SET NULL")
+    )
+
+    order: Mapped["Order"] = relationship(back_populates="product_items")
 
 
 class Payment(Base, UUIDPKMixin, TimestampMixin):

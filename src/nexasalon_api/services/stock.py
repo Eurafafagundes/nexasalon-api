@@ -205,6 +205,44 @@ def record_system_movement(
     )
 
 
+def record_sale_movement(
+    session: Session,
+    actor: ActorContext,
+    *,
+    product_id: uuid.UUID,
+    branch_id: uuid.UUID,
+    quantity: Decimal,
+    order_id: uuid.UUID,
+    unit_cost: Decimal | None = None,
+    observation: str | None = None,
+) -> StockMovement:
+    """Baixa de estoque gerada pelo FECHAMENTO de uma Comanda — Etapa C
+    (Estoque ↔ Comanda). Sempre `direction=OUT`/`reason=SALE`, sempre
+    com `order_id` preenchido (rastreabilidade: dá pra achar a comanda
+    que gerou qualquer saída por venda). `unit_cost` é o custo do
+    produto NO MOMENTO da venda (`Product.cost_price` — quem chama é
+    responsável por passar o valor certo, ver `services/orders.py::
+    close_order`) — guardado só pra quem tem `inventory.view_cost`
+    conseguir analisar margem depois; a Comanda em si nunca expõe
+    custo em nenhum schema novo desta etapa (ver `schemas/order.py`).
+
+    Levanta `ValidationDomainError` (via `_apply_delta`) se o saldo da
+    unidade não cobrir a quantidade — quem chama (`close_order`) deixa
+    isso propagar pra abortar o fechamento inteiro."""
+    return _create_movement(
+        session,
+        actor,
+        product_id=product_id,
+        branch_id=branch_id,
+        direction=StockMovementDirection.OUT,
+        reason=StockMovementReason.SALE,
+        quantity=quantity,
+        unit_cost=unit_cost,
+        observation=observation,
+        order_id=order_id,
+    )
+
+
 def list_movements(
     session: Session,
     actor: ActorContext,
