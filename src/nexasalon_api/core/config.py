@@ -1,4 +1,21 @@
+import os
 from typing import Annotated, Literal
+
+# Precisa vir ANTES do `import pydantic` (mesmo transitivo, via
+# pydantic_settings abaixo): ao definir a classe `Settings(BaseSettings)`,
+# o Pydantic constrói o schema/validator e chama
+# `pydantic.plugin._loader.get_plugins()`, que por padrão varre TODAS as
+# distribuições instaladas via `importlib.metadata.distributions()` —
+# nenhum pacote deste projeto registra plugin de Pydantic (confirmado:
+# zero entry points do grupo "pydantic" instalados), então essa varredura
+# nunca encontra nada útil, só custa tempo. Em disco lento/sincronizado
+# (ex.: `.venv` dentro de pasta OneDrive/rede no Windows) ou com
+# antivírus interceptando cada leitura de metadata, essa varredura pode
+# travar por muito tempo (ou "indefinidamente") — e isso acontece na
+# simples definição da classe `Settings`, antes de qualquer I/O de rede
+# ou banco. `PYDANTIC_DISABLE_PLUGINS=1` pula a varredura por completo;
+# `setdefault` respeita quem já setar a variável no ambiente.
+os.environ.setdefault("PYDANTIC_DISABLE_PLUGINS", "1")
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
