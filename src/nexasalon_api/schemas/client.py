@@ -7,15 +7,25 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from nexasalon_api.schemas.order import OrderRead
 
 from nexasalon_api.core.normalize import is_valid_cpf, normalize_cpf, normalize_phone
-from nexasalon_api.models.enums import BrazilianState
+from nexasalon_api.models.enums import BrazilianState, ClientGender
 
 
 class ClientBase(BaseModel):
+    """Etapa C.1 — cadastro completo. `gender`/endereço (`cep`...
+    `address_number`/`complement`) e `cpf` são TODOS opcionais (nunca
+    requisito de cadastro nem de agendamento) — por isso o MESMO schema
+    já serve tanto o cadastro rápido da Agenda (que só preenche
+    `name`/`phone`, ver `components/agenda/client-picker.tsx` no
+    frontend) quanto o cadastro completo de Clientes > Novo/Editar, sem
+    precisar de um segundo schema "reduzido": campos não enviados
+    simplesmente ficam `None`."""
+
     name: str = Field(min_length=1, max_length=255)
     phone: str | None = Field(default=None, max_length=32)
     whatsapp: str | None = Field(default=None, max_length=32)
     email: str | None = Field(default=None, max_length=255)
     birth_date: date | None = None
+    gender: ClientGender | None = None
     notes: str | None = None
     # Todos opcionais de propósito (item "não torne CPF nem endereço
     # completo obrigatórios") — cadastro universal, não específico de
@@ -26,6 +36,7 @@ class ClientBase(BaseModel):
     city: str | None = Field(default=None, max_length=120)
     neighborhood: str | None = Field(default=None, max_length=120)
     address_line: str | None = Field(default=None, max_length=255)
+    address_number: str | None = Field(default=None, max_length=20)
     complement: str | None = Field(default=None, max_length=120)
 
     @field_validator("phone", "whatsapp", mode="after")

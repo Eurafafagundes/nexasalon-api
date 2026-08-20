@@ -158,6 +158,21 @@ class BrazilianState(str, Enum):
     TO = "TO"
 
 
+class ClientGender(str, Enum):
+    """Gênero do cliente — Etapa C.1 ("evolução do cadastro de
+    clientes"), item explícito "opcional, opções claras, nunca
+    obrigatório pra cadastro ou agendamento". Enum controlado (mesmo
+    raciocínio de `BrazilianState`: evita texto livre), mas sem
+    NENHUMA lógica de negócio associada — não afeta agendamento, preço,
+    disponibilidade nem nenhum outro fluxo; é só um dado de perfil do
+    cliente, exibido no cadastro."""
+
+    FEMALE = "female"
+    MALE = "male"
+    NON_BINARY = "non_binary"
+    PREFER_NOT_TO_SAY = "prefer_not_to_say"
+
+
 class AppointmentSource(str, Enum):
     INTERNAL = "internal"
     PUBLIC_BOOKING = "public_booking"

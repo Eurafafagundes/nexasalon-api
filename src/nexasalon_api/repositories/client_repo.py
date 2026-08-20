@@ -14,6 +14,17 @@ def get(session: Session, organization_id: uuid.UUID, client_id: uuid.UUID) -> C
     return session.scalars(stmt).first()
 
 
+def get_by_cpf(session: Session, organization_id: uuid.UUID, cpf: str) -> Client | None:
+    """`cpf` já deve vir NORMALIZADO (só dígitos — ver
+    `schemas/client.py::ClientBase._normalize_and_validate_cpf`).
+    Considera clientes ativos E inativos (item "analise a unicidade" —
+    um CPF já usado por um cadastro desativado ainda é um conflito de
+    identidade real, não deveria poder ser reaproveitado silenciosamente
+    por um cadastro novo)."""
+    stmt = select(Client).where(Client.organization_id == organization_id, Client.cpf == cpf)
+    return session.scalars(stmt).first()
+
+
 def list_all(
     session: Session,
     organization_id: uuid.UUID,

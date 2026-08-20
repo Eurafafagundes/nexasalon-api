@@ -128,6 +128,207 @@ def test_endereco_aceita_uf_controlada(client_as, org_a_actor):
 
 
 # ---------------------------------------------------------------------
+# Etapa C.1 — evolução do cadastro (gênero, número do endereço,
+# unicidade de CPF por organização, compatibilidade com cliente antigo)
+# ---------------------------------------------------------------------
+
+
+def test_cadastro_completo_aceita_todos_os_campos_novos(client_as, org_a_actor):
+    """Cadastro completo (Clientes > Novo) — todos os campos pedidos,
+    incluindo os dois novos desta rodada (gender, address_number)."""
+    c = client_as(org_a_actor)
+    resp = c.post(
+        "/api/v1/clients",
+        json={
+            "name": "Cliente Completo",
+            "phone": "11999990000",
+            "whatsapp": "11999990000",
+            "email": "completo@example.com",
+            "birth_date": "1990-05-20",
+            "gender": "female",
+            "cpf": "111.444.777-35",
+            "cep": "70000-000",
+            "state": "DF",
+            "city": "Brasília",
+            "neighborhood": "Asa Sul",
+            "address_line": "Quadra 5",
+            "address_number": "120",
+            "complement": "Bloco B, apto 302",
+            "notes": "Prefere atendimento pela manhã.",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["gender"] == "female"
+    assert body["address_number"] == "120"
+    assert body["complement"] == "Bloco B, apto 302"
+    assert body["notes"] == "Prefere atendimento pela manhã."
+
+
+def test_cadastro_rapido_da_agenda_continua_funcionando_so_com_nome_e_telefone(client_as, org_a_actor):
+    """Item explícito "não transforme o cadastro rápido em formulário
+    enorme" — o mesmo endpoint aceita um payload mínimo (nome + telefone,
+    exatamente o que `client-picker.tsx` já envia hoje), sem exigir
+    NENHUM dos campos novos."""
+    c = client_as(org_a_actor)
+    resp = c.post("/api/v1/clients", json={"name": "Cliente Rápido", "phone": "11988887777"})
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["name"] == "Cliente Rápido"
+    assert body["gender"] is None
+    assert body["cpf"] is None
+    assert body["address_number"] is None
+    assert body["cep"] is None
+
+
+def test_genero_e_opcional_e_nao_aceita_valor_fora_do_enum(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    sem_genero = c.post("/api/v1/clients", json={"name": "Sem Gênero"})
+    assert sem_genero.status_code == 201, sem_genero.text
+    assert sem_genero.json()["gender"] is None
+
+    invalido = c.post("/api/v1/clients", json={"name": "Gênero Inválido", "gender": "banana"})
+    assert invalido.status_code == 422
+
+
+def test_editar_cliente_atualiza_campos_novos(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    client_id = c.post("/api/v1/clients", json={"name": "Cliente Editável"}).json()["id"]
+
+    resp = c.put(
+        f"/api/v1/clients/{client_id}",
+        json={"name": "Cliente Editável", "gender": "non_binary", "address_number": "45", "notes": "Alérgica a amônia."},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["gender"] == "non_binary"
+    assert body["address_number"] == "45"
+    assert body["notes"] == "Alérgica a amônia."
+
+
+def test_endereco_completo_e_opcional_mesmo_com_alguns_campos_preenchidos(client_as, org_a_actor):
+    """Endereço não é tudo-ou-nada — só CEP e cidade preenchidos, sem
+    UF/bairro/logradouro/número, continua um cadastro válido."""
+    c = client_as(org_a_actor)
+    resp = c.post("/api/v1/clients", json={"name": "Cliente Endereço Parcial", "cep": "01310-100", "city": "São Paulo"})
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["cep"] == "01310100"
+    assert body["city"] == "São Paulo"
+    assert body["state"] is None
+    assert body["address_line"] is None
+    assert body["address_number"] is None
+
+
+def test_nao_permite_dois_clientes_com_mesmo_cpf_na_mesma_organizacao(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    primeiro = c.post("/api/v1/clients", json={"name": "Primeiro Cliente", "cpf": "111.444.777-35"})
+    assert primeiro.status_code == 201, primeiro.text
+
+    duplicado = c.post("/api/v1/clients", json={"name": "Segundo Cliente (mesmo CPF)", "cpf": "111.444.777-35"})
+    assert duplicado.status_code == 409, duplicado.text
+
+    # Mesmo com o CPF formatado diferente (a normalização precisa
+    # acontecer ANTES da checagem de duplicidade, não depois).
+    duplicado_formatado = c.post("/api/v1/clients", json={"name": "Terceiro Cliente", "cpf": "11144477735"})
+    assert duplicado_formatado.status_code == 409
+
+
+def test_editar_o_proprio_cliente_mantendo_o_mesmo_cpf_nao_conflita_consigo_mesmo(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    client_id = c.post("/api/v1/clients", json={"name": "Cliente CPF Próprio", "cpf": "111.444.777-35"}).json()["id"]
+
+    resp = c.put(f"/api/v1/clients/{client_id}", json={"name": "Cliente CPF Próprio Renomeado", "cpf": "111.444.777-35"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["cpf"] == "11144477735"
+
+
+def test_editar_cliente_para_cpf_ja_usado_por_outro_e_bloqueado(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    c.post("/api/v1/clients", json={"name": "Dono do CPF", "cpf": "111.444.777-35"})
+    outro_id = c.post("/api/v1/clients", json={"name": "Outro Cliente"}).json()["id"]
+
+    resp = c.put(f"/api/v1/clients/{outro_id}", json={"name": "Outro Cliente", "cpf": "111.444.777-35"})
+    assert resp.status_code == 409
+
+
+def test_mesmo_cpf_em_organizacoes_diferentes_nunca_conflita(client_as, org_a_actor, org_b_actor):
+    """Item explícito do pedido: "uma mesma pessoa pode existir em
+    organizações diferentes — nunca criar unicidade global indevida"."""
+    c_a = client_as(org_a_actor)
+    resp_a = c_a.post("/api/v1/clients", json={"name": "Cliente Org A", "cpf": "111.444.777-35"})
+    assert resp_a.status_code == 201, resp_a.text
+
+    c_b = client_as(org_b_actor)
+    resp_b = c_b.post("/api/v1/clients", json={"name": "Cliente Org B", "cpf": "111.444.777-35"})
+    assert resp_b.status_code == 201, resp_b.text  # mesmo CPF, organização diferente — nunca é conflito
+
+
+def test_cpf_duplicado_bloqueia_mesmo_se_cliente_original_estiver_desativado(client_as, org_a_actor):
+    """Um cadastro desativado por engano/duplicado continua "dono" do
+    CPF — reativar o original (ou corrigir o cadastro) é o caminho
+    certo, não permitir um segundo cadastro ativo com o mesmo documento."""
+    c = client_as(org_a_actor)
+    original_id = c.post("/api/v1/clients", json={"name": "Cliente Original", "cpf": "111.444.777-35"}).json()["id"]
+    c.patch(f"/api/v1/clients/{original_id}/deactivate")
+
+    resp = c.post("/api/v1/clients", json={"name": "Cliente Novo Mesmo CPF", "cpf": "111.444.777-35"})
+    assert resp.status_code == 409
+
+
+def test_compatibilidade_com_cliente_antigo_sem_os_campos_novos(client_as, org_a_actor):
+    """Cliente criado antes desta rodada (sem gender/address_number,
+    exatamente como um registro legado no banco) continua sendo lido e
+    editado normalmente — os campos novos simplesmente aparecem como
+    `None` até serem preenchidos."""
+    c = client_as(org_a_actor)
+    client_id = c.post("/api/v1/clients", json={"name": "Cliente Legado", "phone": "11977776666"}).json()["id"]
+
+    resp = c.get(f"/api/v1/clients/{client_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["gender"] is None
+    assert body["address_number"] is None
+
+    # E dá pra editar só um dos campos novos sem precisar reenviar tudo
+    # (o schema de Update é o mesmo Base — cada campo omitido volta a
+    # ser None, então o teste reenvia o que já existia de propósito).
+    resp = c.put(f"/api/v1/clients/{client_id}", json={"name": "Cliente Legado", "phone": "11977776666", "gender": "male"})
+    assert resp.status_code == 200
+    assert resp.json()["gender"] == "male"
+    assert resp.json()["address_number"] is None
+
+
+def test_observacoes_sao_internas_nao_aparecem_no_historico_do_cliente(client_as, org_a_actor):
+    """Item explícito "observações são internas — não expor fora de
+    endpoints autorizados": o endpoint de Histórico (usado também pra
+    montar qualquer resumo do atendimento) não inclui `notes` em lugar
+    nenhum do payload — ele só devolve `client_since`/`visits_count`/
+    `total_spent`/`orders`, nunca o próprio `Client`."""
+    c = client_as(org_a_actor)
+    client_id = c.post(
+        "/api/v1/clients", json={"name": "Cliente Observações", "notes": "Informação sensível interna"}
+    ).json()["id"]
+
+    history = c.get(f"/api/v1/clients/{client_id}/history")
+    assert history.status_code == 200
+    assert "notes" not in history.json()
+    assert "Informação sensível interna" not in history.text
+
+
+def test_isolamento_multiempresa_cliente_de_outra_org_nao_aparece(client_as, org_a_actor, org_b_actor):
+    c_a = client_as(org_a_actor)
+    client_id = c_a.post("/api/v1/clients", json={"name": "Cliente Org A"}).json()["id"]
+
+    c_b = client_as(org_b_actor)
+    resp = c_b.get(f"/api/v1/clients/{client_id}")
+    assert resp.status_code == 404
+
+    resp_list = c_b.get("/api/v1/clients")
+    assert client_id not in [cl["id"] for cl in resp_list.json()]
+
+
+# ---------------------------------------------------------------------
 # Histórico do cliente — derivado de Order, nunca campo manual
 # ---------------------------------------------------------------------
 

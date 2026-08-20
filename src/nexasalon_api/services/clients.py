@@ -4,11 +4,28 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from nexasalon_api.core.exceptions import NotFoundError
+from nexasalon_api.core.exceptions import ConflictError, NotFoundError
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.order import Order
 from nexasalon_api.repositories import client_repo, order_repo
 from nexasalon_api.schemas.client import ClientCreate, ClientUpdate
+
+
+def _assert_cpf_not_duplicated(
+    session: Session, organization_id: uuid.UUID, cpf: str | None, *, exclude_client_id: uuid.UUID | None = None
+) -> None:
+    """Unicidade de CPF SEMPRE escopada por `organization_id` — nunca
+    global (a mesma pessoa pode legitimamente existir como cliente em
+    duas organizações diferentes, ex.: ela frequenta dois salões que
+    usam o NexaSalon; isso nunca pode ser tratado como conflito). Ver
+    docstring de `models/client.py::Client` para o porquê disso viver
+    aqui (service layer) em vez de virar uma constraint de banco nesta
+    rodada — dado de staging já existente, sem garantia de estar limpo."""
+    if cpf is None:
+        return
+    existing = client_repo.get_by_cpf(session, organization_id, cpf)
+    if existing is not None and existing.id != exclude_client_id:
+        raise ConflictError("Já existe um cliente com este CPF nesta organização.")
 
 
 def list_clients(
@@ -28,6 +45,7 @@ def get_client(session: Session, organization_id: uuid.UUID, client_id: uuid.UUI
 
 
 def create_client(session: Session, organization_id: uuid.UUID, data: ClientCreate) -> Client:
+    _assert_cpf_not_duplicated(session, organization_id, data.cpf)
     return client_repo.create(session, organization_id, **data.model_dump())
 
 
@@ -35,6 +53,7 @@ def update_client(
     session: Session, organization_id: uuid.UUID, client_id: uuid.UUID, data: ClientUpdate
 ) -> Client:
     client = get_client(session, organization_id, client_id)
+    _assert_cpf_not_duplicated(session, organization_id, data.cpf, exclude_client_id=client.id)
     for field, value in data.model_dump().items():
         setattr(client, field, value)
     return client_repo.save(session, client)
