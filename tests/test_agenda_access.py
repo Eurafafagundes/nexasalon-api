@@ -540,3 +540,161 @@ def test_http_membership_sem_acesso_a_agenda_recebe_404_ao_buscar_direto(client)
         headers=restricted_headers,
     )
     assert edit_resp.status_code == 403, edit_resp.text
+
+
+# ---------------------------------------------------------------------
+# Verificação direcionada (pós-aprovação da Etapa A): o default ALL de
+# agenda_view_scope/agenda_edit_scope NUNCA amplia permissão nenhuma —
+# ele só remove uma restrição ADICIONAL, deixando a decisão inteira nas
+# mãos das permissions grosseiras (agenda.view_own/view_all/edit) já
+# existentes. "Escopo ALL" = "sem filtro extra", nunca = "acesso total
+# concedido pelo escopo". Cobre exatamente os 5 pontos pedidos:
+#   1. agenda.view_own sozinho + scope ALL -> só a própria agenda.
+#   2. agenda.view_all + scope SELECTED -> só os profissionais
+#      selecionados (agenda.view_all não "vaza" pro que está fora do
+#      SELECTED).
+#   3. scope ALL nunca concede permissão global sozinho (sem
+#      agenda.view_own/view_all, ALL não muda nada: continua vazio).
+#   4. scope é sempre uma restrição ADICIONAL sobre o RBAC, nunca uma
+#      concessão — SELECTED vazio nunca é "sobrescrito" por
+#      agenda.view_all.
+#   5. editar continua subconjunto de visualizar mesmo com ambos os
+#      escopos em ALL (o default).
+# ---------------------------------------------------------------------
+
+
+def test_default_orm_da_membership_e_all_all_e_resolve_para_none(org_session):
+    """O valor default do MODELO (não só o que um teste passa à mão
+    pra `ActorContext`) é ALL/ALL, e `resolve_*` traduz isso pra `None`
+    — "sem restrição adicional", o sinal que o resto do sistema usa
+    pra dizer "decida pela permission grosseira"."""
+    session, org_id = org_session
+    role = _role(session, org_id)
+    membership = _membership(session, org_id, role.id)
+    assert membership.agenda_view_scope == AgendaAccessScope.ALL
+    assert membership.agenda_edit_scope == AgendaAccessScope.ALL
+    assert agenda_access.resolve_viewable_ids(session, membership) is None
+    assert agenda_access.resolve_editable_ids(session, membership) is None
+
+
+def test_view_own_com_scope_all_default_continua_vendo_so_a_propria_agenda(org_session):
+    """Ponto 1 do pedido: ainda que o escopo estrutural seja ALL
+    (default, sem nenhuma linha em membership_agenda_grants), um ator
+    com só `agenda.view_own` continua restrito à própria agenda — o
+    ALL do escopo não vira, por si só, um `agenda.view_all`."""
+    session, org_id = org_session
+    branch, prof_a, prof_b, service, client = _setup_two_professionals(session, org_id)
+    owner = _actor(session, org_id, permissions={"agenda.create", "agenda.view_all", "agenda.edit"})
+    _create_appointment(session, org_id, owner, branch, prof_a, service, client, 10)
+    _create_appointment(session, org_id, owner, branch, prof_b, service, client, 14)
+
+    # scope ALL default -> viewable=None (idêntico ao que resolve_viewable_ids devolveria)
+    prof_a_actor = _actor(
+        session, org_id, permissions={"agenda.view_own"}, professional_id=prof_a.id, viewable=None,
+    )
+    items = agenda.list_agenda(session, prof_a_actor, date_from=_dt(0), date_to=_dt(23, 59))
+    assert {i.professional_id for i in items} == {prof_a.id}
+
+    # e get_appointment nega (404) o agendamento do colega, mesmo o
+    # escopo ESTRUTURAL sendo ALL — só a permission decide aqui.
+    from nexasalon_api.schemas.appointment import AppointmentCreate as _AC
+    from nexasalon_api.schemas.appointment import AppointmentItemCreate as _AIC
+
+    appt_b = appointments.create_appointment(
+        session, owner,
+        _AC(
+            branch_id=branch.id, client_id=client.id,
+            items=[_AIC(professional_id=prof_b.id, service_id=service.id, start_at=_dt(16))],
+        ),
+    )
+    with pytest.raises(NotFoundError):
+        appointments.get_appointment(session, prof_a_actor, appt_b.id)
+
+
+def test_view_all_com_scope_selected_ve_so_os_profissionais_selecionados(org_session):
+    """Ponto 2 do pedido: `agenda.view_all` NÃO "vaza" para fora do
+    SELECTED — o escopo concreto substitui a checagem grosseira, nunca
+    convive com ela como um OU."""
+    session, org_id = org_session
+    branch, prof_a, prof_b, service, client = _setup_two_professionals(session, org_id)
+    owner = _actor(session, org_id, permissions={"agenda.create", "agenda.view_all", "agenda.edit"})
+    _create_appointment(session, org_id, owner, branch, prof_a, service, client, 10)
+    _create_appointment(session, org_id, owner, branch, prof_b, service, client, 14)
+
+    actor = _actor(
+        session, org_id, permissions={"agenda.view_all"}, viewable=frozenset({prof_a.id}),
+    )
+    items = agenda.list_agenda(session, actor, date_from=_dt(0), date_to=_dt(23, 59))
+    assert {i.professional_id for i in items} == {prof_a.id}
+    assert prof_b.id not in {i.professional_id for i in items}
+
+
+def test_scope_all_nunca_concede_permissao_sozinho_sem_view_own_nem_view_all(org_session):
+    """Ponto 3 do pedido: sem NENHUMA permission de visualização
+    (nem view_own, nem view_all), o escopo estrutural ALL não concede
+    nada — continua vendo zero agendamentos, exatamente como
+    `test_sem_view_own_nem_view_all_lista_vazia` já provava em
+    test_agenda.py antes desta feature existir (comportamento
+    preservado, não uma regressão nova)."""
+    session, org_id = org_session
+    branch, prof_a, prof_b, service, client = _setup_two_professionals(session, org_id)
+    owner = _actor(session, org_id, permissions={"agenda.create", "agenda.view_all", "agenda.edit"})
+    appt_a = _create_appointment(session, org_id, owner, branch, prof_a, service, client, 10)
+
+    no_perms_actor = _actor(session, org_id, permissions=set(), viewable=None)
+    assert agenda.list_agenda(session, no_perms_actor, date_from=_dt(0), date_to=_dt(23, 59)) == []
+    with pytest.raises(NotFoundError):
+        appointments.get_appointment(session, no_perms_actor, appt_a.id)
+    assert agenda_access.can_view_professional(no_perms_actor, prof_a.id) is False
+
+
+def test_scope_e_sempre_restricao_adicional_nunca_concessao(org_session):
+    """Ponto 4 do pedido: um `agenda.view_all` de verdade, combinado com
+    um escopo SELECTED vazio, continua vendo zero — o escopo restringe
+    por CIMA da permission, nunca "релaxa" o que já foi restringido.
+    Escopo largo (ALL) nunca é necessário pra a permission valer, e
+    escopo estreito (SELECTED vazio) sempre vence sobre uma permission
+    larga."""
+    session, org_id = org_session
+    branch, prof_a, prof_b, service, client = _setup_two_professionals(session, org_id)
+    owner = _actor(session, org_id, permissions={"agenda.create", "agenda.view_all", "agenda.edit"})
+    _create_appointment(session, org_id, owner, branch, prof_a, service, client, 10)
+
+    actor = _actor(session, org_id, permissions={"agenda.view_all"}, viewable=frozenset())
+    assert agenda.list_agenda(session, actor, date_from=_dt(0), date_to=_dt(23, 59)) == []
+    assert agenda_access.can_view_professional(actor, prof_a.id) is False
+
+
+def test_editar_continua_subconjunto_de_visualizar_mesmo_com_scope_all_default(org_session):
+    """Ponto 5 do pedido: com AMBOS os escopos no default ALL, um ator
+    que só tem `agenda.edit` (sem view_own nem view_all) — cenário
+    hipotético de role mal configurada, mas exatamente o caso que a
+    regra "editar é subconjunto de visualizar" existe pra cobrir —
+    continua sem poder editar NADA, porque `can_edit_professional` cai
+    em `can_view_professional`, que nega por falta de permission de
+    visualização. O escopo ALL não bypassa essa regra."""
+    session, org_id = org_session
+    branch, prof_a, prof_b, service, client = _setup_two_professionals(session, org_id)
+    owner = _actor(session, org_id, permissions={"agenda.create", "agenda.view_all", "agenda.edit"})
+    appt_a = _create_appointment(session, org_id, owner, branch, prof_a, service, client, 10)
+
+    edit_only_actor = _actor(
+        session, org_id, permissions={"agenda.edit", "agenda.view_all"}, viewable=None, editable=None,
+    )
+    # agenda.view_all presente -> ENXERGA o agendamento (visualizar ok)...
+    assert appointments.get_appointment(session, edit_only_actor, appt_a.id).id == appt_a.id
+
+    edit_only_sem_view_actor = _actor(
+        session, org_id, permissions={"agenda.edit"}, viewable=None, editable=None,
+    )
+    # ...mas SEM nenhuma permission de visualização, mesmo tendo
+    # agenda.edit e ambos os escopos em ALL, nem consegue ENXERGAR o
+    # agendamento pra chegar perto de editar: 404 (convenção anti-leak
+    # de `get_appointment`, chamado antes de `_assert_can_edit` em
+    # `update_status`) — nunca um "passa direto porque o escopo é ALL".
+    with pytest.raises(NotFoundError):
+        appointments.update_status(session, edit_only_sem_view_actor, appt_a.id, AppointmentStatus.CONFIRMED)
+    # e, isolando só a checagem de edição (sem passar pelo 404 de
+    # visualização), can_edit_professional confirma: nega, porque cai
+    # em can_view_professional, que nega por falta de view_own/view_all.
+    assert agenda_access.can_edit_professional(edit_only_sem_view_actor, prof_a.id) is False
