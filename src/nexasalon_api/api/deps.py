@@ -35,6 +35,7 @@ from nexasalon_api.core.rate_limit import rate_limiter
 from nexasalon_api.core.security import InvalidTokenError, TokenType, decode_token
 from nexasalon_api.models.enums import MembershipStatus
 from nexasalon_api.repositories import membership_repo, professional_repo, rbac_repo, user_repo
+from nexasalon_api.services import agenda_access
 from nexasalon_api.services.auth import compute_effective_permissions
 
 _bearer_scheme = HTTPBearer(auto_error=False)
@@ -101,6 +102,11 @@ def _get_real_current_actor(
             role_name=role.name if role is not None else "",
             permissions=permissions,
             professional_id=professional.id if professional is not None else None,
+            # Escopo granular de agenda — ver services/agenda_access.py.
+            # `None` (ALL) é o caso comum e não bate no banco de novo além
+            # do SELECT já feito acima para resolver `membership`.
+            agenda_viewable_professional_ids=agenda_access.resolve_viewable_ids(session, membership),
+            agenda_editable_professional_ids=agenda_access.resolve_editable_ids(session, membership),
         )
         session.commit()
     except Exception:

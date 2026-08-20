@@ -36,6 +36,9 @@ class MembershipRead(BaseModel):
     branch_id: uuid.UUID | None
     status: MembershipStatus
     professional_id: uuid.UUID | None
+    # "Último acesso" da tela Configurações > Acessos — `None` quando o
+    # usuário nunca fez login (ex.: convite ainda pendente).
+    last_login_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -52,3 +55,11 @@ class EmployeeInviteResponse(BaseModel):
 
 class ResendInviteResponse(BaseModel):
     invite_token: str
+
+
+class ResetPasswordLinkResponse(BaseModel):
+    """Resposta de `POST /users/{id}/reset-password` — mesmo padrão do
+    convite: um link de uso único que o administrador repassa, nunca uma
+    senha. Ver `core/security.py::create_password_reset_token`."""
+
+    reset_token: str

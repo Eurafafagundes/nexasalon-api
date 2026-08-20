@@ -22,6 +22,22 @@ def list_all(
     return list(session.scalars(stmt).all())
 
 
+def list_by_ids(
+    session: Session, organization_id: uuid.UUID, professional_ids: list[uuid.UUID]
+) -> list[Professional]:
+    """Usado por `services/agenda_access.py` pra validar, em lote, que
+    todo profissional referenciado numa configuração de acesso existe
+    NESTA organização (defesa em profundidade — RLS/FK já impediriam
+    referenciar outra org, mas com uma mensagem de erro clara em vez de
+    um 500)."""
+    if not professional_ids:
+        return []
+    stmt = select(Professional).where(
+        Professional.organization_id == organization_id, Professional.id.in_(professional_ids)
+    )
+    return list(session.scalars(stmt).all())
+
+
 def create(session: Session, organization_id: uuid.UUID, **fields) -> Professional:
     professional = Professional(organization_id=organization_id, **fields)
     session.add(professional)

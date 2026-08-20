@@ -26,3 +26,12 @@ class ActorContext:
     # None quando a membership não está ligada a nenhum Professional
     # (Professional.user_id é a FK canônica — ver models/identity.py).
     professional_id: uuid.UUID | None = None
+    # Escopo granular de agenda (ver models/agenda_access.py). `None` =
+    # SEM restrição adicional além de agenda.view_own/agenda.view_all
+    # (equivalente ao AgendaAccessScope.ALL, que é o default de toda
+    # membership) — só vira um `frozenset` concreto quando o escopo
+    # correspondente está em SELECTED. Recalculado a cada request em
+    # `api/deps.py`, nunca cacheado no token — mesma regra de
+    # `permissions` acima.
+    agenda_viewable_professional_ids: frozenset[uuid.UUID] | None = None
+    agenda_editable_professional_ids: frozenset[uuid.UUID] | None = None

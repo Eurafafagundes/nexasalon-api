@@ -6,7 +6,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, TimestampMixin, UUIDPKMixin
-from .enums import MembershipStatus, PermissionEffect, pg_enum
+from .enums import AgendaAccessScope, MembershipStatus, PermissionEffect, pg_enum
 
 
 class User(Base, UUIDPKMixin, TimestampMixin):
@@ -61,6 +61,24 @@ class OrganizationMembership(Base, UUIDPKMixin, TimestampMixin):
         server_default=MembershipStatus.INVITED.value,
     )
 
+    # Escopo de agenda (item "controle granular de quais agendas cada
+    # usuário pode visualizar/editar") — ver docstring completa em
+    # `models/agenda_access.py::MembershipAgendaGrant`. Default ALL/ALL
+    # preserva EXATAMENTE o comportamento atual (`agenda.view_own`/
+    # `agenda.view_all` continuam sendo o único portão) pra toda
+    # membership já existente — isto é uma restrição ADICIONAL opcional,
+    # nunca uma permissão nova por si só.
+    agenda_view_scope: Mapped[AgendaAccessScope] = mapped_column(
+        pg_enum(AgendaAccessScope, "agenda_access_scope"),
+        nullable=False,
+        server_default=AgendaAccessScope.ALL.value,
+    )
+    agenda_edit_scope: Mapped[AgendaAccessScope] = mapped_column(
+        pg_enum(AgendaAccessScope, "agenda_access_scope"),
+        nullable=False,
+        server_default=AgendaAccessScope.ALL.value,
+    )
+
     user: Mapped["User"] = relationship(back_populates="memberships")
     role: Mapped["Role"] = relationship()  # noqa: F821 (importado via models/__init__)
 
@@ -75,6 +93,10 @@ class OrganizationMembership(Base, UUIDPKMixin, TimestampMixin):
 
     permission_overrides: Mapped[list["MembershipPermissionOverride"]] = relationship(
         back_populates="membership"
+    )
+    agenda_grants: Mapped[list["MembershipAgendaGrant"]] = relationship(  # noqa: F821
+        primaryjoin="OrganizationMembership.id == foreign(MembershipAgendaGrant.membership_id)",
+        viewonly=True,
     )
 
 

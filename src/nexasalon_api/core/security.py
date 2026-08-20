@@ -45,6 +45,7 @@ class TokenType(str, Enum):
     ACCESS = "access"
     ORG_SELECTION = "org_selection"
     INVITE = "invite"
+    PASSWORD_RESET = "password_reset"
 
 
 def create_access_token(*, user_id: uuid.UUID, organization_id: uuid.UUID, membership_id: uuid.UUID) -> str:
@@ -89,6 +90,29 @@ def create_invite_token(*, user_id: uuid.UUID, membership_id: uuid.UUID) -> str:
         "sub": str(user_id),
         "membership_id": str(membership_id),
         "type": TokenType.INVITE.value,
+        "jti": str(uuid.uuid4()),
+        "iat": now,
+        "exp": now + timedelta(days=settings.invite_token_ttl_days),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def create_password_reset_token(*, user_id: uuid.UUID, membership_id: uuid.UUID) -> str:
+    """Redefinição de senha ACIONADA POR ADMIN pra uma membership já
+    ACTIVE (`resend_invite`/`accept_invite` só funcionam pra INVITED —
+    ver services/user_management.py::admin_reset_password). Mesma
+    filosofia do convite: o administrador nunca define nem vê a nova
+    senha, só recebe este link/token pra repassar ao funcionário. Vida
+    curta (mesma janela do convite) porque, diferente do invite token, o
+    estado da membership não muda ao gerar este token (continua ACTIVE)
+    — não há "já foi usado" pra invalidar um token velho sozinho, então
+    a expiração curta é a única barreira contra um link antigo esquecido
+    em algum lugar."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "membership_id": str(membership_id),
+        "type": TokenType.PASSWORD_RESET.value,
         "jti": str(uuid.uuid4()),
         "iat": now,
         "exp": now + timedelta(days=settings.invite_token_ttl_days),

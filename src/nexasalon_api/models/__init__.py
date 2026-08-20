@@ -10,6 +10,7 @@ from .auth import RefreshToken  # noqa: F401
 from .organization import Organization, Branch  # noqa: F401
 from .rbac import Role, Permission, RolePermission  # noqa: F401
 from .identity import User, OrganizationMembership, MembershipPermissionOverride  # noqa: F401
+from .agenda_access import MembershipAgendaGrant  # noqa: F401
 from .professional import Professional, WorkingHours, ScheduleBlock  # noqa: F401
 from .service import Service, ServiceCategory, ProfessionalService  # noqa: F401
 from .client import Client  # noqa: F401
@@ -31,6 +32,7 @@ __all__ = [
     "User",
     "OrganizationMembership",
     "MembershipPermissionOverride",
+    "MembershipAgendaGrant",
     "Professional",
     "WorkingHours",
     "ScheduleBlock",

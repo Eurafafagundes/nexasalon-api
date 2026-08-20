@@ -6,13 +6,15 @@ mesma regra usada na Etapa 2C."""
 import uuid
 from dataclasses import dataclass
 
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from nexasalon_api.core.exceptions import ConflictError, NotFoundError
-from nexasalon_api.core.security import create_invite_token
-from nexasalon_api.models.enums import MembershipStatus
-from nexasalon_api.models.identity import OrganizationMembership, User
-from nexasalon_api.repositories import membership_repo, professional_repo, rbac_repo, user_repo
+from nexasalon_api.core.exceptions import ConflictError, NotFoundError, ValidationDomainError
+from nexasalon_api.core.security import create_invite_token, create_password_reset_token
+from nexasalon_api.models.enums import AuditAction, MembershipStatus, PermissionEffect
+from nexasalon_api.models.identity import MembershipPermissionOverride, OrganizationMembership, User
+from nexasalon_api.models.rbac import Permission
+from nexasalon_api.repositories import audit_log_repo, membership_repo, professional_repo, rbac_repo, user_repo
 
 
 def _get_membership_in_org(
@@ -174,3 +176,91 @@ def get_user(session: Session, user_id: uuid.UUID) -> User:
     if user is None:
         raise NotFoundError("Usuário não encontrado.")
     return user
+
+
+def admin_reset_password(session: Session, organization_id: uuid.UUID, membership_id: uuid.UUID) -> str:
+    """Gera um link de redefinição de senha pra uma membership já ACTIVE
+    (`resend_invite` só serve pra INVITED — ver docstring lá). Mesma
+    regra de segurança do convite original: o administrador NUNCA vê
+    nem define a senha do funcionário, só recebe este token/link pra
+    repassar — ver `core/security.py::create_password_reset_token` e
+    `services/auth.py::reset_password` (quem consome o token)."""
+    membership = _get_membership_in_org(session, organization_id, membership_id)
+    if membership.status not in (MembershipStatus.ACTIVE, MembershipStatus.SUSPENDED):
+        raise ConflictError("Só é possível redefinir senha de uma membership ativa ou suspensa.")
+    return create_password_reset_token(user_id=membership.user_id, membership_id=membership.id)
+
+
+def list_roles(session: Session, organization_id: uuid.UUID) -> list:
+    """Roles de sistema + roles customizadas desta organização — ver
+    `rbac_repo.list_roles_available`. Usado pelo seletor de "Perfil de
+    acesso" em Configurações > Acessos; o frontend traduz `name`
+    (OWNER/ADMIN/RECEPTIONIST/PROFESSIONAL) para rótulo humano
+    (Proprietário/Administrador/Recepção/Profissional) — nunca mostra a
+    string técnica."""
+    return rbac_repo.list_roles_available(session, organization_id)
+
+
+def list_permissions(session: Session):
+    """Catálogo global de permissions — ver `rbac_repo.list_all_permissions`.
+    Usado pelo editor "Personalizado" (overrides por membership); o
+    frontend é responsável por traduzir cada `key` pra linguagem humana
+    (item explícito do pedido: nunca mostrar `agenda.edit` cru pro
+    usuário final)."""
+    return rbac_repo.list_all_permissions(session)
+
+
+def get_permission_overrides(session: Session, organization_id: uuid.UUID, membership_id: uuid.UUID):
+    membership = _get_membership_in_org(session, organization_id, membership_id)
+    return rbac_repo.list_overrides(session, membership.id)
+
+
+def set_permission_overrides(
+    session: Session,
+    organization_id: uuid.UUID,
+    membership_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    overrides: list[tuple[str, PermissionEffect]],
+):
+    """Substitui TODOS os overrides desta membership pelo conjunto
+    informado (semântica PUT, não incremental — evita deixar overrides
+    "órfãos" de uma configuração anterior). Isto é o que torna o perfil
+    "Personalizado" possível sem tocar no Role em si: o Role continua
+    sendo a base (OWNER/ADMIN/RECEPTIONIST/PROFESSIONAL), e os overrides
+    aqui GRANT/DENY permissions individuais por cima dela — ver
+    `services/auth.py::compute_effective_permissions`."""
+    membership = _get_membership_in_org(session, organization_id, membership_id)
+
+    keys = [key for key, _effect in overrides]
+    if keys:
+        existing_keys = set(session.scalars(select(Permission.key).where(Permission.key.in_(keys))).all())
+        unknown = set(keys) - existing_keys
+        if unknown:
+            raise ValidationDomainError(f"Permissões desconhecidas: {', '.join(sorted(unknown))}.")
+
+    old_overrides = [
+        {"permission_key": o.permission_key, "effect": o.effect.value}
+        for o in rbac_repo.list_overrides(session, membership.id)
+    ]
+
+    session.execute(
+        delete(MembershipPermissionOverride).where(MembershipPermissionOverride.membership_id == membership.id)
+    )
+    for key, effect in overrides:
+        session.add(
+            MembershipPermissionOverride(membership_id=membership.id, permission_key=key, effect=effect)
+        )
+    session.flush()
+
+    audit_log_repo.create(
+        session,
+        organization_id=organization_id,
+        user_id=actor_user_id,
+        entity_type="membership_permission_overrides",
+        entity_id=membership.id,
+        action=AuditAction.UPDATE,
+        old_values={"overrides": old_overrides},
+        new_values={"overrides": [{"permission_key": k, "effect": e.value} for k, e in overrides]},
+    )
+
+    return rbac_repo.list_overrides(session, membership.id)

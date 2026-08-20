@@ -59,6 +59,7 @@ from nexasalon_api.schemas.auth import (
     LoginResponse,
     MeResponse,
     OrganizationChoiceRead,
+    ResetPasswordRequest,
     SelectOrganizationRequest,
     TokenPairRead,
 )
@@ -175,6 +176,17 @@ def logout(request: Request, response: Response) -> None:
 )
 def accept_invite(payload: AcceptInviteRequest, response: Response) -> TokenPairRead:
     tokens = auth_service.accept_invite(payload.invite_token, payload.password)
+    _set_refresh_cookie(response, tokens.refresh_token)
+    return _tokens_to_schema(tokens)
+
+
+@router.post(
+    "/reset-password",
+    response_model=TokenPairRead,
+    summary="Consumir o link de redefinição de senha gerado por um administrador",
+)
+def reset_password(payload: ResetPasswordRequest, response: Response) -> TokenPairRead:
+    tokens = auth_service.reset_password(payload.reset_token, payload.password)
     _set_refresh_cookie(response, tokens.refresh_token)
     return _tokens_to_schema(tokens)
 

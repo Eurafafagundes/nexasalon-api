@@ -188,6 +188,25 @@ class PermissionEffect(str, Enum):
     DENY = "deny"
 
 
+class AgendaAccessScope(str, Enum):
+    """Escopo de VISUALIZAÇÃO/EDIÇÃO de agenda por profissional, além (não
+    em vez) das permissions `agenda.view_own`/`agenda.view_all`/
+    `agenda.edit` já existentes — ver `models/agenda_access.py`.
+
+    ALL = todos os profissionais da organização, inclusive os criados
+    DEPOIS desta configuração (nenhuma linha extra precisa ser inserida
+    quando um novo Professional é cadastrado — é o valor padrão de toda
+    membership, preservando o comportamento atual). É o que resolve, de
+    forma estrutural, o item "aplicar acesso automaticamente a novas
+    agendas": não existe lista para manter atualizada.
+
+    SELECTED = só os profissionais com uma linha explícita em
+    `membership_agenda_grants` (`can_view`/`can_edit`)."""
+
+    ALL = "all"
+    SELECTED = "selected"
+
+
 def pg_enum(enum_cls, name: str):
     """Enum nativo do Postgres, tipo já criado na migration 0001.
 

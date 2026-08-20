@@ -400,6 +400,54 @@ def accept_invite(invite_token: str, password: str) -> SessionTokens:
     return _issue_session_tokens(user_id=user_id, organization_id=organization_id, membership_id=membership_id)
 
 
+def reset_password(reset_token: str, password: str) -> SessionTokens:
+    """Consome um token de redefinição de senha ACIONADO POR ADMIN (ver
+    `services/user_management.py::admin_reset_password` — o admin nunca
+    define nem vê a senha, só gera este link pra repassar). Ao contrário
+    de `accept_invite`, a membership já está ACTIVE e continua ACTIVE —
+    isto não é um convite, é só uma troca de senha. Retorna uma sessão
+    completa (auto-login), mesma conveniência do accept-invite."""
+    try:
+        payload = decode_token(reset_token)
+    except InvalidTokenError as exc:
+        raise UnauthorizedError("Link de redefinição inválido ou expirado.") from exc
+
+    if payload.get("type") != TokenType.PASSWORD_RESET.value:
+        raise UnauthorizedError("Token inválido para esta operação.")
+
+    try:
+        user_id = uuid.UUID(payload["sub"])
+        membership_id = uuid.UUID(payload["membership_id"])
+    except (KeyError, ValueError) as exc:
+        raise UnauthorizedError("Link de redefinição malformado.") from exc
+
+    with _session_scoped_to_user(user_id) as session:
+        membership = membership_repo.get(session, membership_id)
+        if membership is None or membership.user_id != user_id:
+            raise UnauthorizedError("Link de redefinição inválido.")
+        if membership.status not in (MembershipStatus.ACTIVE, MembershipStatus.SUSPENDED):
+            raise ForbiddenError("Esta membership não está mais disponível para redefinição de senha.")
+
+        user = user_repo.get(session, user_id)
+        if user is None:
+            raise UnauthorizedError("Link de redefinição inválido.")
+
+        user.password_hash = hash_password(password)
+        user_repo.save(session, user)
+
+        organization_id = membership.organization_id
+        membership_status = membership.status
+
+    # Membership SUSPENSA: a senha foi trocada com sucesso, mas login
+    # continua bloqueado (mesma checagem de sempre em `login()`/
+    # `_get_real_current_actor`) — não faz sentido devolver uma sessão
+    # que o próximo request derrubaria de qualquer forma.
+    if membership_status != MembershipStatus.ACTIVE:
+        raise ForbiddenError("Senha redefinida, mas o acesso desta membership está suspenso.")
+
+    return _issue_session_tokens(user_id=user_id, organization_id=organization_id, membership_id=membership_id)
+
+
 def list_my_organizations(user_id: uuid.UUID) -> list[OrganizationChoice]:
     """Memberships ativas do usuário em todas as organizações — usado
     pelo `GET /auth/me` para montar o seletor de empresas do frontend."""

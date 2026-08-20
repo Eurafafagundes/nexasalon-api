@@ -28,13 +28,25 @@ from nexasalon_api.repositories import (
     service_repo,
 )
 from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate, AppointmentReplace
-from nexasalon_api.services import availability
+from nexasalon_api.services import agenda_access, availability
 from nexasalon_api.services.appointment_state_machine import assert_cancellable, next_status
 from nexasalon_api.services.appointment_state_machine import mark_paid as _mark_paid_transition
 
 FORCE_OVERLAP_PERMISSION = "agenda.force_overlap"
-VIEW_ALL_PERMISSION = "agenda.view_all"
-VIEW_OWN_PERMISSION = "agenda.view_own"
+
+
+def _assert_can_edit(actor: ActorContext, professional_ids: set[uuid.UUID]) -> None:
+    """Portão de EDIÇÃO por profissional (item explícito do pedido:
+    "visualizar" e "editar" são permissões diferentes) — chamado depois
+    que o ator já passou pelo portão de VISUALIZAÇÃO (`get_appointment`)
+    em toda operação que de fato MUDA um agendamento. `mark_paid` fica
+    de fora de propósito: é consequência do fechamento da Comanda
+    (domínio financeiro), não uma edição direta de agenda."""
+    for professional_id in professional_ids:
+        if not agenda_access.can_edit_professional(actor, professional_id):
+            raise ForbiddenError(
+                "Você não tem permissão para editar a agenda de um ou mais profissionais deste agendamento."
+            )
 
 
 @dataclass
@@ -250,6 +262,7 @@ def create_appointment(session: Session, actor: ActorContext, data: AppointmentC
     snapshots = _build_all_item_snapshots(
         session, organization_id, data.branch_id, data.items, exclude_appointment_id=None
     )
+    _assert_can_edit(actor, {s.professional_id for s in snapshots})
     any_forced = _apply_conflict_policy(snapshots, effective_force_overlap)
     _maybe_allow_overlap(session, any_forced)
 
@@ -285,22 +298,18 @@ def _reload(session: Session, organization_id: uuid.UUID, appointment_id: uuid.U
     return appointment
 
 
-def _actor_can_view_all(actor: ActorContext) -> bool:
-    return VIEW_ALL_PERMISSION in actor.permissions
-
-
 def get_appointment(session: Session, actor: ActorContext, appointment_id: uuid.UUID) -> Appointment:
-    """404 (nunca 403) quando o ator não tem `view_all` e o agendamento
-    não envolve seu próprio `professional_id` — mesmo padrão anti-leak
-    usado no resto da API pra recursos fora do escopo do ator."""
+    """404 (nunca 403) quando o ator não pode VER nenhum profissional
+    envolvido neste agendamento — mesmo padrão anti-leak usado no resto
+    da API pra recursos fora do escopo do ator. Delega a regra completa
+    (view_all / view_own / escopo granular SELECTED) a
+    `agenda_access.can_view_professional`, a mesma função usada pela
+    listagem em `services/agenda.py`."""
     appointment = appointment_repo.get(session, actor.organization_id, appointment_id)
     if appointment is None:
         raise NotFoundError("Agendamento não encontrado.")
-    if not _actor_can_view_all(actor):
-        if actor.professional_id is None or not any(
-            item.professional_id == actor.professional_id for item in appointment.items
-        ):
-            raise NotFoundError("Agendamento não encontrado.")
+    if not any(agenda_access.can_view_professional(actor, item.professional_id) for item in appointment.items):
+        raise NotFoundError("Agendamento não encontrado.")
     return appointment
 
 
@@ -327,6 +336,14 @@ def replace_appointment(
     _assert_branch_and_client(session, organization_id, data.branch_id, data.client_id)
     snapshots = _build_all_item_snapshots(
         session, organization_id, data.branch_id, data.items, exclude_appointment_id=appointment_id
+    )
+    # Edição precisa valer tanto para os profissionais que JÁ estavam no
+    # agendamento (pode estar reduzindo/removendo o item deles) quanto
+    # para os NOVOS profissionais sendo atribuídos (pode estar
+    # reatribuindo pra alguém que o ator não tem permissão de editar).
+    _assert_can_edit(
+        actor,
+        {item.professional_id for item in appointment.items} | {s.professional_id for s in snapshots},
     )
     any_forced = _apply_conflict_policy(snapshots, effective_force_overlap)
     _maybe_allow_overlap(session, any_forced)
@@ -387,6 +404,7 @@ def update_status(
     obrigatória). `CANCELLED` e `PAID` nunca são destino aqui (ver
     `appointment_state_machine.next_status`)."""
     appointment = get_appointment(session, actor, appointment_id)
+    _assert_can_edit(actor, {item.professional_id for item in appointment.items})
     old_status = appointment.status
     new_status = next_status(old_status, target_status)
     appointment.status = new_status
@@ -428,6 +446,7 @@ def mark_paid(session: Session, actor: ActorContext, appointment_id: uuid.UUID) 
 
 def cancel_appointment(session: Session, actor: ActorContext, appointment_id: uuid.UUID) -> Appointment:
     appointment = get_appointment(session, actor, appointment_id)
+    _assert_can_edit(actor, {item.professional_id for item in appointment.items})
     assert_cancellable(appointment.status)
     old_status = appointment.status
     appointment.status = AppointmentStatus.CANCELLED

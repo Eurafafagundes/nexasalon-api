@@ -890,6 +890,188 @@ def test_producao_recusa_subir_com_rate_limit_desligado():
 # ---------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------
+# Redefinição de senha por administrador (Etapa A) — mesma garantia do
+# convite: admin nunca vê/define a senha do funcionário, só relaya um
+# link/token de uso único.
+# ---------------------------------------------------------------------
+
+
+def test_admin_reset_password_gera_link_e_membership_continua_active(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    headers = _auth_headers(owner_body["tokens"]["access_token"])
+
+    resp = client.post(f"/api/v1/users/{scenario.recep_membership_id}/reset-password", headers=headers)
+    assert resp.status_code == 200, resp.text
+    reset_token = resp.json()["reset_token"]
+    assert reset_token
+
+    # a senha ANTIGA continua funcionando até o link ser de fato usado
+    old_login = client.post(
+        "/api/v1/auth/login", json={"email": scenario.recep_email, "password": scenario.password}
+    )
+    assert old_login.status_code == 200
+
+
+def test_consumir_reset_password_troca_a_senha_e_ja_loga(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    reset_resp = client.post(
+        f"/api/v1/users/{scenario.recep_membership_id}/reset-password",
+        headers=_auth_headers(owner_body["tokens"]["access_token"]),
+    )
+    reset_token = reset_resp.json()["reset_token"]
+
+    consume_resp = client.post(
+        "/api/v1/auth/reset-password", json={"reset_token": reset_token, "password": "NovaSenha123!"}
+    )
+    assert consume_resp.status_code == 200, consume_resp.text
+    assert consume_resp.json()["access_token"]
+
+    # senha antiga não funciona mais; a nova sim
+    old_login = client.post(
+        "/api/v1/auth/login", json={"email": scenario.recep_email, "password": scenario.password}
+    )
+    assert old_login.status_code == 401
+
+    new_login = client.post(
+        "/api/v1/auth/login", json={"email": scenario.recep_email, "password": "NovaSenha123!"}
+    )
+    assert new_login.status_code == 200
+
+
+def test_reset_password_de_membership_suspensa_troca_senha_mas_recusa_sessao(client, scenario):
+    """A senha é redefinida com sucesso mesmo assim (não é o convite —
+    já existe conta), mas a resposta recusa devolver uma sessão logada
+    porque a membership está SUSPENDED; login subsequente também
+    continua bloqueado até reativação."""
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    reset_resp = client.post(
+        f"/api/v1/users/{scenario.inactive_membership_id}/reset-password",
+        headers=_auth_headers(owner_body["tokens"]["access_token"]),
+    )
+    reset_token = reset_resp.json()["reset_token"]
+
+    consume_resp = client.post(
+        "/api/v1/auth/reset-password", json={"reset_token": reset_token, "password": "NovaSenha123!"}
+    )
+    assert consume_resp.status_code == 403
+
+    login_resp = client.post(
+        "/api/v1/auth/login", json={"email": scenario.inactive_email, "password": "NovaSenha123!"}
+    )
+    assert login_resp.status_code == 403
+
+
+def test_reset_password_token_invalido(client):
+    resp = client.post(
+        "/api/v1/auth/reset-password", json={"reset_token": "token-invalido", "password": "Senha1234!"}
+    )
+    assert resp.status_code == 401
+
+
+def test_receptionist_nao_pode_gerar_reset_password_de_outra_membership(client, scenario):
+    recep_body = _login(client, scenario.recep_email, scenario.password)
+    resp = client.post(
+        f"/api/v1/users/{scenario.single_membership_id}/reset-password",
+        headers=_auth_headers(recep_body["tokens"]["access_token"]),
+    )
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------
+# Catálogo de roles/permissions + overrides por membership (perfil
+# "Personalizado") — Etapa A.
+# ---------------------------------------------------------------------
+
+
+def test_list_roles_retorna_os_4_roles_de_sistema(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    resp = client.get("/api/v1/roles", headers=_auth_headers(owner_body["tokens"]["access_token"]))
+    assert resp.status_code == 200, resp.text
+    names = {r["name"] for r in resp.json()}
+    assert {"OWNER", "ADMIN", "RECEPTIONIST", "PROFESSIONAL"} <= names
+    assert all(r["is_system"] for r in resp.json() if r["name"] in {"OWNER", "ADMIN", "RECEPTIONIST", "PROFESSIONAL"})
+
+
+def test_list_permissions_retorna_catalogo_com_modulo(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    resp = client.get("/api/v1/permissions", headers=_auth_headers(owner_body["tokens"]["access_token"]))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert any(p["key"] == "agenda.edit" for p in body)
+    assert all("module" in p for p in body)
+
+
+def test_permission_overrides_get_put_roundtrip(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    headers = _auth_headers(owner_body["tokens"]["access_token"])
+
+    empty = client.get(f"/api/v1/users/{scenario.prof_membership_id}/permission-overrides", headers=headers)
+    assert empty.status_code == 200
+    assert empty.json() == []
+
+    put_resp = client.put(
+        f"/api/v1/users/{scenario.prof_membership_id}/permission-overrides",
+        json={"overrides": [{"permission_key": "agenda.view_all", "effect": "grant"}]},
+        headers=headers,
+    )
+    assert put_resp.status_code == 200, put_resp.text
+    assert put_resp.json() == [{"permission_key": "agenda.view_all", "effect": "grant"}]
+
+    get_resp = client.get(f"/api/v1/users/{scenario.prof_membership_id}/permission-overrides", headers=headers)
+    assert get_resp.json() == [{"permission_key": "agenda.view_all", "effect": "grant"}]
+
+    # e o efeito realmente se reflete no /me da própria pessoa
+    prof_body = _login(client, scenario.prof_email, scenario.password)
+    prof_me = client.get("/api/v1/auth/me", headers=_auth_headers(prof_body["tokens"]["access_token"]))
+    assert "agenda.view_all" in prof_me.json()["permissions"]
+
+
+def test_permission_overrides_com_chave_desconhecida_e_rejeitado(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    resp = client.put(
+        f"/api/v1/users/{scenario.prof_membership_id}/permission-overrides",
+        json={"overrides": [{"permission_key": "isso.nao.existe", "effect": "grant"}]},
+        headers=_auth_headers(owner_body["tokens"]["access_token"]),
+    )
+    assert resp.status_code == 422
+
+
+def test_agenda_access_default_e_all_all_sem_grants(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    resp = client.get(
+        f"/api/v1/users/{scenario.prof_membership_id}/agenda-access",
+        headers=_auth_headers(owner_body["tokens"]["access_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["view_scope"] == "all"
+    assert body["edit_scope"] == "all"
+    assert body["grants"] == []
+
+
+def test_agenda_access_edit_scope_all_sem_view_scope_all_e_rejeitado(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    resp = client.put(
+        f"/api/v1/users/{scenario.prof_membership_id}/agenda-access",
+        json={
+            "view_scope": "selected", "edit_scope": "all",
+            "viewable_professional_ids": [], "editable_professional_ids": [],
+        },
+        headers=_auth_headers(owner_body["tokens"]["access_token"]),
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_receptionist_nao_gerencia_agenda_access_de_outra_membership(client, scenario):
+    recep_body = _login(client, scenario.recep_email, scenario.password)
+    resp = client.get(
+        f"/api/v1/users/{scenario.prof_membership_id}/agenda-access",
+        headers=_auth_headers(recep_body["tokens"]["access_token"]),
+    )
+    assert resp.status_code == 403
+
+
 def test_cross_tenant_nao_acessa_membership_de_outra_organizacao(client, scenario):
     """multi_org_user tem membership ACTIVE em A (ADMIN) e em B
     (RECEPTIONIST) — usando o token da sessão em B, tentar manipular a

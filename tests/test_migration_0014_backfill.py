@@ -74,26 +74,26 @@ def legacy_db():
 
 def _insert_legacy_payment(admin_url: str) -> dict:
     """Monta a cadeia mínima de domínio pra satisfazer as FKs. `Client`,
-    `Order`/`OrderItem` ganharam colunas novas em rodadas posteriores à
-    0013 (0015) — inserir/consultar essas tabelas via ORM ou via
+    `Order`/`OrderItem`, `Payment` e (a partir da 0019, Etapa A)
+    `OrganizationMembership` ganharam colunas novas em rodadas
+    posteriores à 0013 — inserir/consultar essas tabelas via ORM ou via
     services que as tocam (ex.: `appointments.create_appointment`, que
     faz `client_repo.get`) falharia com "column does not exist" nesta
     revisão congelada do schema. Por isso TODA a cadeia (org, role,
     user, membership, branch, client, professional, service, agendamento
     + item, comanda + item, pagamento) é montada via SQL cru, restrita
     às colunas que já existiam na 0013 — só os models que realmente não
-    mudaram desde então (`Organization`, `User`, `OrganizationMembership`,
-    `Branch`, `Professional`, `Service`, `ProfessionalService`,
-    `WorkingHours`, `Role`) continuam via ORM. Devolve os ids relevantes
-    pra validação depois do upgrade."""
+    mudaram desde então (`Organization`, `Branch`, `Professional`,
+    `Service`, `ProfessionalService`, `WorkingHours`, `Role`) continuam
+    via ORM. `User` também continua via ORM (não ganhou coluna nova).
+    Devolve os ids relevantes pra validação depois do upgrade."""
     # Import tardio: só depois que `NEXASALON_DATABASE_URL` do processo
     # de teste principal já foi fixada pelo `conftest.py` (não usamos
     # esse valor aqui — construímos nossa própria engine/session — mas
     # os models em si não têm estado de engine, então importar aqui ou
     # no topo do arquivo dá no mesmo; mantido aqui só por clareza de que
     # este helper é o único lugar que efetivamente usa os models).
-    from nexasalon_api.models.identity import OrganizationMembership, User
-    from nexasalon_api.models.enums import MembershipStatus
+    from nexasalon_api.models.identity import User
     from nexasalon_api.models.organization import Branch, Organization
     from nexasalon_api.models.professional import Professional, WorkingHours
     from nexasalon_api.models.rbac import Role
@@ -113,10 +113,21 @@ def _insert_legacy_payment(admin_url: str) -> dict:
         session.add(user)
         session.flush()
 
-        session.add(
-            OrganizationMembership(
-                user_id=user.id, organization_id=org.id, role_id=owner_role.id, status=MembershipStatus.ACTIVE
-            )
+        # SQL cru, de propósito: `OrganizationMembership` ganhou
+        # `agenda_view_scope`/`agenda_edit_scope` na 0019 (Etapa A) — não
+        # existem ainda nesta revisão do schema (0013), então inserir via
+        # ORM (que sempre inclui todas as colunas mapeadas, inclusive as
+        # com server_default, no RETURNING) falharia com "column
+        # organization_memberships.agenda_view_scope does not exist".
+        # Mesma lógica já documentada acima para `clients`/`orders`/
+        # `order_items`/`payments`.
+        session.execute(
+            text(
+                "INSERT INTO organization_memberships (id, user_id, organization_id, role_id, status, "
+                "created_at, updated_at) "
+                "VALUES (:id, :user_id, :org, :role, 'active', now(), now())"
+            ),
+            {"id": uuid.uuid4(), "user_id": user.id, "org": org.id, "role": owner_role.id},
         )
 
         branch = Branch(organization_id=org.id, name="Unidade", slug=f"unidade-{uuid.uuid4().hex[:8]}")

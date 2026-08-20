@@ -53,12 +53,19 @@ def list_agenda(
     date_to: datetime,
     branch_id: uuid.UUID | None = None,
     professional_id: uuid.UUID | None = None,
+    professional_ids: list[uuid.UUID] | None = None,
     service_id: uuid.UUID | None = None,
     status: AppointmentStatus | None = None,
 ) -> list[AppointmentItem]:
     """Lista itens (não appointments) — a granularidade certa pra
     filtrar por profissional/serviço e pra aplicar `agenda.view_own`
-    (um item por profissional, não o appointment inteiro)."""
+    (um item por profissional, não o appointment inteiro).
+
+    `professional_ids` (plural) filtra por um CONJUNTO de profissionais
+    — usado pelo escopo granular SELECTED (`services/agenda_access.py`),
+    combinável com `professional_id` (singular) se os dois vierem
+    preenchidos ao mesmo tempo, embora os chamadores atuais nunca passem
+    os dois juntos."""
     effective_status = func.coalesce(AppointmentItem.status, Appointment.status)
     stmt = (
         select(AppointmentItem)
@@ -74,6 +81,8 @@ def list_agenda(
         stmt = stmt.where(Appointment.branch_id == branch_id)
     if professional_id is not None:
         stmt = stmt.where(AppointmentItem.professional_id == professional_id)
+    if professional_ids is not None:
+        stmt = stmt.where(AppointmentItem.professional_id.in_(professional_ids))
     if service_id is not None:
         stmt = stmt.where(AppointmentItem.service_id == service_id)
     if status is not None:

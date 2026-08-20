@@ -54,6 +54,14 @@ class AcceptInviteRequest(BaseModel):
     password: str = Field(min_length=8)
 
 
+class ResetPasswordRequest(BaseModel):
+    """Consumo do link gerado por `POST /users/{id}/reset-password`
+    (admin) — ver `services/auth.py::reset_password`."""
+
+    reset_token: str
+    password: str = Field(min_length=8)
+
+
 # Não existem mais `RefreshRequest`/`LogoutRequest`: refresh/logout leem o
 # refresh token do cookie HttpOnly (`Request.cookies`), nunca de um campo
 # de body — o objetivo do cookie HttpOnly é justamente o token nunca
