@@ -25,6 +25,19 @@ def get_by_cpf(session: Session, organization_id: uuid.UUID, cpf: str) -> Client
     return session.scalars(stmt).first()
 
 
+def get_by_phone(session: Session, organization_id: uuid.UUID, phone: str) -> Client | None:
+    """`phone` já deve vir NORMALIZADO (só dígitos — ver
+    `core/normalize.py::normalize_phone`) — usado pelo Agendamento
+    Online público (Etapa K) pra achar a cliente existente pelo
+    telefone/WhatsApp DENTRO DA MESMA organização antes de criar um
+    cadastro novo (item explícito do pedido "procurar cliente existente
+    pelo telefone dentro da organização"). Considera ativos E inativos,
+    mesmo raciocínio de `get_by_cpf` — um telefone de um cadastro
+    desativado ainda identifica a mesma pessoa."""
+    stmt = select(Client).where(Client.organization_id == organization_id, Client.phone == phone)
+    return session.scalars(stmt).first()
+
+
 def list_all(
     session: Session,
     organization_id: uuid.UUID,

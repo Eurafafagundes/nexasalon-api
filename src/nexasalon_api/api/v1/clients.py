@@ -5,8 +5,16 @@ from sqlalchemy.orm import Session
 
 from nexasalon_api.api.deps import get_db, require_permission
 from nexasalon_api.core.actor import ActorContext
-from nexasalon_api.schemas.client import ClientCreate, ClientHistory, ClientRead, ClientUpdate
-from nexasalon_api.schemas.order import OrderRead
+from nexasalon_api.schemas.appointment import AppointmentRead
+from nexasalon_api.schemas.client import (
+    ClientCreate,
+    ClientHistory,
+    ClientListRead,
+    ClientProfile,
+    ClientRead,
+    ClientUpdate,
+)
+from nexasalon_api.schemas.order import ClientOrderSummary, OrderRead
 from nexasalon_api.services import clients as clients_service
 
 router = APIRouter(prefix="/clients", tags=["clients"])
@@ -15,15 +23,30 @@ _view = require_permission("clients.view")
 _manage = require_permission("clients.manage")
 
 
-@router.get("", response_model=list[ClientRead], summary="Listar/buscar clientes (nome, telefone ou CPF — campo único)")
+@router.get(
+    "", response_model=list[ClientListRead], summary="Listar/buscar clientes (nome, telefone ou CPF — campo único)"
+)
 def list_clients(
     search: str | None = None,
     include_inactive: bool = False,
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_view),
-) -> list[ClientRead]:
-    clients = clients_service.list_clients(session, actor.organization_id, include_inactive, search)
-    return [ClientRead.model_validate(c) for c in clients]
+) -> list[ClientListRead]:
+    entries = clients_service.list_clients_with_summary(session, actor.organization_id, include_inactive, search)
+    result = []
+    for entry in entries:
+        base = ClientListRead.model_validate(entry.client)
+        result.append(
+            base.model_copy(
+                update={
+                    "last_visit_at": entry.last_visit_at,
+                    "next_appointment_at": entry.next_appointment_at,
+                    "last_professional_name": entry.last_professional_name,
+                    "has_no_show": entry.has_no_show,
+                }
+            )
+        )
+    return result
 
 
 @router.post("", response_model=ClientRead, status_code=status.HTTP_201_CREATED, summary="Criar cliente")
@@ -62,6 +85,35 @@ def get_client_history(
         visits_count=summary.visits_count,
         total_spent=summary.total_spent,
         orders=[OrderRead.from_order(o) for o in summary.orders],
+    )
+
+
+@router.get(
+    "/{client_id}/profile",
+    response_model=ClientProfile,
+    summary="Ficha 360° do cliente — Resumo + Histórico + Comandas (Etapa J)",
+)
+def get_client_profile(
+    client_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> ClientProfile:
+    profile = clients_service.get_client_profile(session, actor, client_id)
+    return ClientProfile(
+        client=ClientRead.model_validate(profile.client),
+        client_since=profile.client_since,
+        visits_count=profile.visits_count,
+        total_spent=profile.total_spent if profile.can_view_finance else None,
+        last_visit_at=profile.last_visit_at,
+        next_appointment=AppointmentRead.model_validate(profile.next_appointment)
+        if profile.next_appointment
+        else None,
+        no_show_count=profile.no_show_count,
+        cancelled_count=profile.cancelled_count,
+        timeline=[AppointmentRead.model_validate(a) for a in profile.timeline],
+        orders=[ClientOrderSummary.from_order(o, can_view_finance=profile.can_view_finance) for o in profile.orders],
+        can_view_finance=profile.can_view_finance,
+        can_view_orders=profile.can_view_orders,
     )
 
 

@@ -12,7 +12,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from nexasalon_api.core.normalize import is_valid_cnpj, normalize_cnpj
+from nexasalon_api.core.normalize import is_valid_cnpj, normalize_cnpj, normalize_slug
 from nexasalon_api.models.enums import BrazilianState, OrganizationStatus
 
 
@@ -23,6 +23,10 @@ class OrganizationRead(BaseModel):
     name: str
     slug: str
     document: str | None
+    online_booking_enabled: bool
+    online_booking_auto_confirm: bool
+    online_booking_min_lead_minutes: int
+    online_booking_max_lead_days: int
     legal_name: str | None
     logo_url: str | None
     email: str | None
@@ -57,6 +61,16 @@ class OrganizationUpdate(BaseModel):
     (ex.: remover um CNPJ cadastrado por engano)."""
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
+    # Slug da URL pública (Etapa K — Agendamento Online): `None` = campo
+    # não enviado, mantém o valor atual (mesma semântica `exclude_unset`
+    # do resto deste schema). Diferente do resto: `slug` NUNCA pode ser
+    # limpo pra `null` (é NOT NULL no banco) — `services/organizations.py`
+    # recusa esse caso explicitamente antes de chegar no banco.
+    slug: str | None = Field(default=None, min_length=1, max_length=120)
+    online_booking_enabled: bool | None = None
+    online_booking_auto_confirm: bool | None = None
+    online_booking_min_lead_minutes: int | None = Field(default=None, ge=0, le=10080)
+    online_booking_max_lead_days: int | None = Field(default=None, ge=1, le=3650)
     legal_name: str | None = Field(default=None, max_length=255)
     document: str | None = Field(default=None, max_length=18)
     business_type: str | None = Field(default=None, max_length=50)
@@ -73,6 +87,16 @@ class OrganizationUpdate(BaseModel):
     address_line: str | None = Field(default=None, max_length=255)
     address_number: str | None = Field(default=None, max_length=20)
     complement: str | None = Field(default=None, max_length=120)
+
+    @field_validator("slug", mode="after")
+    @classmethod
+    def _normalize_slug(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = normalize_slug(value)
+        if not normalized:
+            raise ValueError("Slug inválido — use letras, números e hífen.")
+        return normalized
 
     @field_validator("document", mode="after")
     @classmethod

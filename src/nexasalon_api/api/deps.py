@@ -20,6 +20,7 @@ este módulo é o único seam de troca.
 """
 import uuid
 from collections.abc import Generator
+from dataclasses import dataclass
 
 from fastapi import Depends, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -30,11 +31,22 @@ from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.config import settings
 from nexasalon_api.core.db import SessionLocal
 from nexasalon_api.core.dev_auth import get_current_actor_DEV_ONLY
-from nexasalon_api.core.exceptions import ForbiddenError, UnauthorizedError
+from nexasalon_api.core.exceptions import (
+    ForbiddenError,
+    NotFoundError,
+    UnauthorizedError,
+)
 from nexasalon_api.core.rate_limit import rate_limiter
 from nexasalon_api.core.security import InvalidTokenError, TokenType, decode_token
 from nexasalon_api.models.enums import MembershipStatus
-from nexasalon_api.repositories import membership_repo, professional_repo, rbac_repo, user_repo
+from nexasalon_api.models.organization import Organization
+from nexasalon_api.repositories import (
+    membership_repo,
+    organization_repo,
+    professional_repo,
+    rbac_repo,
+    user_repo,
+)
 from nexasalon_api.services import agenda_access
 from nexasalon_api.services.auth import compute_effective_permissions
 
@@ -276,6 +288,80 @@ def require_csrf_header(request: Request) -> None:
         raise ForbiddenError(
             f"Header '{settings.csrf_header_name}' é obrigatório nesta rota (proteção CSRF)."
         )
+
+
+def rate_limit_public_booking_create(request: Request) -> None:
+    """Rate limit ESTRITO na confirmação (POST) — mais apertado que o de
+    navegação (`get_public_context`, abaixo): é o endpoint que de fato
+    escreve dado (cria Client/Appointment), o alvo mais valioso pra
+    abuso automatizado num endpoint sem login nenhum."""
+    if not settings.rate_limit_enabled:
+        return
+    rate_limiter.hit(
+        f"public_booking_create:{_client_ip(request)}",
+        max_attempts=settings.rate_limit_public_booking_create_max_attempts,
+        window_seconds=settings.rate_limit_public_booking_create_window_seconds,
+    )
+
+
+@dataclass
+class PublicBookingContext:
+    """Sessão + organização já resolvida pra uma request da página
+    pública de Agendamento Online (Etapa K) — devolvido por
+    `get_public_context` pras rotas de `api/v1/public_booking.py`."""
+
+    session: Session
+    organization: Organization
+
+
+def get_public_context(
+    organization_slug: str, request: Request
+) -> Generator[PublicBookingContext, None, None]:
+    """Dependency-raiz das rotas PÚBLICAS de agendamento — SEM
+    autenticação nenhuma (o pedido é explícito: "sem login"), então não
+    existe `ActorContext`/`organization_id` de saída como em `get_db`.
+
+    RLS (ver docstring completa na migration 0028): `organizations` tem
+    `FORCE ROW LEVEL SECURITY`, então buscar por slug ANTES de conhecer
+    `organization_id` normalmente devolveria zero linhas. O flag
+    `app.public_booking_lookup` liga uma segunda policy, estritamente
+    `FOR SELECT` e só nesta tabela, só pelo tempo desta única consulta —
+    desligado de novo logo em seguida. A partir daí, `app.current_org_id`
+    é setado como em QUALQUER request autenticada, e todo o resto da
+    request (serviços, profissionais, disponibilidade, criação do
+    agendamento) fica sob a MESMA RLS de tenant isolation de sempre —
+    nunca um bypass geral.
+
+    Uma organização com `online_booking_enabled=false` (ou slug
+    inexistente) devolve 404 igual — nunca revela se o slug existe mas
+    está com a página desativada (item de segurança: não vazar
+    existência de organização por enumeração de slug)."""
+    if settings.rate_limit_enabled:
+        rate_limiter.hit(
+            f"public_booking:{_client_ip(request)}",
+            max_attempts=settings.rate_limit_public_booking_max_attempts,
+            window_seconds=settings.rate_limit_public_booking_window_seconds,
+        )
+
+    session = SessionLocal()
+    try:
+        session.execute(text("SELECT set_config('app.public_booking_lookup', 'true', true)"))
+        organization = organization_repo.get_by_slug(session, organization_slug)
+        session.execute(text("SELECT set_config('app.public_booking_lookup', 'false', true)"))
+
+        if organization is None or not organization.online_booking_enabled:
+            raise NotFoundError("Página de agendamento não encontrada.")
+
+        session.execute(
+            text("SELECT set_config('app.current_org_id', :oid, true)"), {"oid": str(organization.id)}
+        )
+        yield PublicBookingContext(session=session, organization=organization)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def get_db(actor: ActorContext = Depends(get_current_actor)) -> Generator[Session, None, None]:

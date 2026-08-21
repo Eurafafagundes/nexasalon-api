@@ -6,15 +6,17 @@ from . import (
     appointments,
     auth,
     branches,
+    cash_register_config,
     cash_registers,
     clients,
     dashboard,
     extract,
     inventory_counts,
-    organizations,
     orders,
+    organizations,
     products,
     professionals,
+    public_booking,
     roles,
     schedule_blocks,
     service_categories,
@@ -39,8 +41,10 @@ api_v1_router.include_router(appointment_status_styles.router)
 api_v1_router.include_router(schedule_blocks.router)
 api_v1_router.include_router(orders.router)
 api_v1_router.include_router(cash_registers.router)
+api_v1_router.include_router(cash_register_config.router)
 api_v1_router.include_router(extract.router)
 api_v1_router.include_router(dashboard.router)
 api_v1_router.include_router(products.router)
 api_v1_router.include_router(stock.router)
 api_v1_router.include_router(inventory_counts.router)
+api_v1_router.include_router(public_booking.router)

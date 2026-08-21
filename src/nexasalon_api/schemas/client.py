@@ -4,10 +4,10 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from nexasalon_api.schemas.order import OrderRead
-
 from nexasalon_api.core.normalize import is_valid_cpf, normalize_cpf, normalize_phone
 from nexasalon_api.models.enums import BrazilianState, ClientGender
+from nexasalon_api.schemas.appointment import AppointmentRead
+from nexasalon_api.schemas.order import ClientOrderSummary, OrderRead
 
 
 class ClientBase(BaseModel):
@@ -92,3 +92,45 @@ class ClientHistory(BaseModel):
     visits_count: int
     total_spent: Decimal
     orders: list[OrderRead]
+
+
+class ClientListRead(ClientRead):
+    """`GET /clients` (Etapa J, "Lista de clientes") — `ClientRead` +
+    campos DERIVADOS de Appointment/Order, calculados em lote por
+    `services/clients.py::list_clients_with_summary` (nunca gravados no
+    `Client`, mesmo espírito de `ClientHistory`). Construído com
+    `ClientListRead.model_validate(client).model_copy(update={...})` —
+    os 4 campos abaixo não existem no ORM, por isso os defaults (nunca
+    obrigatórios pra `model_validate` funcionar direto no `Client`)."""
+
+    last_visit_at: datetime | None = None
+    next_appointment_at: datetime | None = None
+    last_professional_name: str | None = None
+    has_no_show: bool = False
+
+
+class ClientProfile(BaseModel):
+    """`GET /clients/{id}/profile` (Etapa J, "Ficha 360°") — Resumo +
+    Histórico + Comandas num único payload, tudo DERIVADO de
+    Appointment/Order (nunca uma tabela nova duplicando histórico, ver
+    `services/clients.py::get_client_profile`). RBAC: `total_spent`
+    vem `None` sem `finance.view`; `orders` vem vazia sem `orders.view`
+    (`can_view_finance`/`can_view_orders` dizem pro frontend POR QUE
+    está vazio — "sem permissão" é diferente de "sem dado" — mas quem
+    decide o conteúdo é sempre o backend, nunca o frontend só
+    escondendo visualmente)."""
+
+    model_config = ConfigDict(from_attributes=False)
+
+    client: ClientRead
+    client_since: datetime
+    visits_count: int
+    total_spent: Decimal | None
+    last_visit_at: datetime | None
+    next_appointment: AppointmentRead | None
+    no_show_count: int
+    cancelled_count: int
+    timeline: list[AppointmentRead]
+    orders: list[ClientOrderSummary]
+    can_view_finance: bool
+    can_view_orders: bool

@@ -37,7 +37,7 @@ from nexasalon_api.models.identity import User
 from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.service import ProfessionalService, Service
-from nexasalon_api.repositories import audit_log_repo, order_repo, stock_level_repo
+from nexasalon_api.repositories import audit_log_repo, cash_register_repo, order_repo, stock_level_repo
 from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate
 from nexasalon_api.schemas.order import (
     OrderClose,
@@ -131,6 +131,11 @@ def _open_order(session, org_id, actor, *, n_services=1, branch=None):
     """Comanda ABERTA com `n_services` linhas de serviço (Corte R$100
     cada) na `branch` informada (ou uma nova, se não vier)."""
     branch = branch or _branch(session, org_id)
+    # Etapa H ("exigir caixa aberto para criar Comanda", padrão ON) —
+    # abre caixa nesta unidade se ainda não houver um aberto aqui (uma
+    # `branch` reutilizada entre chamadas já pode ter um).
+    if cash_register_repo.get_open_for_branch(session, org_id, branch.id) is None:
+        cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
     prof = _professional(session, org_id, branch.id)
     _working_hours(session, org_id, prof.id, _THURSDAY, time(9, 0), time(20, 0))
     client = _client(session, org_id)

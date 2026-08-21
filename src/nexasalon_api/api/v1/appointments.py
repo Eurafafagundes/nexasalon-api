@@ -5,9 +5,12 @@ from sqlalchemy.orm import Session
 
 from nexasalon_api.api.deps import get_db, require_any_permission, require_permission
 from nexasalon_api.core.actor import ActorContext
+from nexasalon_api.repositories import client_repo
 from nexasalon_api.schemas.appointment import (
     AppointmentCreate,
+    AppointmentItemUpdate,
     AppointmentRead,
+    AppointmentRelatedRead,
     AppointmentReplace,
     AppointmentStatusUpdate,
 )
@@ -53,6 +56,41 @@ def replace_appointment(
 
 
 @router.patch(
+    "/{appointment_id}/items/{item_id}",
+    response_model=AppointmentRead,
+    summary="Editar preço/duração/profissional/horário de UM item (drawer da Agenda + drag-and-drop)",
+)
+def update_appointment_item(
+    appointment_id: uuid.UUID,
+    item_id: uuid.UUID,
+    payload: AppointmentItemUpdate,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_edit),
+) -> AppointmentRead:
+    appointment = appointments_service.update_appointment_item(session, actor, appointment_id, item_id, payload)
+    return AppointmentRead.model_validate(appointment)
+
+
+@router.get(
+    "/{appointment_id}/related",
+    response_model=AppointmentRelatedRead,
+    summary="Agendamentos relacionados (mesma cliente, mesmo dia) — Etapa I",
+)
+def get_related_appointments(
+    appointment_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> AppointmentRelatedRead:
+    appointment = appointments_service.get_appointment(session, actor, appointment_id)
+    related = appointments_service.get_related_appointments(session, actor, appointment_id)
+    client = client_repo.get(session, actor.organization_id, appointment.client_id)
+    return AppointmentRelatedRead(
+        client_name=client.name if client is not None else "Cliente",
+        related=[AppointmentRead.model_validate(a) for a in related],
+    )
+
+
+@router.patch(
     "/{appointment_id}/status", response_model=AppointmentRead, summary="Mudar status do agendamento"
 )
 def update_status(
@@ -61,7 +99,9 @@ def update_status(
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_edit),
 ) -> AppointmentRead:
-    appointment = appointments_service.update_status(session, actor, appointment_id, payload.status)
+    appointment = appointments_service.update_status(
+        session, actor, appointment_id, payload.status, scope=payload.scope
+    )
     return AppointmentRead.model_validate(appointment)
 
 

@@ -2,6 +2,7 @@
 — Etapa 3A. Mesma abordagem de `test_availability.py`: direto no
 service layer via `SessionLocal`, sem rota HTTP (rotas ainda não
 existem — próximo passo)."""
+import dataclasses
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -10,18 +11,32 @@ import pytest
 from sqlalchemy import text
 
 from nexasalon_api.core.actor import ActorContext
-from nexasalon_api.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationDomainError
 from nexasalon_api.core.db import SessionLocal
+from nexasalon_api.core.exceptions import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ValidationDomainError,
+)
 from nexasalon_api.models.audit import AuditLog
 from nexasalon_api.models.client import Client
+from nexasalon_api.models.enums import (
+    AppointmentStatus,
+    OrderStatus,
+    ScheduleBlockScope,
+    ScheduleBlockType,
+)
 from nexasalon_api.models.identity import User
-from nexasalon_api.models.enums import AppointmentStatus, ScheduleBlockScope, ScheduleBlockType
 from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.professional import Professional, ScheduleBlock, WorkingHours
 from nexasalon_api.models.service import ProfessionalService, Service
-from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate, AppointmentReplace
-from nexasalon_api.services import appointments
-from nexasalon_api.services import appointment_state_machine
+from nexasalon_api.schemas.appointment import (
+    AppointmentCreate,
+    AppointmentItemCreate,
+    AppointmentItemUpdate,
+    AppointmentReplace,
+)
+from nexasalon_api.services import appointment_state_machine, appointments, cash_register, orders
 from nexasalon_api.services.appointment_state_machine import next_status
 
 _ALL_AGENDA_PERMS = frozenset(
@@ -820,3 +835,305 @@ def test_auditoria_de_criacao_registrada(org_session):
         AuditLog.organization_id == org_id, AuditLog.entity_id == appt.id, AuditLog.action == "create"
     ).all()
     assert len(logs) == 1
+
+
+# ---------------------------------------------------------------------
+# PATCH /appointments/{id}/items/{item_id} — Etapa F, item "editar valor
+# e duração no agendamento" + "drag and drop" (services/appointments.py::
+# update_appointment_item). Edição EM PLACE de um item já existente
+# (nunca apaga+recria como o PUT), pra sobreviver a uma Comanda aberta
+# já linkada (FK RESTRICT em `OrderItem.appointment_item_id`).
+# ---------------------------------------------------------------------
+
+
+def test_editar_preco_do_item_sem_motivo_e_recusado(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    item = appt.items[0]
+
+    with pytest.raises(ValidationDomainError):
+        appointments.update_appointment_item(
+            session, actor, appt.id, item.id, AppointmentItemUpdate(price_override=Decimal("310.00")),
+        )
+
+
+def test_editar_preco_e_duracao_do_item_com_motivo_aplica_recalcula_ends_at_e_audita(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    item = appt.items[0]
+    assert item.price == Decimal("100.00")
+    assert item.duration_minutes == 60
+
+    updated = appointments.update_appointment_item(
+        session, actor, appt.id, item.id,
+        AppointmentItemUpdate(price_override=Decimal("310.00"), duration_override=90, reason="Serviço adicional"),
+    )
+    updated_item = updated.items[0]
+    assert updated_item.price == Decimal("310.00")
+    assert updated_item.duration_minutes == 90
+    # ends_at recalculado a partir da NOVA duração (trigger recalc_appointment_bounds).
+    assert updated_item.end_at == _dt(14, 0) + timedelta(minutes=90)
+    assert updated.ends_at == _dt(14, 0) + timedelta(minutes=90)
+
+    # Nunca escreve de volta no catálogo.
+    session.refresh(service)
+    assert service.default_price == 100
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == item.id, AuditLog.entity_type == "appointment_item",
+    ).all()
+    assert len(logs) == 1
+    change_types = logs[0].new_values["change_type"]
+    assert "manual_price_edit" in change_types
+    assert "manual_duration_edit" in change_types
+    assert logs[0].old_values["price"] == "100.00"
+    assert logs[0].new_values["reason"] == "Serviço adicional"
+
+
+def test_editar_apenas_duracao_sem_mudar_preco_nao_exige_motivo(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    item = appt.items[0]
+
+    updated = appointments.update_appointment_item(
+        session, actor, appt.id, item.id, AppointmentItemUpdate(duration_override=45),
+    )
+    assert updated.items[0].duration_minutes == 45
+    assert updated.items[0].price == Decimal("100.00")
+
+
+def test_mover_horario_recalcula_e_detecta_conflito_com_outro_agendamento(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(10, 0))],
+        ),
+    )
+    other_client = _client(session, org_id, "Outra Cliente")
+    other_appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=other_client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(15, 0))],
+        ),
+    )
+
+    # Move (drag-and-drop) o primeiro pra cima do horário do segundo -> conflito.
+    with pytest.raises(ConflictError):
+        appointments.update_appointment_item(
+            session, actor, appt.id, appt.items[0].id, AppointmentItemUpdate(start_at=_dt(15, 30)),
+        )
+
+    # Um horário livre funciona normalmente e recalcula end_at.
+    moved = appointments.update_appointment_item(
+        session, actor, appt.id, appt.items[0].id, AppointmentItemUpdate(start_at=_dt(11, 0)),
+    )
+    assert moved.items[0].start_at == _dt(11, 0)
+    assert moved.items[0].end_at == _dt(12, 0)
+    assert other_appt.id != appt.id  # sanity
+
+
+def test_mover_para_profissional_sem_permissao_de_edicao_e_bloqueado(org_session):
+    """Item explícito: "visualizar" != "editar" — ver a agenda da Ianka
+    não autoriza mover um atendimento PRA ELA."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    other_prof = _professional(session, org_id, branch.id, name="Ianka")
+    _link(session, other_prof.id, service.id)
+    _working_hours(session, org_id, other_prof.id, _OUR_THURSDAY, time(9, 0), time(18, 0))
+    actor_full = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor_full,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+
+    # Ator só ENXERGA os dois profissionais, mas só EDITA o primeiro.
+    base_restricted = _actor(
+        session, org_id,
+        permissions=frozenset({"agenda.view_own", "agenda.view_all", "agenda.edit"}),
+    )
+    restricted = dataclasses.replace(
+        base_restricted,
+        agenda_viewable_professional_ids=frozenset({prof.id, other_prof.id}),
+        agenda_editable_professional_ids=frozenset({prof.id}),
+    )
+
+    with pytest.raises(ForbiddenError):
+        appointments.update_appointment_item(
+            session, restricted, appt.id, appt.items[0].id,
+            AppointmentItemUpdate(professional_id=other_prof.id),
+        )
+
+
+def test_mover_para_profissional_que_nao_faz_o_servico_e_bloqueado(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    other_prof = _professional(session, org_id, branch.id, name="Sem o serviço")
+    _working_hours(session, org_id, other_prof.id, _OUR_THURSDAY, time(9, 0), time(18, 0))
+    # NUNCA vinculado ao serviço (sem `_link`).
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+
+    with pytest.raises(ValidationDomainError):
+        appointments.update_appointment_item(
+            session, actor, appt.id, appt.items[0].id, AppointmentItemUpdate(professional_id=other_prof.id),
+        )
+
+
+def test_faltou_libera_o_horario_para_um_novo_agendamento(org_session):
+    """Item "Faltou libera o horário" — `OCCUPYING_STATUSES` já exclui
+    NO_SHOW da checagem de conflito; este teste confirma isso na
+    ÍNTEGRA (criar -> marcar NO_SHOW -> criar outro no MESMO horário/
+    profissional não conflita)."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    first = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    appointments.update_status(session, actor, first.id, AppointmentStatus.NO_SHOW)
+
+    other_client = _client(session, org_id, "Segunda Cliente")
+    second = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=other_client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    assert second.items[0].start_at == _dt(14, 0)
+
+    # O agendamento faltoso continua existindo (histórico), só não ocupa mais.
+    session.refresh(first)
+    assert first.status == AppointmentStatus.NO_SHOW
+
+
+def test_faltou_permanece_no_historico_do_appointment(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    updated = appointments.update_status(session, actor, appt.id, AppointmentStatus.NO_SHOW)
+    assert updated.status == AppointmentStatus.NO_SHOW
+    # Nada foi apagado — segue recuperável por id, com os itens intactos.
+    reloaded = appointments.get_appointment(session, actor, appt.id)
+    assert reloaded.status == AppointmentStatus.NO_SHOW
+    assert len(reloaded.items) == 1
+
+
+def test_editar_item_com_comanda_aberta_sincroniza_order_item(org_session):
+    """Regra ÚNICA do pedido: Agenda e Comanda nunca divergem em
+    silêncio enquanto a comanda está ABERTA — editar o item da Agenda
+    reflete automaticamente na linha correspondente da Comanda."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id, permissions=_ALL_AGENDA_PERMS | frozenset({"orders.manage"}))
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    order = orders.create_order(session, actor, appt.id)
+    order_item = order.items[0]
+    assert order_item.price == Decimal("100.00")
+
+    appointments.update_appointment_item(
+        session, actor, appt.id, appt.items[0].id,
+        AppointmentItemUpdate(price_override=Decimal("150.00"), duration_override=75, reason="Ajuste"),
+    )
+
+    session.refresh(order_item)
+    assert order_item.price == Decimal("150.00")
+    assert order_item.duration_minutes == 75
+
+    sync_logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == order_item.id, AuditLog.entity_type == "order_item",
+    ).all()
+    assert any(log.new_values.get("change_type") == "synced_from_appointment_edit" for log in sync_logs)
+
+
+def test_editar_preco_com_comanda_fechada_e_bloqueado(org_session):
+    """Item explícito: comanda fechada/paga nunca sofre alteração
+    financeira silenciosa vinda da Agenda."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(
+        session, org_id,
+        permissions=_ALL_AGENDA_PERMS | frozenset({"orders.manage", "orders.view", "payments.register"}),
+    )
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    order = orders.create_order(session, actor, appt.id)
+    # Fecha a comanda direto no banco (sem depender do fluxo de Caixa,
+    # que não é o que este teste está verificando).
+    order.status = OrderStatus.CLOSED
+    order.closed_at = datetime.now(timezone.utc)
+    session.flush()
+
+    with pytest.raises(ValidationDomainError):
+        appointments.update_appointment_item(
+            session, actor, appt.id, appt.items[0].id,
+            AppointmentItemUpdate(price_override=Decimal("999.00"), reason="Tentativa pós-fechamento"),
+        )
+
+    # Duração/horário continuam livres (não são alteração financeira).
+    moved = appointments.update_appointment_item(
+        session, actor, appt.id, appt.items[0].id, AppointmentItemUpdate(duration_override=90),
+    )
+    assert moved.items[0].duration_minutes == 90

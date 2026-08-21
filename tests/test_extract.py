@@ -107,7 +107,10 @@ def _dt(hour, minute=0):
 
 
 def _finished_appointment_with_two_services(session, org_id, actor, client_name="Cliente"):
+    # Etapa H ("exigir caixa aberto para criar Comanda", padrão ON) —
+    # ver docstring equivalente em `test_orders.py`.
     branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
     prof = _professional(session, org_id, branch.id)
     corte = _service(session, org_id, name="Manutenção", duration=60, price=Decimal("300.00"))
     mechas = _service(session, org_id, name="Mechas", duration=90, price=Decimal("500.00"))

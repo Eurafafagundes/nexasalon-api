@@ -47,7 +47,11 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.actor import ActorContext
-from nexasalon_api.core.exceptions import ConflictError, NotFoundError, ValidationDomainError
+from nexasalon_api.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    ValidationDomainError,
+)
 from nexasalon_api.models.enums import AuditAction, OrderStatus
 from nexasalon_api.models.order import Order
 from nexasalon_api.repositories import (
@@ -65,6 +69,8 @@ from nexasalon_api.repositories import (
     user_repo,
 )
 from nexasalon_api.schemas.order import (
+    ConsolidatedOrderClose,
+    OrderCancel,
     OrderClose,
     OrderItemUpdate,
     OrderProductItemCreate,
@@ -72,6 +78,7 @@ from nexasalon_api.schemas.order import (
     OrderReceiptRead,
 )
 from nexasalon_api.services import appointments as appointments_service
+from nexasalon_api.services import availability
 from nexasalon_api.services import cash_register as cash_register_service
 from nexasalon_api.services import stock as stock_service
 
@@ -106,6 +113,12 @@ def create_order(session: Session, actor: ActorContext, appointment_id: uuid.UUI
         raise ConflictError("Este agendamento já tem uma comanda.")
     if not appointment.items:
         raise ValidationDomainError("Agendamento sem nenhum serviço — não é possível abrir comanda.")
+
+    # Etapa H (`Financeiro > Caixa > Configurações do Caixa`) — "exigir
+    # caixa aberto para criar Comanda" (padrão ON) e "bloquear
+    # operações se existir caixa aberto de dia anterior" (padrão ON),
+    # ambos aplicados no backend, nunca só desabilitando botão.
+    cash_register_service.assert_operational_prerequisites(session, actor, appointment.branch_id, purpose="order")
 
     order = order_repo.create(
         session,
@@ -178,6 +191,45 @@ def get_order_by_appointment(session: Session, actor: ActorContext, appointment_
     return order_repo.get_by_appointment(session, actor.organization_id, appointment_id)
 
 
+def get_related_orders(session: Session, actor: ActorContext, order: Order) -> list[Order]:
+    """Outras comandas NÃO canceladas da MESMA cliente no MESMO dia
+    operacional do agendamento desta comanda (fuso da unidade de cada
+    comanda) — item "Comandas relacionadas" (Etapa I). Exemplo do
+    pedido: Amanda -> Manutenção com Duda; Amanda -> Progressiva com
+    Ianka, mesmo dia, profissionais diferentes — as duas comandas
+    aparecem relacionadas uma da outra. Nunca inclui a própria `order`."""
+    organization_id = actor.organization_id
+    appointment = appointment_repo.get(session, organization_id, order.appointment_id)
+    if appointment is None or appointment.starts_at is None:
+        return []
+    tz = availability.effective_timezone(session, organization_id, order.branch_id)
+    target_day = appointment.starts_at.astimezone(tz).date()
+
+    candidates = order_repo.list_active_for_client(session, organization_id, order.client_id)
+    related: list[Order] = []
+    for candidate in candidates:
+        if candidate.id == order.id:
+            continue
+        c_appointment = appointment_repo.get(session, organization_id, candidate.appointment_id)
+        if c_appointment is None or c_appointment.starts_at is None:
+            continue
+        c_tz = availability.effective_timezone(session, organization_id, candidate.branch_id)
+        if c_appointment.starts_at.astimezone(c_tz).date() == target_day:
+            related.append(candidate)
+    return related
+
+
+def get_order_related(session: Session, actor: ActorContext, order_id: uuid.UUID) -> tuple[Order, list[Order], str]:
+    """Monta `GET /orders/{id}/related` — devolve a comanda, as
+    relacionadas e o nome da cliente (pra montar o texto discreto "Esta
+    cliente possui N comandas hoje" no frontend)."""
+    order = _get_order_or_404(session, actor.organization_id, order_id)
+    related = get_related_orders(session, actor, order)
+    client = client_repo.get(session, actor.organization_id, order.client_id)
+    client_name = client.name if client is not None else "Cliente"
+    return order, related, client_name
+
+
 def get_order_receipt(session: Session, actor: ActorContext, order_id: uuid.UUID) -> OrderReceiptRead:
     """Comprovante de Atendimento (Etapa D) — ver docstring de
     `schemas/order.py::OrderReceiptRead` pro raciocínio completo
@@ -248,6 +300,52 @@ def update_order_item(
 # Nome anterior, mantido como alias — nenhuma rota nem teste externo
 # precisa saber que foi renomeado.
 update_item_price = update_order_item
+
+
+def cancel_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data: OrderCancel) -> Order:
+    """Cancela uma comanda `OPEN` criada por engano (Etapa F, item
+    "Cancelar/Excluir Comanda") — NUNCA apaga a linha; ela sai das
+    operações abertas (`get_by_appointment` passa a ignorá-la) mas
+    continua em `GET /orders`/histórico pra sempre.
+
+    Mesmo lock de `close_order` (`get_for_update`, `SELECT ... FOR
+    UPDATE`) ANTES de checar o status — mesma proteção de retry: uma
+    segunda tentativa de cancelamento (ou um cancelamento correndo
+    junto com um fechamento) sempre enxerga o estado JÁ decidido pela
+    primeira, nunca cancela duas vezes nem cancela uma comanda que
+    acabou de ser fechada por outra requisição.
+
+    Só aceita `status == OPEN` — e só `OPEN` estrutural, sem
+    `Payment`/baixa de estoque, existe nesta versão (as duas coisas só
+    nascem dentro de `close_order`, na mesma transação que vira o
+    status pra `closed`), então a checagem de status sozinha já garante
+    "sem pagamento, sem baixa definitiva, sem fechamento" (item
+    explícito do pedido). Nunca aceita cancelar uma comanda já
+    `closed`/`cancelled` — pedido explícito: exigir o fluxo financeiro
+    de estorno/reversão nesses casos (não implementado nesta versão),
+    nunca "desfazer" silenciosamente."""
+    organization_id = actor.organization_id
+    order = _get_order_for_update_or_404(session, organization_id, order_id)
+    if order.status != OrderStatus.OPEN:
+        raise ConflictError(
+            "Só é possível cancelar uma comanda aberta e sem pagamento/fechamento — "
+            "esta já foi fechada ou cancelada."
+        )
+
+    order.status = OrderStatus.CANCELLED
+    session.flush()
+
+    audit_log_repo.create(
+        session,
+        organization_id=organization_id,
+        user_id=actor.user_id,
+        entity_type="order",
+        entity_id=order.id,
+        action=AuditAction.UPDATE,
+        old_values={"status": "open"},
+        new_values={"status": "cancelled", "change_type": "cancel", "reason": data.reason},
+    )
+    return _reload(session, organization_id, order_id)
 
 
 def add_product_item(
@@ -409,6 +507,16 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
     if order.status != OrderStatus.OPEN:
         raise ConflictError("Esta comanda já está fechada.")
 
+    # Etapa H — "exigir caixa aberto para receber pagamento" (padrão
+    # ON; hoje já é sempre verdade na prática, pois todo `Payment`
+    # exige um `cash_register_id` de caixa aberto — ver validação logo
+    # abaixo) e "bloquear operações se existir caixa aberto de dia
+    # anterior" (padrão ON — este SIM é um comportamento novo: mesmo
+    # apontando pra um caixa aberto hoje, o fechamento é recusado
+    # enquanto existir um caixa de dia anterior ainda aberto na mesma
+    # unidade).
+    cash_register_service.assert_operational_prerequisites(session, actor, order.branch_id, purpose="payment")
+
     services_total = sum((item.price for item in order.items), Decimal("0"))
     products_total = sum((item.quantity * item.unit_price for item in order.product_items), Decimal("0"))
     total = services_total + products_total
@@ -505,3 +613,172 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
         },
     )
     return _reload(session, organization_id, order_id)
+
+
+def close_orders_consolidated(
+    session: Session, actor: ActorContext, primary_order_id: uuid.UUID, data: ConsolidatedOrderClose
+) -> list[Order]:
+    """Fecha VÁRIAS comandas relacionadas (mesma cliente, mesmo dia) de
+    uma vez só — item "Fechamento consolidado" (Etapa I). Tudo dentro
+    da MESMA transação da request (`api/deps.py::get_db` só commita no
+    final; qualquer exceção reverte tudo — nenhuma comanda fecha
+    "pela metade").
+
+    Retry-safety: TODAS as comandas envolvidas são travadas
+    (`order_repo.get_for_update`) em ordem DETERMINÍSTICA (por `id`,
+    nunca a ordem recebida no payload) ANTES de checar qualquer status
+    — evita deadlock entre duas requisições concorrentes disputando o
+    mesmo conjunto de comandas em ordens diferentes, e garante que um
+    retry sempre enxerga o estado já commitado (nenhuma comanda fecha
+    duas vezes, nenhum pagamento/baixa duplicado — mesmo raciocínio de
+    `close_order`, só que pra N comandas de uma vez).
+
+    Split de pagamento: `data.payments` é tratada como uma FILA — cada
+    comanda (na ordem de `order_number`, a mais legível pro usuário)
+    consome da fila até cobrir o PRÓPRIO total; um lançamento que não
+    fecha exato numa fronteira de comanda é DIVIDIDO em duas linhas de
+    `Payment` (mesmo método/caixa/bandeira, valor reduzido em cada) — a
+    soma por método continua batendo com o que a cliente de fato pagou.
+    Sobra da fila (pagou a mais) vira `Payment` extra na ÚLTIMA comanda
+    processada — mesmo comportamento de troco que `close_order` já
+    permite pra uma comanda só."""
+    organization_id = actor.organization_id
+
+    order_ids: list[uuid.UUID] = list(dict.fromkeys(data.order_ids))
+    if primary_order_id not in order_ids:
+        order_ids.append(primary_order_id)
+    if len(order_ids) < 2:
+        raise ValidationDomainError("Fechamento consolidado exige pelo menos 2 comandas.")
+
+    # Lock em ordem determinística (por id) — nunca a ordem do payload,
+    # pra duas requisições concorrentes com o mesmo conjunto nunca
+    # travarem uma na outra em sentidos opostos.
+    locked_by_id: dict[uuid.UUID, Order] = {}
+    for oid in sorted(order_ids):
+        locked_by_id[oid] = _get_order_for_update_or_404(session, organization_id, oid)
+    orders = [locked_by_id[oid] for oid in order_ids]
+
+    if len({o.client_id for o in orders}) > 1:
+        raise ValidationDomainError("Fechamento consolidado exige comandas da mesma cliente.")
+
+    for order in orders:
+        if order.status != OrderStatus.OPEN:
+            raise ConflictError(f"A comanda #{order.order_number} já está fechada ou cancelada.")
+
+    # Etapa H — mesma trava de `close_order`, uma vez por UNIDADE
+    # distinta entre as comandas envolvidas (o caso comum é todas na
+    # mesma unidade, mas o código não assume isso).
+    for branch_id in {o.branch_id for o in orders}:
+        cash_register_service.assert_operational_prerequisites(session, actor, branch_id, purpose="payment")
+
+    orders_by_number = sorted(orders, key=lambda o: o.order_number)
+
+    totals: dict[uuid.UUID, Decimal] = {}
+    for order in orders_by_number:
+        services_total = sum((item.price for item in order.items), Decimal("0"))
+        products_total = sum((item.quantity * item.unit_price for item in order.product_items), Decimal("0"))
+        totals[order.id] = services_total + products_total
+    grand_total = sum(totals.values(), Decimal("0"))
+
+    paid_total = sum((p.amount for p in data.payments), Decimal("0"))
+    if paid_total < grand_total:
+        raise ValidationDomainError(
+            f"Valor pago (R$ {paid_total}) é menor que o total consolidado (R$ {grand_total})."
+        )
+
+    for payment_in in data.payments:
+        cash_register_service.assert_register_open_and_in_org(session, organization_id, payment_in.cash_register_id)
+
+    # Baixa de estoque de CADA comanda — antes de qualquer Payment,
+    # mesmo raciocínio "falha rápido" de `close_order`: estoque
+    # insuficiente em QUALQUER comanda do lote aborta o lote inteiro
+    # (nenhuma fecha, nenhum pagamento é criado).
+    for order in orders_by_number:
+        for product_item in order.product_items:
+            if product_item.stock_movement_id is not None:
+                continue
+            product = product_repo.get(session, organization_id, product_item.product_id)
+            try:
+                movement = stock_service.record_sale_movement(
+                    session, actor, product_id=product_item.product_id, branch_id=order.branch_id,
+                    quantity=product_item.quantity, order_id=order.id,
+                    unit_cost=product.cost_price if product is not None else None,
+                )
+            except ValidationDomainError as exc:
+                raise ValidationDomainError(
+                    f"Estoque insuficiente para '{product_item.product_name}' "
+                    f"(comanda #{order.order_number}): {exc.message}"
+                ) from exc
+            product_item.stock_movement_id = movement.id
+    session.flush()
+
+    actor_user = user_repo.get(session, actor.user_id)
+    actor_name = actor_user.name if actor_user is not None else None
+
+    # Fila de pagamento — `amount` mutável (por isso um dict, não o
+    # próprio schema imutável) pra "descontar" conforme cada comanda
+    # consome parte de um lançamento.
+    queue: list[dict] = [
+        {
+            "method": p.method, "amount": p.amount, "cash_register_id": p.cash_register_id,
+            "card_brand": p.card_brand, "installments": p.installments,
+        }
+        for p in data.payments
+    ]
+
+    def _create_payment(order: Order, entry: dict, amount: Decimal) -> None:
+        payment_repo.create(
+            session, organization_id, order_id=order.id, cash_register_id=entry["cash_register_id"],
+            method=entry["method"], card_brand=entry["card_brand"], installments=entry["installments"],
+            amount=amount, created_by=actor.user_id, created_by_name=actor_name,
+        )
+
+    for order in orders_by_number:
+        remaining = totals[order.id]
+        while remaining > 0:
+            if not queue:
+                # Não deveria ser alcançável — já validamos
+                # `paid_total >= grand_total` acima. Defesa em
+                # profundidade: nunca fecha parcialmente se acontecer.
+                raise ValidationDomainError(
+                    "Falha ao distribuir pagamento entre as comandas — soma insuficiente."
+                )
+            entry = queue[0]
+            take = min(entry["amount"], remaining)
+            _create_payment(order, entry, take)
+            entry["amount"] -= take
+            remaining -= take
+            if entry["amount"] <= 0:
+                queue.pop(0)
+
+    # Troco/sobra (pagou a mais que o total consolidado) — vira Payment
+    # extra na ÚLTIMA comanda, mesmo comportamento que `close_order` já
+    # permite pra uma comanda só.
+    if queue:
+        last_order = orders_by_number[-1]
+        for entry in queue:
+            if entry["amount"] > 0:
+                _create_payment(last_order, entry, entry["amount"])
+
+    now = datetime.now(timezone.utc)
+    for order in orders_by_number:
+        appointments_service.mark_paid(session, actor, order.appointment_id)
+        order.status = OrderStatus.CLOSED
+        order.closed_at = now
+        order.closed_by = actor.user_id
+    session.flush()
+
+    sibling_numbers = [o.order_number for o in orders_by_number]
+    for order in orders_by_number:
+        audit_log_repo.create(
+            session, organization_id=organization_id, user_id=actor.user_id, entity_type="order",
+            entity_id=order.id, action=AuditAction.UPDATE,
+            old_values={"status": "open"},
+            new_values={
+                "status": "closed", "change_type": "consolidated_close",
+                "order_total": str(totals[order.id]), "grand_total": str(grand_total),
+                "related_order_numbers": sibling_numbers,
+            },
+        )
+
+    return [_reload(session, organization_id, o.id) for o in orders_by_number]

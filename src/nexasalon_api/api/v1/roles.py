@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from nexasalon_api.api.deps import get_db, require_permission
 from nexasalon_api.core.actor import ActorContext
+from nexasalon_api.repositories import rbac_repo
 from nexasalon_api.schemas.rbac import PermissionRead, RoleRead
 from nexasalon_api.services import user_management as user_management_service
 
@@ -27,7 +28,14 @@ def list_roles(
 ) -> list[RoleRead]:
     roles = user_management_service.list_roles(session, actor.organization_id)
     return [
-        RoleRead(id=r.id, name=r.name, description=r.description, is_system=r.is_system) for r in roles
+        RoleRead(
+            id=r.id,
+            name=r.name,
+            description=r.description,
+            is_system=r.is_system,
+            permissions=sorted(rbac_repo.list_role_permission_keys(session, r.id)),
+        )
+        for r in roles
     ]
 
 

@@ -26,6 +26,7 @@ from nexasalon_api.schemas.user_management import (
     MembershipRead,
     ResendInviteResponse,
     ResetPasswordLinkResponse,
+    SetPasswordRequest,
 )
 from nexasalon_api.services import agenda_access as agenda_access_service
 from nexasalon_api.services import user_management as user_management_service
@@ -82,10 +83,13 @@ def add_employee(
         name=payload.name,
         role_id=payload.role_id,
         branch_id=payload.branch_id,
+        password=payload.password,
+        actor_user_id=actor.user_id,
     )
     return EmployeeInviteResponse(
         membership=_to_membership_read(session, result.membership),
         invite_token=result.invite_token,
+        credential_mode=result.credential_mode,
     )
 
 
@@ -175,6 +179,23 @@ def reset_password(
 ) -> ResetPasswordLinkResponse:
     reset_token = user_management_service.admin_reset_password(session, actor.organization_id, membership_id)
     return ResetPasswordLinkResponse(reset_token=reset_token)
+
+
+@router.patch(
+    "/{membership_id}/set-password",
+    response_model=MembershipRead,
+    summary="Definir a senha do funcionário diretamente (Etapa G — caminho principal, substitui o link)",
+)
+def set_password(
+    membership_id: uuid.UUID,
+    payload: SetPasswordRequest,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_require_users_manage),
+) -> MembershipRead:
+    membership = user_management_service.admin_set_password(
+        session, actor.organization_id, membership_id, actor.user_id, payload.password
+    )
+    return _to_membership_read(session, membership)
 
 
 @router.get(

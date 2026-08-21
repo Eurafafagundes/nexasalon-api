@@ -36,7 +36,7 @@ from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.rbac import Role, RolePermission
 from nexasalon_api.models.service import ProfessionalService, Service
-from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate
+from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate, AppointmentItemUpdate
 from nexasalon_api.services import agenda, agenda_access, appointments
 
 _OUR_THURSDAY = 4
@@ -256,6 +256,60 @@ def test_create_appointment_recusa_profissional_fora_do_escopo_de_edicao(org_ses
                 items=[AppointmentItemCreate(professional_id=prof_a.id, service_id=service.id, start_at=_dt(10))],
             ),
         )
+
+
+def test_drag_and_drop_recusa_profissional_de_origem_fora_do_escopo_de_edicao(org_session):
+    """`update_appointment_item` (drawer de preço/duração + drag-and-drop,
+    Etapa F) precisa reusar a MESMA checagem granular já provada acima
+    pra `update_status`/`cancel_appointment`/`create_appointment` — item
+    explícito do pedido "respeitar view/edit por agenda no drag-and-drop".
+    Aqui o item já pertence a um profissional FORA do escopo de edição
+    (mesmo visível) -> 403 só de tentar editar preço/duração, sem nem
+    chegar a mover de profissional."""
+    session, org_id = org_session
+    branch, prof_a, prof_b, service, client = _setup_two_professionals(session, org_id)
+    owner = _actor(session, org_id, permissions={"agenda.create", "agenda.view_all", "agenda.edit"})
+    appt = _create_appointment(session, org_id, owner, branch, prof_a, service, client, 10)
+    item = appt.items[0]
+
+    view_only = _actor(
+        session, org_id, permissions={"agenda.view_all", "agenda.edit"},
+        viewable=frozenset({prof_a.id}), editable=frozenset(),
+    )
+    with pytest.raises(ForbiddenError):
+        appointments.update_appointment_item(
+            session, view_only, appt.id, item.id,
+            AppointmentItemUpdate(duration_override=90),
+        )
+
+
+def test_drag_and_drop_recusa_mover_para_profissional_fora_do_escopo_de_edicao(org_session):
+    """Caso simétrico: o item começa num profissional EDITÁVEL (prof_a),
+    mas o destino do arraste (prof_b) está fora do escopo de edição do
+    ator -> 403. Prova que `_assert_can_edit` checa AMBOS os
+    profissionais (origem e destino), não só o de origem."""
+    session, org_id = org_session
+    branch, prof_a, prof_b, service, client = _setup_two_professionals(session, org_id)
+    owner = _actor(session, org_id, permissions={"agenda.create", "agenda.view_all", "agenda.edit"})
+    appt = _create_appointment(session, org_id, owner, branch, prof_a, service, client, 10)
+    item = appt.items[0]
+
+    can_edit_only_a = _actor(
+        session, org_id, permissions={"agenda.view_all", "agenda.edit"},
+        viewable=frozenset({prof_a.id, prof_b.id}), editable=frozenset({prof_a.id}),
+    )
+    with pytest.raises(ForbiddenError):
+        appointments.update_appointment_item(
+            session, can_edit_only_a, appt.id, item.id,
+            AppointmentItemUpdate(professional_id=prof_b.id),
+        )
+
+    # mas mover para dentro do escopo de edição (continuar com prof_a) funciona:
+    updated = appointments.update_appointment_item(
+        session, can_edit_only_a, appt.id, item.id,
+        AppointmentItemUpdate(start_at=_dt(11)),
+    )
+    assert updated.items[0].start_at == _dt(11)
 
 
 # ---------------------------------------------------------------------

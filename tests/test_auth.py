@@ -507,6 +507,11 @@ def test_permissions_efetivas_por_role(client, scenario):
         "orders.view", "orders.manage", "orders.edit_price", "payments.register",
         # Estoque (migration 0020) — OWNER recebe as 3.
         "inventory.view", "inventory.view_cost", "inventory.manage",
+        # Cancelar Comanda (migration 0025, Etapa F).
+        "orders.cancel",
+        # Dashboard (migration 0026, Etapa G) — módulo próprio, antes
+        # emprestava reports.view.
+        "dashboard.view",
     }
 
     recep_body = _login(client, scenario.recep_email, scenario.password)
@@ -519,14 +524,21 @@ def test_permissions_efetivas_por_role(client, scenario):
         # fica só com OWNER/ADMIN, ver docstring da migration 0013).
         "orders.view", "orders.manage", "payments.register",
         # Caixa Diário (migration 0014) — RECEPTIONIST ganha finance.view
-        # pra poder selecionar um caixa aberto ao registrar pagamento;
-        # finance.manage (abrir/fechar caixa, sangria, suprimento)
-        # continua só com OWNER/ADMIN.
-        "finance.view",
+        # pra poder selecionar um caixa aberto ao registrar pagamento.
+        # Etapa H (migration 0027, `Financeiro > Caixa > Configurações
+        # do Caixa`) muda a regra que vinha da 0014 ("finance.manage só
+        # com OWNER/ADMIN"): o pedido explícito agora é "permitir
+        # Recepção abrir/fechar caixa" — com um toggle próprio
+        # (`allow_receptionist_open_close`, padrão ON) pra quem quiser
+        # restringir de novo sem mexer em RBAC.
+        "finance.view", "finance.manage",
         # Estoque (migration 0020) — RECEPTIONIST só vê (precisa saber o
         # que tem em estoque pra vender/avisar o cliente), nunca gerencia
         # nem vê custo (ver docstring da migration 0020).
         "inventory.view",
+        # Cancelar Comanda (migration 0025, Etapa F) — mesmo conjunto de
+        # orders.manage (quem pode abrir por engano pode desfazer).
+        "orders.cancel",
     }
 
     prof_body = _login(client, scenario.prof_email, scenario.password)
@@ -985,6 +997,167 @@ def test_receptionist_nao_pode_gerar_reset_password_de_outra_membership(client, 
 
 
 # ---------------------------------------------------------------------
+# Etapa G — admin define a senha DIRETAMENTE (`PATCH .../set-password`),
+# caminho principal que substitui o link/token acima na UX. Senha nunca
+# é retornada/logada em nenhuma resposta (só o hash é persistido).
+# ---------------------------------------------------------------------
+
+
+def test_admin_define_senha_diretamente_e_a_antiga_para_de_funcionar(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    headers = _auth_headers(owner_body["tokens"]["access_token"])
+
+    resp = client.patch(
+        f"/api/v1/users/{scenario.recep_membership_id}/set-password",
+        json={"password": "SenhaNovaDefinidaPeloAdmin1!"},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "active"
+    # nunca vaza senha/hash na resposta:
+    assert "password" not in body and "password_hash" not in body
+
+    # a senha ANTIGA já não funciona mais...
+    old_login = client.post(
+        "/api/v1/auth/login", json={"email": scenario.recep_email, "password": scenario.password}
+    )
+    assert old_login.status_code == 401
+
+    # ...só a nova, definida pelo admin:
+    new_login = client.post(
+        "/api/v1/auth/login",
+        json={"email": scenario.recep_email, "password": "SenhaNovaDefinidaPeloAdmin1!"},
+    )
+    assert new_login.status_code == 200
+
+
+def test_admin_define_senha_de_membership_convidada_ativa_direto_sem_token(client, scenario):
+    """Definir a senha de uma membership ainda INVITED dispensa por
+    completo o convite/token — mesmo resultado final de
+    `accept_invite`, só que iniciado pelo admin."""
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    headers = _auth_headers(owner_body["tokens"]["access_token"])
+
+    invite_resp = client.post(
+        "/api/v1/users",
+        json={"email": "novo.funcionario@example.com", "name": "Novo Funcionário", "role_id": str(scenario.recep_role)},
+        headers=headers,
+    )
+    assert invite_resp.status_code == 201, invite_resp.text
+    assert invite_resp.json()["credential_mode"] == "invite_link"
+    membership_id = invite_resp.json()["membership"]["id"]
+    assert invite_resp.json()["membership"]["status"] == "invited"
+
+    set_resp = client.patch(
+        f"/api/v1/users/{membership_id}/set-password",
+        json={"password": "SenhaDefinidaPeloAdmin1!"},
+        headers=headers,
+    )
+    assert set_resp.status_code == 200, set_resp.text
+    assert set_resp.json()["status"] == "active"
+
+    login_resp = client.post(
+        "/api/v1/auth/login",
+        json={"email": "novo.funcionario@example.com", "password": "SenhaDefinidaPeloAdmin1!"},
+    )
+    assert login_resp.status_code == 200
+
+
+def test_receptionist_nao_pode_definir_senha_sem_permission(client, scenario):
+    recep_body = _login(client, scenario.recep_email, scenario.password)
+    resp = client.patch(
+        f"/api/v1/users/{scenario.single_membership_id}/set-password",
+        json={"password": "QualquerSenha123!"},
+        headers=_auth_headers(recep_body["tokens"]["access_token"]),
+    )
+    assert resp.status_code == 403
+
+
+def test_set_password_exige_minimo_8_caracteres(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    resp = client.patch(
+        f"/api/v1/users/{scenario.recep_membership_id}/set-password",
+        json={"password": "curta"},
+        headers=_auth_headers(owner_body["tokens"]["access_token"]),
+    )
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------
+# Etapa G — criar acesso já com senha inicial definida pelo admin
+# (`POST /users` com `password`) — caminho principal, substitui o
+# convite por link/token na UX.
+# ---------------------------------------------------------------------
+
+
+def test_criar_acesso_com_senha_inicial_ativa_direto_sem_token(client, scenario):
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    resp = client.post(
+        "/api/v1/users",
+        json={
+            "email": "com.senha@example.com", "name": "Com Senha",
+            "role_id": str(scenario.recep_role), "password": "SenhaInicial123!",
+        },
+        headers=_auth_headers(owner_body["tokens"]["access_token"]),
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["credential_mode"] == "password_set"
+    assert body["invite_token"] is None
+    assert body["membership"]["status"] == "active"
+    assert "password" not in body["membership"] and "password_hash" not in body["membership"]
+
+    login_resp = client.post(
+        "/api/v1/auth/login", json={"email": "com.senha@example.com", "password": "SenhaInicial123!"}
+    )
+    assert login_resp.status_code == 200
+
+
+def test_criar_acesso_com_senha_para_email_ja_existente_ignora_a_senha_informada(client, scenario):
+    """O e-mail já pertence a um usuário com senha própria (de OUTRA
+    organização) — a membership nesta organização nova entra ACTIVE
+    reaproveitando a credencial existente; a `password` desta chamada é
+    ignorada de propósito (nunca sobrescreve silenciosamente a senha de
+    login de outra organização). `scenario.multi_org_email` já tem
+    membership nas duas orgs do fixture — precisa de uma ORG C nova pra
+    isolar o caso sem esbarrar no `ConflictError` de membership duplicada."""
+    session = SessionLocal()
+    org_c_owner = _new_user(session, "SenhaDoOwnerC123!")
+    org_c = _new_org(session, "C")
+    owner_role_c = _role_id(session, "OWNER")
+    recep_role_c = _role_id(session, "RECEPTIONIST")
+    _new_membership(session, org_c_owner, org_c, owner_role_c)
+    org_c_owner_email = org_c_owner.email
+    session.commit()
+    session.close()
+
+    owner_body = _login(client, org_c_owner_email, "SenhaDoOwnerC123!")
+    resp = client.post(
+        "/api/v1/users",
+        json={
+            "email": scenario.multi_org_email, "name": "Já existe",
+            "role_id": str(recep_role_c), "password": "SenhaIgnorada123!",
+        },
+        headers=_auth_headers(owner_body["tokens"]["access_token"]),
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["credential_mode"] == "existing_account_linked"
+    assert resp.json()["invite_token"] is None
+
+    # a senha "informada" nunca foi aplicada — só a original continua válida:
+    ignored_login = client.post(
+        "/api/v1/auth/login", json={"email": scenario.multi_org_email, "password": "SenhaIgnorada123!"}
+    )
+    assert ignored_login.status_code == 401
+
+    original_login = client.post(
+        "/api/v1/auth/login", json={"email": scenario.multi_org_email, "password": scenario.password}
+    )
+    assert original_login.status_code == 200
+
+
+# ---------------------------------------------------------------------
 # Catálogo de roles/permissions + overrides por membership (perfil
 # "Personalizado") — Etapa A.
 # ---------------------------------------------------------------------
@@ -997,6 +1170,22 @@ def test_list_roles_retorna_os_4_roles_de_sistema(client, scenario):
     names = {r["name"] for r in resp.json()}
     assert {"OWNER", "ADMIN", "RECEPTIONIST", "PROFESSIONAL"} <= names
     assert all(r["is_system"] for r in resp.json() if r["name"] in {"OWNER", "ADMIN", "RECEPTIONIST", "PROFESSIONAL"})
+
+
+def test_list_roles_inclui_as_permissions_de_cada_role(client, scenario):
+    """Etapa G — o Gerenciador de Acessos precisa saber o que cada perfil
+    concede POR PADRÃO pra mostrar "herdado do perfil" vs override
+    (`PermissoesTab` no frontend). Sem isso a UI não tinha como distinguir
+    as duas coisas."""
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    resp = client.get("/api/v1/roles", headers=_auth_headers(owner_body["tokens"]["access_token"]))
+    by_name = {r["name"]: r for r in resp.json()}
+
+    assert "agenda.edit" in by_name["PROFESSIONAL"]["permissions"]
+    assert "organization.manage" not in by_name["PROFESSIONAL"]["permissions"]
+    assert "organization.manage" in by_name["OWNER"]["permissions"]
+    assert "dashboard.view" in by_name["OWNER"]["permissions"]
+    assert "dashboard.view" not in by_name["RECEPTIONIST"]["permissions"]
 
 
 def test_list_permissions_retorna_catalogo_com_modulo(client, scenario):

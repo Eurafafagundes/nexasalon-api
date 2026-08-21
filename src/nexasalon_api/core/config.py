@@ -130,6 +130,17 @@ class Settings(BaseSettings):
     rate_limit_refresh_window_seconds: int = 300
     rate_limit_select_organization_max_attempts: int = 20
     rate_limit_select_organization_window_seconds: int = 300
+    # Agendamento Online público (Etapa K) — SEM autenticação nenhuma,
+    # então rate limit é a única proteção contra abuso automatizado.
+    # `_max_attempts`/`_window_seconds` (sem sufixo `_create`) cobre a
+    # NAVEGAÇÃO (GET organização/serviços/profissionais/disponibilidade,
+    # aplicado uma vez por request em `get_public_context`) — mais
+    # permissivo, é leitura. `_create_*` cobre só o POST de confirmação
+    # — bem mais apertado, é o único endpoint que escreve dado.
+    rate_limit_public_booking_max_attempts: int = 60
+    rate_limit_public_booking_window_seconds: int = 60
+    rate_limit_public_booking_create_max_attempts: int = 5
+    rate_limit_public_booking_create_window_seconds: int = 300
 
     # --- Storage de arquivos (Etapa D — logo do estabelecimento) ---
     # Nenhuma infraestrutura de storage existia no projeto antes desta

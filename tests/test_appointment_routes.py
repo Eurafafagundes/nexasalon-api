@@ -256,3 +256,75 @@ def test_force_overlap_sem_permissao_sem_conflito_tambem_e_403(client_as, org_a_
         },
     )
     assert resp.status_code == 403, resp.text
+
+
+def test_editar_preco_do_item_via_http(client_as, org_a_actor):
+    """Etapa F, item 1 — `PATCH /appointments/{id}/items/{item_id}` pela
+    API real: exige `reason` pra alteração de preço, recalcula o total
+    exibido no item e audita (a auditoria em si já é coberta em
+    `test_appointments.py`, aqui só confere que a rota real aplica)."""
+    c = client_as(org_a_actor)
+    branch, professional, service, client = _setup_agenda(c)
+    appt = c.post(
+        "/api/v1/appointments",
+        json={
+            "branch_id": branch["id"], "client_id": client["id"],
+            "items": [{"professional_id": professional["id"], "service_id": service["id"], "start_at": _START}],
+        },
+    ).json()
+    item_id = appt["items"][0]["id"]
+
+    # Sem `reason`, altera preço é recusado.
+    resp = c.patch(
+        f"/api/v1/appointments/{appt['id']}/items/{item_id}", json={"price_override": "80.00"}
+    )
+    assert resp.status_code == 422, resp.text
+
+    resp = c.patch(
+        f"/api/v1/appointments/{appt['id']}/items/{item_id}",
+        json={"price_override": "80.00", "reason": "desconto combinado com a cliente"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"][0]["price"] == "80.00"
+
+
+def test_mover_horario_do_item_via_http_drag_and_drop(client_as, org_a_actor):
+    """Etapa F, item 2 — mesma rota PATCH cobre o "arrastar" (mudar
+    `start_at`/`professional_id`), sem precisar de `reason`."""
+    c = client_as(org_a_actor)
+    branch, professional, service, client = _setup_agenda(c)
+    appt = c.post(
+        "/api/v1/appointments",
+        json={
+            "branch_id": branch["id"], "client_id": client["id"],
+            "items": [{"professional_id": professional["id"], "service_id": service["id"], "start_at": _START}],
+        },
+    ).json()
+    item_id = appt["items"][0]["id"]
+
+    resp = c.patch(
+        f"/api/v1/appointments/{appt['id']}/items/{item_id}",
+        json={"start_at": "2026-08-13T16:00:00-03:00"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"][0]["start_at"].startswith("2026-08-13T19:00:00")
+
+
+def test_permissao_agenda_edit_e_exigida_para_editar_item(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    branch, professional, service, client = _setup_agenda(c)
+    appt = c.post(
+        "/api/v1/appointments",
+        json={
+            "branch_id": branch["id"], "client_id": client["id"],
+            "items": [{"professional_id": professional["id"], "service_id": service["id"], "start_at": _START}],
+        },
+    ).json()
+    item_id = appt["items"][0]["id"]
+
+    restricted = _restricted_actor(org_a_actor, permissions={"agenda.view_all"})
+    resp = client_as(restricted).patch(
+        f"/api/v1/appointments/{appt['id']}/items/{item_id}",
+        json={"start_at": "2026-08-13T16:00:00-03:00"},
+    )
+    assert resp.status_code == 403

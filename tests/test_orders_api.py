@@ -67,6 +67,16 @@ def _setup_finished_appointment(c):
     return appt
 
 
+def _open_register_for(c, branch_id, *, initial_amount="0"):
+    """Etapa H ('exigir caixa aberto para criar Comanda', padrão ON) —
+    `POST /orders` passa a exigir um caixa aberto NESTA unidade; a
+    maioria dos testes deste arquivo não testa o Caixa em si, só
+    precisa de um caixa válido pra `POST /orders` não ser recusado."""
+    resp = c.post("/api/v1/cash-registers", json={"branch_id": branch_id, "initial_amount": initial_amount})
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
 def test_fluxo_completo_via_api_comanda_ate_pago(client_as, org_a_actor):
     c = client_as(org_a_actor)
     appt = _setup_finished_appointment(c)
@@ -109,11 +119,15 @@ def test_fluxo_completo_via_api_comanda_ate_pago(client_as, org_a_actor):
 
 def test_nao_fecha_comanda_sem_nenhum_caixa_aberto(client_as, org_a_actor):
     """Item 'se não existir nenhum caixa aberto: impedir a confirmação
-    do pagamento' — via API, sem nenhum `POST /cash-registers` antes,
-    o fechamento é recusado (422, cash_register_id não existe/não está
-    aberto — nunca cria um caixa sozinho)."""
+    do pagamento' — o FECHAMENTO é recusado ao referenciar um caixa que
+    não existe/não está aberto (422, nunca cria um caixa sozinho). A
+    ABERTURA da comanda em si já exige um caixa aberto na unidade
+    desde a Etapa H (padrão ON) — `_open_register_for` só satisfaz
+    esse pré-requisito; o alvo deste teste continua sendo o
+    fechamento com um `cash_register_id` inválido."""
     c = client_as(org_a_actor)
     appt = _setup_finished_appointment(c)
+    _open_register_for(c, appt["branch_id"])
     order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
 
     resp = c.post(
@@ -135,6 +149,7 @@ def test_permissao_orders_manage_e_exigida_para_abrir_comanda(client_as, org_a_a
 def test_permissao_orders_edit_price_e_exigida(client_as, org_a_actor):
     c = client_as(org_a_actor)
     appt = _setup_finished_appointment(c)
+    _open_register_for(c, appt["branch_id"])
     order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
     item_id = order["items"][0]["id"]
 
@@ -146,6 +161,7 @@ def test_permissao_orders_edit_price_e_exigida(client_as, org_a_actor):
 def test_permissao_payments_register_e_exigida_para_fechar(client_as, org_a_actor):
     c = client_as(org_a_actor)
     appt = _setup_finished_appointment(c)
+    _open_register_for(c, appt["branch_id"])
     order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
 
     restricted = _restricted_actor(org_a_actor, permissions={"orders.view", "orders.manage"})
@@ -156,9 +172,47 @@ def test_permissao_payments_register_e_exigida_para_fechar(client_as, org_a_acto
     assert resp.status_code == 403
 
 
+def test_cancelar_comanda_via_api(client_as, org_a_actor):
+    """Etapa F, item 4 — fluxo feliz de `POST /orders/{id}/cancel` pela
+    API real: comanda some do fluxo ativo (status vira `cancelled`) e o
+    Appointment volta a poder abrir uma comanda nova em seguida."""
+    c = client_as(org_a_actor)
+    appt = _setup_finished_appointment(c)
+    _open_register_for(c, appt["branch_id"])
+    order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
+
+    resp = c.post(f"/api/v1/orders/{order['id']}/cancel", json={"reason": "aberta por engano"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "cancelled"
+
+    # Tenta cancelar de novo — já não está mais aberta, recusa (não é 200 nem duplica).
+    resp_again = c.post(f"/api/v1/orders/{order['id']}/cancel", json={"reason": "de novo"})
+    assert resp_again.status_code in (409, 422)
+
+    # O agendamento não fica travado — dá pra abrir uma comanda nova.
+    reopened = c.post("/api/v1/orders", json={"appointment_id": appt["id"]})
+    assert reopened.status_code == 201, reopened.text
+    assert reopened.json()["id"] != order["id"]
+
+
+def test_permissao_orders_cancel_e_exigida(client_as, org_a_actor):
+    """`orders.cancel` é permission NOVA e separada de `orders.manage` —
+    quem só abre/gerencia comanda mas não tem `orders.cancel` recebe 403
+    ao tentar cancelar."""
+    c = client_as(org_a_actor)
+    appt = _setup_finished_appointment(c)
+    _open_register_for(c, appt["branch_id"])
+    order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
+
+    restricted = _restricted_actor(org_a_actor, permissions={"orders.view", "orders.manage"})
+    resp = client_as(restricted).post(f"/api/v1/orders/{order['id']}/cancel", json={"reason": "teste"})
+    assert resp.status_code == 403
+
+
 def test_isolamento_multi_tenant_comanda_nao_vaza_entre_organizacoes(client_as, org_a_actor, org_b_actor):
     c_a = client_as(org_a_actor)
     appt = _setup_finished_appointment(c_a)
+    _open_register_for(c_a, appt["branch_id"])
     order = c_a.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
 
     c_b = client_as(org_b_actor)

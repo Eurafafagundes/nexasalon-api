@@ -43,13 +43,63 @@ def get_for_update(session: Session, organization_id: uuid.UUID, order_id: uuid.
 
 
 def get_by_appointment(session: Session, organization_id: uuid.UUID, appointment_id: uuid.UUID) -> Order | None:
+    """A comanda ATIVA (OPEN ou CLOSED) deste agendamento — nunca uma
+    CANCELLED (migration 0024, item "Cancelar Comanda"): depois de
+    cancelar uma comanda criada por engano, o Appointment precisa
+    voltar a "sem comanda" pra `create_order` permitir abrir uma nova, e
+    `services/appointments.py::update_appointment_item` (edição de
+    preço/duração pela Agenda) precisa enxergar "nenhuma comanda pra
+    sincronizar/bloquear" — não a cancelada. O índice único parcial
+    `uq_orders_appointment_id_active` garante o mesmo filtro no banco."""
     stmt = (
         select(Order)
         .options(selectinload(Order.items), selectinload(Order.product_items), selectinload(Order.payments))
-        .where(Order.appointment_id == appointment_id, Order.organization_id == organization_id)
+        .where(
+            Order.appointment_id == appointment_id,
+            Order.organization_id == organization_id,
+            Order.status != OrderStatus.CANCELLED,
+        )
         .execution_options(populate_existing=True)
     )
     return session.scalars(stmt).first()
+
+
+def list_active_for_client(session: Session, organization_id: uuid.UUID, client_id: uuid.UUID) -> list[Order]:
+    """Comandas NÃO canceladas (OPEN ou CLOSED) da cliente, qualquer
+    unidade/data — usada por `services/orders.py::get_related_orders`
+    (Etapa I, "Comandas relacionadas") pra filtrar o dia operacional em
+    memória (o agrupamento depende de `Appointment.starts_at`, que não
+    dá pra comparar diretamente numa cláusula `WHERE` desta tabela)."""
+    stmt = (
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.product_items), selectinload(Order.payments))
+        .where(
+            Order.organization_id == organization_id,
+            Order.client_id == client_id,
+            Order.status != OrderStatus.CANCELLED,
+        )
+    )
+    return list(session.scalars(stmt).all())
+
+
+def list_closed_for_clients(session: Session, organization_id: uuid.UUID, client_ids: list[uuid.UUID]) -> list[Order]:
+    """Comandas FECHADAS de vários clientes de uma vez, mais recente
+    primeiro — Etapa J, "Lista de clientes" (calcula "último
+    atendimento"/"profissional mais recente" em LOTE, evita 1 query por
+    linha da lista). Mesmo filtro de `list_for_client` (só CLOSED)."""
+    if not client_ids:
+        return []
+    stmt = (
+        select(Order)
+        .options(selectinload(Order.items))
+        .where(
+            Order.organization_id == organization_id,
+            Order.client_id.in_(client_ids),
+            Order.status == OrderStatus.CLOSED,
+        )
+        .order_by(Order.closed_at.desc())
+    )
+    return list(session.scalars(stmt).all())
 
 
 def _next_order_number(session: Session, organization_id: uuid.UUID) -> int:

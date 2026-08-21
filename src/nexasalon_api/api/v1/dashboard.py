@@ -11,11 +11,12 @@ from nexasalon_api.services import dashboard as dashboard_service
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
-# `reports.view` já existe desde a migration 0007 (seeded pra OWNER/ADMIN,
-# fora do alcance de RECEPTIONIST/PROFESSIONAL) — encaixe semântico exato
-# pra "visualizar relatórios/BI", nenhuma permission nova precisa nascer
-# pra este módulo.
-_view = require_permission("reports.view")
+# `dashboard.view` (migration 0026, Etapa G) — antes emprestava
+# `reports.view` (comentário revertido: o Gerenciador de Acessos precisa
+# de um toggle "Dashboard" próprio, independente de um futuro módulo de
+# Relatórios). Seeded pra OWNER/ADMIN, fora do alcance de
+# RECEPTIONIST/PROFESSIONAL — mesmo público de antes.
+_view = require_permission("dashboard.view")
 
 
 @router.get("/overview", response_model=DashboardOverviewResponse, summary="Dashboard — visão geral (KPIs + gráficos)")

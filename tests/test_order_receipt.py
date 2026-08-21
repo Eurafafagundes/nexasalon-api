@@ -76,7 +76,8 @@ def _stock_product(c, branch_id, *, sale_price="120.00", quantity="10"):
 
 def test_comprovante_indisponivel_para_comanda_aberta(client_as, org_a_actor):
     c = client_as(org_a_actor)
-    appt, _branch, _service, _client = _setup_finished_appointment(c)
+    appt, branch, _service, _client = _setup_finished_appointment(c)
+    c.post("/api/v1/cash-registers", json={"branch_id": branch["id"], "initial_amount": "0"})
     order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
 
     resp = c.get(f"/api/v1/orders/{order['id']}/receipt")

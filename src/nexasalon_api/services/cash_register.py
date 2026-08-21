@@ -12,14 +12,18 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.actor import ActorContext
-from nexasalon_api.core.exceptions import ConflictError, NotFoundError, ValidationDomainError
+from nexasalon_api.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationDomainError
 from nexasalon_api.models.cash_register import CashMovement, CashRegister
 from nexasalon_api.models.enums import AuditAction, CashMovementType, CashRegisterStatus, PaymentMethod
 from nexasalon_api.repositories import audit_log_repo, cash_movement_repo, cash_register_repo, payment_repo, user_repo
+from nexasalon_api.services import cash_register_config as cash_register_config_service
+from nexasalon_api.services.availability import effective_timezone
 
 
 def _resolve_user_name(session: Session, user_id: uuid.UUID) -> str:
@@ -41,6 +45,87 @@ def _reload(session: Session, organization_id: uuid.UUID, register_id: uuid.UUID
     return register
 
 
+def _operational_date(moment: datetime, tz: ZoneInfo):
+    return moment.astimezone(tz).date()
+
+
+def _stale_open_register(
+    session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID, tz: ZoneInfo
+) -> CashRegister | None:
+    """Caixa aberto desta unidade cuja ABERTURA aconteceu num dia
+    operacional anterior a hoje (dia calculado no fuso efetivo da
+    organização/unidade — `effective_timezone` — nunca em UTC puro).
+    Usado tanto por `open_register` (item "exigir fechamento do caixa
+    anterior antes de abrir o de hoje") quanto por
+    `assert_operational_prerequisites` (item "bloquear operações se
+    existir caixa aberto de dia anterior")."""
+    today = _operational_date(datetime.now(timezone.utc), tz)
+    for register in cash_register_repo.list_open(session, organization_id):
+        if register.branch_id == branch_id and _operational_date(register.created_at, tz) < today:
+            return register
+    return None
+
+
+def _previous_day_open_message(register: CashRegister, tz: ZoneInfo) -> str:
+    opened_local = register.created_at.astimezone(tz)
+    return (
+        f"Existe um caixa de {opened_local.strftime('%d/%m/%Y')} ainda aberto. "
+        "Feche o caixa anterior antes de iniciar as operações de hoje."
+    )
+
+
+def _assert_role_allowed_to_open_close(
+    actor: ActorContext, config: cash_register_config_service.EffectiveConfig
+) -> None:
+    """Proprietário nunca é bloqueado por este toggle — só os dois
+    perfis de sistema explicitamente configuráveis (Administrador/
+    Recepção). Perfis Personalizados/Profissional não são afetados
+    aqui (continuam regidos só por `finance.manage`, RBAC padrão)."""
+    role = (actor.role_name or "").upper()
+    if role == "ADMIN" and not config.allow_admin_open_close:
+        raise ForbiddenError("As Configurações do Caixa não permitem que Administradores abram/fechem caixa.")
+    if role == "RECEPTIONIST" and not config.allow_receptionist_open_close:
+        raise ForbiddenError("As Configurações do Caixa não permitem que a Recepção abra/feche caixa.")
+
+
+def _acquire_branch_open_lock(session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID) -> None:
+    """Serializa aberturas CONCORRENTES da mesma unidade dentro da
+    transação atual (`pg_advisory_xact_lock` — liberado sozinho no
+    commit/rollback da request, nunca precisa de unlock explícito).
+    Necessário porque, quando não existe NENHUM caixa aberto ainda,
+    não há linha nenhuma pra um `SELECT ... FOR UPDATE` travar — sem
+    este lock, duas requisições de abertura concorrentes fariam a
+    MESMA leitura "nenhum caixa aberto" antes de qualquer uma
+    commitar, e as duas abririam caixa (exatamente o cenário que a
+    Etapa H pede pra impedir "quando a configuração proibir")."""
+    key = f"cash_register_open:{organization_id}:{branch_id}"
+    session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key})
+
+
+def assert_operational_prerequisites(
+    session: Session, actor: ActorContext, branch_id: uuid.UUID, *, purpose: str
+) -> None:
+    """Reaproveitado por `services/orders.py::create_order`/`close_order`
+    e `services/appointments.py::create_appointment` (Etapa H,
+    `Financeiro > Caixa > Configurações do Caixa`). Nunca fecha nada
+    sozinho — só barra a operação com uma mensagem acionável."""
+    config = cash_register_config_service.get_effective_config(session, actor.organization_id)
+    tz = effective_timezone(session, actor.organization_id, branch_id)
+
+    if config.block_if_previous_day_open:
+        stale = _stale_open_register(session, actor.organization_id, branch_id, tz)
+        if stale is not None:
+            raise ConflictError(_previous_day_open_message(stale, tz))
+
+    require_open, action_description = {
+        "order": (config.require_open_register_for_order, "criar uma comanda"),
+        "payment": (config.require_open_register_for_payment, "receber um pagamento"),
+        "appointment": (config.require_open_register_for_appointment, "criar um agendamento"),
+    }[purpose]
+    if require_open and cash_register_repo.get_open_for_branch(session, actor.organization_id, branch_id) is None:
+        raise ValidationDomainError(f"É necessário abrir o caixa desta unidade para {action_description}.")
+
+
 def open_register(
     session: Session, actor: ActorContext, branch_id: uuid.UUID, initial_amount: Decimal, notes: str | None
 ) -> CashRegister:
@@ -53,9 +138,28 @@ def open_register(
     # `finance.manage` continua podendo abrir/fechar; só não é possível
     # abrir um SEGUNDO caixa na mesma unidade enquanto o primeiro
     # estiver aberto.
-    existing = cash_register_repo.get_open_for_branch(session, actor.organization_id, branch_id)
-    if existing is not None:
-        raise ConflictError("Esta unidade já tem um caixa aberto. Feche-o antes de abrir outro.")
+    #
+    # Etapa H acrescenta, sem mudar o que já existia: (a) os dois
+    # toggles acima também podem restringir POR PERFIL quem abre/fecha;
+    # (b) "apenas um caixa aberto por unidade" virou configurável (era
+    # sempre-ligado); (c) checagem de caixa de dia anterior ainda
+    # aberto ANTES de abrir um novo; (d) lock de transação pra duas
+    # aberturas concorrentes nunca passarem as duas quando a regra "um
+    # por unidade" estiver ligada.
+    config = cash_register_config_service.get_effective_config(session, actor.organization_id)
+    _assert_role_allowed_to_open_close(actor, config)
+
+    tz = effective_timezone(session, actor.organization_id, branch_id)
+    if config.require_close_previous_before_opening_today:
+        stale = _stale_open_register(session, actor.organization_id, branch_id, tz)
+        if stale is not None:
+            raise ConflictError(_previous_day_open_message(stale, tz))
+
+    if config.single_open_register_per_branch:
+        _acquire_branch_open_lock(session, actor.organization_id, branch_id)
+        existing = cash_register_repo.get_open_for_branch(session, actor.organization_id, branch_id)
+        if existing is not None:
+            raise ConflictError("Esta unidade já tem um caixa aberto. Feche-o antes de abrir outro.")
 
     name = _resolve_user_name(session, actor.user_id)
     register = cash_register_repo.create(
@@ -275,6 +379,9 @@ def close_register(
     register = _get_register_or_404(session, actor.organization_id, register_id)
     if register.status != CashRegisterStatus.OPEN:
         raise ConflictError("Este caixa já está fechado.")
+
+    config = cash_register_config_service.get_effective_config(session, actor.organization_id)
+    _assert_role_allowed_to_open_close(actor, config)
 
     summary = build_summary(session, actor.organization_id, register)
     name = _resolve_user_name(session, actor.user_id)

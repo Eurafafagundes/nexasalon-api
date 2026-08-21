@@ -10,7 +10,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.exceptions import ConflictError, NotFoundError, ValidationDomainError
-from nexasalon_api.core.security import create_invite_token, create_password_reset_token
+from nexasalon_api.core.security import create_invite_token, create_password_reset_token, hash_password
 from nexasalon_api.models.enums import AuditAction, MembershipStatus, PermissionEffect
 from nexasalon_api.models.identity import MembershipPermissionOverride, OrganizationMembership, User
 from nexasalon_api.models.rbac import Permission
@@ -45,13 +45,14 @@ def list_employees(
 @dataclass(frozen=True)
 class EmployeeInviteResult:
     membership: OrganizationMembership
-    # Só preenchido quando a membership entra como INVITED — o
-    # administrador nunca vê/define a senha do funcionário; ele só
-    # recebe este link/token pra repassar (WhatsApp, e-mail manual etc.
-    # — envio automático de e-mail é etapa futura). Quando o usuário já
-    # tem senha própria (`invite_token is None`), a membership já entra
-    # ACTIVE e não existe convite a aceitar.
+    # Só preenchido no fluxo antigo (nenhuma `password` informada) — o
+    # link/token que o administrador repassa manualmente. `None` nos
+    # outros dois `credential_mode` (a membership já entra ACTIVE, sem
+    # convite a aceitar).
     invite_token: str | None
+    # "password_set" | "existing_account_linked" | "invite_link" — ver
+    # docstring de `EmployeeInviteResponse` (schemas/user_management.py).
+    credential_mode: str
 
 
 def add_or_invite_employee(
@@ -61,27 +62,33 @@ def add_or_invite_employee(
     email: str,
     name: str,
     role_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
     branch_id: uuid.UUID | None = None,
+    password: str | None = None,
 ) -> EmployeeInviteResult:
-    """Fluxo de convite (o dono NUNCA cria/conhece a senha do
-    funcionário):
+    """Conceder acesso a um funcionário — três caminhos possíveis (Etapa
+    G tornou `password` o caminho PRINCIPAL; o convite por link/token
+    permanece só por compatibilidade, não é mais usado pela UX):
 
-        User/Membership INVITED -> invite_token temporário (JWT)
-            -> funcionário abre o link, define a própria senha
-            -> POST /auth/accept-invite -> membership vira ACTIVE
+        1. `password` informada + usuário NOVO (sem senha própria ainda)
+           -> hash aplicado direto (`core/security.hash_password`),
+           membership entra ACTIVE imediatamente. Nenhum
+           token/link é gerado — o admin definiu a credencial, não tem
+           nada a "aceitar" depois.
+        2. Usuário já EXISTE com senha própria (de outra organização) ->
+           a membership entra ACTIVE reaproveitando essa credencial. Uma
+           eventual `password` informada aqui é IGNORADA de propósito —
+           nunca sobrescreve silenciosamente a senha de login de outra
+           organização (dois admins de orgs diferentes não podem pisar
+           na senha um do outro). O chamador recebe `credential_mode`
+           pra avisar o admin disso.
+        3. Nenhuma `password` informada e usuário novo -> fluxo antigo:
+           membership INVITED + `invite_token` (JWT) pra o funcionário
+           definir a própria senha em `POST /auth/accept-invite`.
 
-    A decisão de INVITED vs ACTIVE é sobre o `User`, não sobre "já
-    existia na base": um `User` pode existir (criado por um convite
-    anterior noutra organização) e AINDA não ter senha — nesse caso essa
-    membership também precisa de convite próprio, não pode entrar ACTIVE
-    direto (bug corrigido nesta revisão: antes bastava a linha existir).
-
-    - `user.password_hash is None` (novo ou ainda sem senha definida)
-      -> membership INVITED + gera `invite_token` novo para ESTA
-      membership especificamente (cada organização convida separado,
-      como no Slack: aceitar o convite da org A não ativa a da org B).
-    - `user.password_hash` já definido -> a pessoa já tem credenciais
-      próprias; a nova membership entra ACTIVE direto, sem convite.
+    A decisão nunca é "a linha do User já existia" — é sobre
+    `user.password_hash` estar preenchido ou não (mesmo raciocínio já
+    documentado antes desta revisão).
     """
     _validate_role_for_org(session, organization_id, role_id)
 
@@ -93,7 +100,17 @@ def add_or_invite_employee(
     if existing is not None:
         raise ConflictError("Este usuário já possui uma membership nesta organização.")
 
-    status = MembershipStatus.ACTIVE if user.password_hash is not None else MembershipStatus.INVITED
+    if user.password_hash is not None:
+        status = MembershipStatus.ACTIVE
+        credential_mode = "existing_account_linked"
+    elif password is not None:
+        user.password_hash = hash_password(password)
+        user_repo.save(session, user)
+        status = MembershipStatus.ACTIVE
+        credential_mode = "password_set"
+    else:
+        status = MembershipStatus.INVITED
+        credential_mode = "invite_link"
 
     membership = membership_repo.create(
         session,
@@ -108,7 +125,18 @@ def add_or_invite_employee(
     if status == MembershipStatus.INVITED:
         invite_token = create_invite_token(user_id=user.id, membership_id=membership.id)
 
-    return EmployeeInviteResult(membership=membership, invite_token=invite_token)
+    session.flush()
+    audit_log_repo.create(
+        session, organization_id=organization_id, user_id=actor_user_id,
+        entity_type="membership", entity_id=membership.id, action=AuditAction.CREATE,
+        old_values=None,
+        new_values={
+            "user_email": user.email, "role_id": str(role_id), "status": status.value,
+            "credential_mode": credential_mode,
+        },
+    )
+
+    return EmployeeInviteResult(membership=membership, invite_token=invite_token, credential_mode=credential_mode)
 
 
 def resend_invite(
@@ -189,6 +217,53 @@ def admin_reset_password(session: Session, organization_id: uuid.UUID, membershi
     if membership.status not in (MembershipStatus.ACTIVE, MembershipStatus.SUSPENDED):
         raise ConflictError("Só é possível redefinir senha de uma membership ativa ou suspensa.")
     return create_password_reset_token(user_id=membership.user_id, membership_id=membership.id)
+
+
+def admin_set_password(
+    session: Session,
+    organization_id: uuid.UUID,
+    membership_id: uuid.UUID,
+    actor_user_id: uuid.UUID,
+    password: str,
+) -> OrganizationMembership:
+    """Etapa G — o proprietário/admin define a nova senha DIRETAMENTE
+    (substitui, como caminho principal, o link de redefinição gerado por
+    `admin_reset_password` abaixo, que continua existindo só por
+    compatibilidade). O hash SUBSTITUI o anterior — a senha antiga para
+    de funcionar imediatamente, não há coexistência possível (mesma
+    primitiva `hash_password` usada em `accept_invite`/`reset_password`,
+    ver `core/security.py`).
+
+    Aceita também uma membership ainda `INVITED`: definir a senha aqui
+    já ATIVA a conta (`status -> ACTIVE`), tornando o convite por
+    token/link desnecessário nesse caso — é o mesmo resultado que
+    `accept_invite` produziria, só que iniciado pelo admin em vez do
+    funcionário."""
+    membership = _get_membership_in_org(session, organization_id, membership_id)
+    if membership.status not in (MembershipStatus.INVITED, MembershipStatus.ACTIVE, MembershipStatus.SUSPENDED):
+        raise ConflictError("Não é possível definir senha para esta membership.")
+
+    user = user_repo.get(session, membership.user_id)
+    if user is None:
+        raise NotFoundError("Usuário não encontrado.")
+
+    was_invited = membership.status == MembershipStatus.INVITED
+    user.password_hash = hash_password(password)
+    user_repo.save(session, user)
+
+    if was_invited:
+        membership.status = MembershipStatus.ACTIVE
+        membership_repo.save(session, membership)
+
+    audit_log_repo.create(
+        session, organization_id=organization_id, user_id=actor_user_id,
+        entity_type="membership", entity_id=membership.id, action=AuditAction.UPDATE,
+        # NUNCA logar senha/hash — só o fato de que trocou e o efeito
+        # colateral no status, quando aplicável.
+        old_values={"password_reset": False, "was_invited": was_invited},
+        new_values={"password_reset": True, "status": membership.status.value},
+    )
+    return membership
 
 
 def list_roles(session: Session, organization_id: uuid.UUID) -> list:

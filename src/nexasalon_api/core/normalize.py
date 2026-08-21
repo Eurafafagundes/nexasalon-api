@@ -12,6 +12,7 @@ C.1: nunca confiar só na máscara do frontend, o backend sempre
 normaliza (só dígitos) e valida (checksum módulo 11) antes de
 persistir."""
 import re
+import unicodedata
 
 _DIGITS = re.compile(r"\D+")
 
@@ -47,6 +48,18 @@ def is_valid_cpf(cpf_digits: str) -> bool:
     d1 = _check_digit(cpf_digits[:9])
     d2 = _check_digit(cpf_digits[:9] + str(d1))
     return cpf_digits[9] == str(d1) and cpf_digits[10] == str(d2)
+
+
+def normalize_slug(raw: str) -> str:
+    """Slug de URL (Etapa K — Agendamento Online): minúsculo, só
+    `[a-z0-9-]`, hífens colapsados/sem sobra nas pontas. `"Salão da
+    Ana!"` -> `"salao-da-ana"` (troca espaço por hífen, remove tudo que
+    não é alfanumérico/hífen — inclusive acento, já que `\\w` do Python
+    não cobre isso sozinho, então normaliza NFKD antes)."""
+    text = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+    text = text.strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    return text.strip("-")
 
 
 def normalize_cnpj(raw: str) -> str:

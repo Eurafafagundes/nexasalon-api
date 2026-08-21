@@ -123,15 +123,19 @@ def test_permissao_finance_view_e_exigida_para_listar(client_as, org_a_actor):
     assert resp.status_code == 403
 
 
-def test_receptionist_tem_finance_view_mas_nao_finance_manage(client_as, org_a_actor):
+def test_receptionist_tem_finance_view_e_finance_manage(client_as, org_a_actor):
     """Item da migration 0014: RECEPTIONIST ganha `finance.view` (pra
-    conseguir selecionar um caixa ao registrar pagamento), mas continua
-    sem `finance.manage` (abrir/fechar caixa, sangria, suprimento
-    ficam só com OWNER/ADMIN)."""
+    conseguir selecionar um caixa ao registrar pagamento). Etapa H
+    (`Financeiro > Caixa > Configurações do Caixa`, migration 0027)
+    muda a regra que vinha da 0014: o pedido explícito agora é
+    "permitir Recepção abrir/fechar caixa" (com um toggle próprio,
+    `allow_receptionist_open_close`, padrão ON, pra quem quiser
+    restringir de novo sem mexer em RBAC) — RECEPTIONIST passa a ter
+    também `finance.manage` por padrão."""
     receptionist = _restricted_actor(org_a_actor, permissions={"clients.view"})
     # simula RECEPTIONIST real via seed de permissions do papel, não
     # via lista manual — usamos as permissions exatas concedidas pela
-    # migration 0007+0011+0014 pra esse role.
+    # migration 0007+0011+0014+0027 pra esse role.
     from nexasalon_api.repositories import rbac_repo
 
     with SessionLocal() as session:
@@ -144,7 +148,7 @@ def test_receptionist_tem_finance_view_mas_nao_finance_manage(client_as, org_a_a
         keys = rbac_repo.list_role_permission_keys(session, role.id)
 
     assert "finance.view" in keys
-    assert "finance.manage" not in keys
+    assert "finance.manage" in keys
 
 
 def test_isolamento_multi_tenant_caixa_nao_vaza_entre_organizacoes(client_as, org_a_actor, org_b_actor):

@@ -69,12 +69,20 @@ class OrderStatus(str, Enum):
     editável por linha) e vira CLOSED quando o pagamento é registrado
     (`POST /orders/{id}/close`) — o que também promove o `Appointment`
     associado para `paid` automaticamente (ver `services/orders.py`).
-    Sem estado de cancelamento próprio nesta primeira versão (não
-    pedido, e cancelar comanda não é o mesmo domínio que cancelar
-    agendamento)."""
+
+    CANCELLED (migration 0024, Etapa F — "Cancelar/Excluir Comanda"):
+    só alcançável a partir de OPEN, nunca de CLOSED (uma comanda paga
+    exige um fluxo de estorno/reversão, não implementado nesta rodada
+    — mesmo raciocínio de `AppointmentStatus.PAID` ser terminal pro
+    grafo livre). Uma comanda cancelada sai das operações abertas mas
+    nunca é apagada — continua no histórico (`GET /orders`), só some do
+    "esta é a comanda ativa deste agendamento" (`get_by_appointment`
+    filtra `!= cancelled`), permitindo abrir uma comanda nova pro mesmo
+    Appointment depois de cancelar uma criada por engano."""
 
     OPEN = "open"
     CLOSED = "closed"
+    CANCELLED = "cancelled"
 
 
 class PaymentMethod(str, Enum):

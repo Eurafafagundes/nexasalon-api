@@ -18,6 +18,20 @@ class OrderCreate(BaseModel):
     appointment_id: uuid.UUID
 
 
+class OrderCancel(BaseModel):
+    """`POST /orders/{id}/cancel` (Etapa F, item "Cancelar Comanda").
+
+    Etapa I supersede deliberado: o pedido original tratava `reason`
+    como opcional; a rodada "Comandas relacionadas e fechamento
+    consolidado" pede explicitamente "motivo obrigatório" pro
+    cancelamento lógico — a partir daqui `reason` é required (nunca
+    apagamos a linha, só viramos `CANCELLED`; o motivo entra no
+    `AuditLog` junto com quem/quando, já cobertos por
+    `AuditLog.user_id`/`created_at`)."""
+
+    reason: str = Field(min_length=3, max_length=255)
+
+
 class OrderItemUpdate(BaseModel):
     """Campos editáveis de uma linha de SERVIÇO da comanda — `price`
     (já existia) e `duration_minutes` (Etapa C — item "edição auditada
@@ -134,6 +148,20 @@ class OrderClose(BaseModel):
     payments: list[PaymentCreate] = Field(min_length=1)
 
 
+class ConsolidatedOrderClose(BaseModel):
+    """`POST /orders/{order_id}/close-consolidated` (Etapa I, item
+    "Fechamento consolidado") — `order_ids` é a lista COMPLETA das
+    comandas a fechar juntas (a da URL pode ou não estar incluída
+    explicitamente; o service garante que ela participa). `payments` é
+    uma lista ÚNICA que cobre o TOTAL somado de todas as comandas — o
+    pagamento pode ser dividido normalmente entre Pix/cartão/dinheiro
+    etc.; o service distribui cada valor entre as comandas (ver
+    `services/orders.py::close_orders_consolidated`)."""
+
+    order_ids: list[uuid.UUID] = Field(min_length=1)
+    payments: list[PaymentCreate] = Field(min_length=1)
+
+
 class OrderItemRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -227,6 +255,82 @@ class OrderRead(BaseModel):
             created_by=order.created_by,
             closed_by=order.closed_by,
         )
+
+
+class ClientOrderPaymentSummary(BaseModel):
+    """Um lançamento de pagamento dentro de `ClientOrderSummary` —
+    `amount` vem `None` quando o ator não tem `finance.view` (ver
+    docstring de `ClientOrderSummary`)."""
+
+    model_config = ConfigDict(from_attributes=False)
+
+    method: PaymentMethod
+    amount: Decimal | None
+
+
+class ClientOrderSummary(BaseModel):
+    """Linha da aba "Comandas" da Ficha 360° do cliente (Etapa J) —
+    versão enxuta de `OrderRead`, sem os IDs internos que a ficha não
+    precisa. `total`/`payments[].amount` vêm `None` quando o ator não
+    tem `finance.view` — mesmo padrão de `ProductRead`/
+    `ProductReadWithCost` (`schemas/product.py`): o backend decide,
+    nunca o frontend só esconde visualmente (ver
+    `services/clients.py::get_client_profile`)."""
+
+    model_config = ConfigDict(from_attributes=False)
+
+    id: uuid.UUID
+    order_number: int
+    status: OrderStatus
+    service_names: list[str]
+    product_names: list[str]
+    total: Decimal | None
+    payments: list[ClientOrderPaymentSummary]
+    created_at: datetime
+    closed_at: datetime | None
+
+    @classmethod
+    def from_order(cls, order: Order, *, can_view_finance: bool) -> "ClientOrderSummary":
+        # `dict.fromkeys` preserva a ordem de primeira aparição e
+        # deduplica — mesmo espírito do `[...new Set(...)]` já usado no
+        # frontend (`client-detail-drawer.tsx::HistoricoTab`).
+        service_names = list(dict.fromkeys(item.service_name for item in order.items))
+        product_names = list(dict.fromkeys(item.product_name for item in order.product_items))
+        total = None
+        if can_view_finance:
+            services_total = sum((item.price for item in order.items), Decimal("0"))
+            products_total = sum(
+                (item.quantity * item.unit_price for item in order.product_items), Decimal("0")
+            )
+            total = services_total + products_total
+        payments = [
+            ClientOrderPaymentSummary(method=p.method, amount=p.amount if can_view_finance else None)
+            for p in order.payments
+        ]
+        return cls(
+            id=order.id,
+            order_number=order.order_number,
+            status=order.status,
+            service_names=service_names,
+            product_names=product_names,
+            total=total,
+            payments=payments,
+            created_at=order.created_at,
+            closed_at=order.closed_at,
+        )
+
+
+class OrderRelatedRead(BaseModel):
+    """`GET /orders/{order_id}/related` (Etapa I, item "Comandas
+    relacionadas") — `related` NUNCA inclui a própria comanda
+    consultada; `total_today` = `len(related) + 1`, pronto pro texto
+    discreto "Esta cliente possui N comandas hoje" no frontend."""
+
+    model_config = ConfigDict(from_attributes=False)
+
+    client_name: str
+    total_today: int
+    related: list[OrderRead]
 
 
 # --- Comprovante de Atendimento (Etapa D) -----------------------------

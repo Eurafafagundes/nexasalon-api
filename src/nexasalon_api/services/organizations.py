@@ -1,8 +1,13 @@
 import uuid
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from nexasalon_api.core.exceptions import NotFoundError
+from nexasalon_api.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    ValidationDomainError,
+)
 from nexasalon_api.core.storage import (
     StorageBackend,
     build_logo_key,
@@ -23,6 +28,26 @@ def get_current_organization(session: Session, organization_id: uuid.UUID) -> Or
     return org
 
 
+def _slug_taken_by_other_org(session: Session, slug: str, organization_id: uuid.UUID) -> bool:
+    """Checagem de unicidade GLOBAL de slug (a URL pública `/agendar/<slug>`
+    não é escopada por organização — dois estabelecimentos não podem
+    dividir a mesma URL). Sob RLS normal (autenticado, `app.current_org_id`
+    já apontando pra `organization_id`), a policy `tenant_isolation` de
+    `organizations` só deixa este SELECT enxergar a PRÓPRIA organização —
+    por isso liga o mesmo flag de sessão da rota pública
+    (`public_booking_lookup`, migration 0028) só pelo tempo desta consulta,
+    e desliga de novo logo em seguida, dentro da MESMA transação. Mesmo
+    espírito de `SET LOCAL app.allow_overlap` em
+    `services/appointments.py::_maybe_allow_overlap`: um flag transacional
+    estreito, nunca um bypass geral de RLS."""
+    session.execute(text("SELECT set_config('app.public_booking_lookup', 'true', true)"))
+    try:
+        existing = organization_repo.get_by_slug(session, slug)
+    finally:
+        session.execute(text("SELECT set_config('app.public_booking_lookup', 'false', true)"))
+    return existing is not None and existing.id != organization_id
+
+
 def update_organization(session: Session, organization_id: uuid.UUID, data: OrganizationUpdate) -> Organization:
     """Escrita gated por `organization.manage` na rota (ver
     `api/v1/organizations.py`) — o service não reconfirma permissão,
@@ -37,7 +62,19 @@ def update_organization(session: Session, organization_id: uuid.UUID, data: Orga
     # campo enviado explicitamente como `null` (ex.: "remover CNPJ
     # cadastrado") limpa o valor — é o comportamento certo pra um
     # formulário de configurações que pode ser salvo por seção.
-    for field, value in data.model_dump(exclude_unset=True).items():
+    payload = data.model_dump(exclude_unset=True)
+
+    # `slug` é a ÚNICA exceção à regra "null limpa o valor" acima — é
+    # NOT NULL/UNIQUE no banco (é a URL pública do Agendamento Online),
+    # nunca pode ser removido, só trocado por outro slug válido.
+    if "slug" in payload:
+        new_slug = payload["slug"]
+        if new_slug is None:
+            raise ValidationDomainError("Slug não pode ser removido — informe um novo slug.")
+        if new_slug != org.slug and _slug_taken_by_other_org(session, new_slug, organization_id):
+            raise ConflictError("Este slug já está em uso por outra organização.")
+
+    for field, value in payload.items():
         setattr(org, field, value)
     return organization_repo.save(session, org)
 

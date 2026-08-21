@@ -10,6 +10,11 @@ class RoleRead(BaseModel):
     name: str
     description: str | None
     is_system: bool
+    # Etapa G — chaves de permission concedidas por ESTE role (o "padrão"
+    # que a aba Permissões usa pra mostrar "herdado do perfil" antes de
+    # qualquer override de membership). Vem de `role_permissions`, nunca
+    # confundir com os overrides por membership (`PermissionOverrideRead`).
+    permissions: list[str]
 
 
 class PermissionRead(BaseModel):

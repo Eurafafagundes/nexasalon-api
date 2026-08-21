@@ -54,6 +54,7 @@ def _to_agenda_item_read(item) -> AgendaItemRead:
         duration_minutes=item.duration_minutes,
         price=item.price,
         status=item.status or item.appointment.status,
+        source=item.appointment.source,
     )
 
 

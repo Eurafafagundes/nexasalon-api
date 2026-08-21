@@ -56,7 +56,7 @@ def _actor(session, org_id) -> ActorContext:
     session.flush()
     return ActorContext(
         organization_id=org_id, user_id=user.id, membership_id=uuid.uuid4(), role_id=uuid.uuid4(),
-        role_name="Owner", permissions=frozenset({"reports.view"}),
+        role_name="Owner", permissions=frozenset({"dashboard.view"}),
     )
 
 
@@ -1009,11 +1009,11 @@ def test_drill_down_de_kpi_desconhecido_da_not_found(org_session):
 
 
 # ---------------------------------------------------------------------------
-# Permissão (HTTP) — reports.view.
+# Permissão (HTTP) — dashboard.view.
 # ---------------------------------------------------------------------------
 
 
-def test_http_sem_reports_view_recebe_403(org_a_actor, client_as):
+def test_http_sem_dashboard_view_recebe_403(org_a_actor, client_as):
     from dataclasses import replace
 
     restricted = replace(org_a_actor, permissions=frozenset({"agenda.view_own"}))
@@ -1025,7 +1025,7 @@ def test_http_sem_reports_view_recebe_403(org_a_actor, client_as):
     assert resp.status_code == 403
 
 
-def test_http_com_reports_view_funciona(org_a_actor, client_as):
+def test_http_com_dashboard_view_funciona(org_a_actor, client_as):
     client = client_as(org_a_actor)  # fixture já concede TODAS as permissions (Owner de teste).
     resp = client.get(
         "/api/v1/dashboard/overview",

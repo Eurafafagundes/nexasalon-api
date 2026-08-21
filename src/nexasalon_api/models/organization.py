@@ -1,7 +1,16 @@
 import uuid
 from datetime import time
 
-from sqlalchemy import CheckConstraint, ForeignKey, SmallInteger, String, Time, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    Integer,
+    SmallInteger,
+    String,
+    Time,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -85,6 +94,25 @@ class Organization(Base, UUIDPKMixin, TimestampMixin):
     whatsapp: Mapped[str | None] = mapped_column(String(32))
     instagram: Mapped[str | None] = mapped_column(String(120))
     website: Mapped[str | None] = mapped_column(String(255))
+
+    # --- Etapa K: Agendamento Online público (Configurações > Agendamento
+    # Online) — página nasce DESATIVADA (`false`) até a organização optar
+    # por ligá-la explicitamente; `online_booking_auto_confirm` nasce
+    # LIGADA (comportamento mais comum de agendamento online: confirma
+    # sozinho, sem exigir um passo manual de "confirmar" da recepção —
+    # quando desligado, o agendamento público nasce em SCHEDULED normal,
+    # igual a um agendamento interno comum). `slug` (usado na URL pública,
+    # `/agendar/<slug>`) JÁ EXISTIA desde a migration 0002 — não duplicado
+    # aqui, só passa a ser editável via `OrganizationUpdate` nesta etapa.
+    online_booking_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    online_booking_auto_confirm: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    # Antecedência mínima/máxima para reservar um horário pela página
+    # pública — puramente uma regra de UX/negócio desta etapa (a
+    # disponibilidade REAL continua vindo integralmente do motor
+    # existente, `services/availability.py`; estes dois campos só
+    # recortam a janela de datas ofertada/aceita no fluxo público).
+    online_booking_min_lead_minutes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="60")
+    online_booking_max_lead_days: Mapped[int] = mapped_column(Integer, nullable=False, server_default="60")
 
     branches: Mapped[list["Branch"]] = relationship(back_populates="organization")
 

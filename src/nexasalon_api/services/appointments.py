@@ -6,31 +6,56 @@ Camada de VALIDAÇÃO DE APLICAÇÃO (erro limpo e rápido). O trigger
 """
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.actor import ActorContext
-from nexasalon_api.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationDomainError
-from nexasalon_api.models.appointment import Appointment, AppointmentItem
-from nexasalon_api.models.enums import AppointmentStatus, AuditAction
+from nexasalon_api.core.exceptions import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ValidationDomainError,
+)
+from nexasalon_api.core.normalize import normalize_phone
+from nexasalon_api.models.appointment import Appointment
+from nexasalon_api.models.enums import (
+    AppointmentSource,
+    AppointmentStatus,
+    AuditAction,
+    OrderStatus,
+)
+from nexasalon_api.models.organization import Organization
 from nexasalon_api.repositories import (
     appointment_item_repo,
     appointment_repo,
     audit_log_repo,
     branch_repo,
     client_repo,
+    order_repo,
     professional_repo,
     professional_service_repo,
     schedule_block_repo,
     service_repo,
 )
-from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate, AppointmentReplace
+from nexasalon_api.schemas.appointment import (
+    AppointmentCreate,
+    AppointmentItemCreate,
+    AppointmentItemUpdate,
+    AppointmentReplace,
+)
 from nexasalon_api.services import agenda_access, availability
-from nexasalon_api.services.appointment_state_machine import assert_cancellable, next_status
-from nexasalon_api.services.appointment_state_machine import mark_paid as _mark_paid_transition
+from nexasalon_api.services import cash_register as cash_register_service
+from nexasalon_api.services.appointment_state_machine import (
+    OPERATIONAL_STATUSES,
+    assert_cancellable,
+    next_status,
+)
+from nexasalon_api.services.appointment_state_machine import (
+    mark_paid as _mark_paid_transition,
+)
 
 FORCE_OVERLAP_PERMISSION = "agenda.force_overlap"
 
@@ -259,6 +284,12 @@ def create_appointment(session: Session, actor: ActorContext, data: AppointmentC
     effective_force_overlap = _resolve_force_overlap(actor, data.force_overlap)
     _assert_branch_and_client(session, organization_id, data.branch_id, data.client_id)
 
+    # Etapa H (`Financeiro > Caixa > Configurações do Caixa`) — "exigir
+    # caixa aberto para criar agendamento" (padrão OFF, ao contrário de
+    # Comanda/Pagamento) e "bloquear operações se existir caixa aberto
+    # de dia anterior" (padrão ON).
+    cash_register_service.assert_operational_prerequisites(session, actor, data.branch_id, purpose="appointment")
+
     snapshots = _build_all_item_snapshots(
         session, organization_id, data.branch_id, data.items, exclude_appointment_id=None
     )
@@ -379,6 +410,210 @@ def replace_appointment(
     return _reload(session, organization_id, appointment_id)
 
 
+def _assert_online_booking_lead_time(organization: Organization, start_at: datetime) -> None:
+    """"Antecedência mínima"/"antecedência máxima" (Etapa K,
+    Configurações > Agendamento Online) — regra de UX/negócio SÓ do
+    fluxo público; nunca se aplica a agendamento interno (que continua
+    sem nenhuma janela mínima/máxima). A disponibilidade REAL do horário
+    (jornada/bloqueio/conflito) continua vindo inteiramente do motor
+    existente (`_build_all_item_snapshots` -> `services/availability.py`)
+    — isto aqui só recorta a janela de datas aceita antes de chegar lá."""
+    now = datetime.now(timezone.utc)
+    earliest = now + timedelta(minutes=organization.online_booking_min_lead_minutes)
+    if start_at < earliest:
+        raise ValidationDomainError(
+            "Este horário está muito próximo — escolha um horário com mais antecedência."
+        )
+    latest = now + timedelta(days=organization.online_booking_max_lead_days)
+    if start_at > latest:
+        raise ValidationDomainError(
+            "Este horário está muito distante — escolha uma data mais próxima."
+        )
+
+
+def _get_or_create_public_client(
+    session: Session, organization_id: uuid.UUID, *, name: str, phone: str, email: str | None
+) -> uuid.UUID:
+    """"Procurar cliente existente pelo telefone dentro da organização;
+    se não existir, criar cadastro" (item explícito do pedido) — nunca
+    pede CPF/endereço, mesmo cadastro universal de `Client`, só com
+    menos campos preenchidos. `phone` já chega normalizado (só dígitos)
+    de `schemas/public_booking.py::PublicBookingCreate`."""
+    existing = client_repo.get_by_phone(session, organization_id, phone)
+    if existing is not None:
+        return existing.id
+    client = client_repo.create(session, organization_id, name=name, phone=phone, email=email)
+    return client.id
+
+
+def resolve_public_professional_for_slot(
+    session: Session,
+    organization_id: uuid.UUID,
+    *,
+    branch_id: uuid.UUID,
+    service_id: uuid.UUID,
+    start_at: datetime,
+    eligible_professional_ids: list[uuid.UUID],
+) -> uuid.UUID:
+    """"Qualquer profissional" (item explícito do pedido) — o cliente só
+    escolhe SERVIÇO + horário; o profissional de fato é resolvido aqui,
+    reaproveitando o MESMO motor de disponibilidade (nunca uma segunda
+    lógica de agenda): o primeiro elegível cuja disponibilidade real
+    inclui exatamente este `start_at` é quem atende. Corrida entre duas
+    clientes pro mesmo profissional/horário continua coberta pela
+    mesma barreira transacional de sempre (trigger da migration 0004,
+    via `_build_all_item_snapshots`/`_apply_conflict_policy` logo
+    depois) — isto aqui só escolhe QUEM tentar primeiro."""
+    tz = availability.effective_timezone(session, organization_id, branch_id)
+    target_date = start_at.astimezone(tz).date()
+    for professional_id in eligible_professional_ids:
+        slots = availability.compute_availability(
+            session,
+            organization_id,
+            branch_id=branch_id,
+            professional_id=professional_id,
+            service_id=service_id,
+            target_date=target_date,
+        )
+        if any(slot.start_at == start_at for slot in slots):
+            return professional_id
+    raise ConflictError("Nenhum profissional disponível para este horário — escolha outro horário.")
+
+
+def create_public_appointment(
+    session: Session,
+    organization: Organization,
+    *,
+    branch_id: uuid.UUID,
+    professional_id: uuid.UUID | None,
+    service_id: uuid.UUID,
+    start_at: datetime,
+    client_name: str,
+    client_phone: str,
+    client_email: str | None,
+) -> Appointment:
+    """Orquestração da Etapa K (Agendamento Online público) —
+    equivalente a `create_appointment`, mas SEM `ActorContext` (não há
+    login de cliente, item explícito do pedido) e com um único item
+    (Serviço -> Profissional -> Horário, fluxo linear obrigatório, "não
+    inverter profissional/horário"). Reaproveita DIRETAMENTE
+    `_build_all_item_snapshots`/`_apply_conflict_policy`/`_insert_items`
+    — a MESMA validação de jornada/bloqueio/conflito/duração/timezone do
+    agendamento interno, nunca uma segunda lógica de agenda. `force_overlap`
+    nunca é oferecido aqui (nem no schema de entrada, ver
+    `schemas/public_booking.py`) — o portão de `_resolve_force_overlap`
+    simplesmente não é chamado.
+
+    Chamada SEMPRE dentro do contexto RLS já resolvido pra esta
+    organização (`api/deps.py::get_public_context` já setou
+    `app.current_org_id` antes desta função ser invocada) — o trigger
+    `check_appointment_item_overlap` (migration 0004) continua sendo a
+    barreira TRANSACIONAL final contra duas clientes reservando o mesmo
+    horário ("Backend deve revalidar disponibilidade de forma
+    transacional na confirmação", item explícito do pedido) — nenhum
+    lock/código novo foi necessário pra isso, o trigger já cobre
+    qualquer INSERT em `appointment_items`, não importa quem chamou."""
+    organization_id = organization.id
+
+    service = service_repo.get(session, organization_id, service_id)
+    if service is None or not service.is_active or not service.allow_online_booking:
+        raise ValidationDomainError("Este serviço não está disponível para agendamento online.")
+
+    if professional_id is not None:
+        professional = professional_repo.get(session, organization_id, professional_id)
+        if professional is None or not professional.is_active or not professional.allow_online_booking:
+            raise ValidationDomainError("Este profissional não está disponível para agendamento online.")
+        eligible_professional_ids = [professional_id]
+    else:
+        # "Qualquer profissional": só considera quem está habilitado
+        # online E de fato executa este serviço (mesma checagem de
+        # `professional_service_repo.get_for_pair` usada depois, adiantada
+        # aqui só pra montar a lista de candidatos).
+        links = professional_service_repo.list_for_service(session, organization_id, service_id)
+        linked_ids = {link.professional_id for link in links if link.is_active}
+        eligible_professional_ids = [
+            p.id
+            for p in professional_repo.list_all(session, organization_id)
+            if p.id in linked_ids and p.allow_online_booking
+        ]
+        if not eligible_professional_ids:
+            raise ValidationDomainError("Nenhum profissional disponível para este serviço no momento.")
+
+    _assert_online_booking_lead_time(organization, start_at)
+    # Não reaproveita `_assert_branch_and_client` (valida os dois juntos)
+    # porque a cliente ainda não existe neste ponto — só é
+    # criada/encontrada mais abaixo, depois da resolução do profissional.
+    if not branch_repo.exists(session, organization_id, branch_id):
+        raise NotFoundError("Unidade não encontrada.")
+
+    resolved_professional_id = (
+        professional_id
+        if professional_id is not None
+        else resolve_public_professional_for_slot(
+            session,
+            organization_id,
+            branch_id=branch_id,
+            service_id=service_id,
+            start_at=start_at,
+            eligible_professional_ids=eligible_professional_ids,
+        )
+    )
+
+    client_id = _get_or_create_public_client(
+        session, organization_id, name=client_name, phone=normalize_phone(client_phone), email=client_email
+    )
+
+    item_in = AppointmentItemCreate(
+        professional_id=resolved_professional_id, service_id=service_id, start_at=start_at
+    )
+    snapshots = _build_all_item_snapshots(
+        session, organization_id, branch_id, [item_in], exclude_appointment_id=None
+    )
+    # Fluxo público nunca oferece force_overlap — qualquer conflito real
+    # vira 409 direto, sem exceção.
+    _apply_conflict_policy(snapshots, effective_force_overlap=False)
+
+    appointment = appointment_repo.create(
+        session,
+        organization_id,
+        branch_id=branch_id,
+        client_id=client_id,
+        notes=None,
+        created_by=None,
+        source=AppointmentSource.PUBLIC_BOOKING,
+    )
+    _insert_items(session, organization_id, appointment.id, snapshots)
+
+    if organization.online_booking_auto_confirm:
+        appointment.status = AppointmentStatus.CONFIRMED
+    session.flush()
+
+    audit_log_repo.create(
+        session,
+        organization_id=organization_id,
+        user_id=None,
+        entity_type="appointment",
+        entity_id=appointment.id,
+        action=AuditAction.CREATE,
+        new_values={
+            "source": AppointmentSource.PUBLIC_BOOKING.value,
+            "branch_id": str(branch_id),
+            "client_id": str(client_id),
+            "items": [
+                {
+                    "professional_id": str(s.professional_id),
+                    "service_id": str(s.service_id),
+                    "start_at": s.start_at.isoformat(),
+                    "end_at": s.end_at.isoformat(),
+                }
+                for s in snapshots
+            ],
+        },
+    )
+
+    return _reload(session, organization_id, appointment.id)
+
+
 def _diff_change_types(old_items: list[dict], new_snapshots: list[_ItemSnapshot]) -> list[str]:
     """Comparação posicional best-effort (o PUT não manda IDs de item) —
     o objetivo é dar contexto útil no AuditLog, não uma reconciliação
@@ -396,13 +631,68 @@ def _diff_change_types(old_items: list[dict], new_snapshots: list[_ItemSnapshot]
     return sorted(change_types) or ["no_op"]
 
 
-def update_status(
+def get_related_appointments(session: Session, actor: ActorContext, appointment_id: uuid.UUID) -> list[Appointment]:
+    """Outros agendamentos NÃO cancelados da MESMA cliente no MESMO dia
+    operacional (fuso da unidade de cada agendamento) — item "Comandas
+    relacionadas" / "Alteração de status" (Etapa I). Baseado em
+    `starts_at` (cache derivado dos itens, ver `models/appointment.py`),
+    nunca inclui o próprio `appointment_id`. Aplica a MESMA trava
+    anti-leak de `get_appointment`: um candidato só entra se o ator
+    conseguir ver pelo menos um profissional dele."""
+    organization_id = actor.organization_id
+    appointment = get_appointment(session, actor, appointment_id)
+    if appointment.starts_at is None:
+        return []
+    tz = availability.effective_timezone(session, organization_id, appointment.branch_id)
+    target_day = appointment.starts_at.astimezone(tz).date()
+
+    candidates = appointment_repo.list_active_for_client(session, organization_id, appointment.client_id)
+    related: list[Appointment] = []
+    for candidate in candidates:
+        if candidate.id == appointment.id or candidate.starts_at is None:
+            continue
+        if not any(agenda_access.can_view_professional(actor, item.professional_id) for item in candidate.items):
+            continue
+        c_tz = availability.effective_timezone(session, organization_id, candidate.branch_id)
+        if candidate.starts_at.astimezone(c_tz).date() == target_day:
+            related.append(candidate)
+    return related
+
+
+def _auto_cancel_order_for_no_show(session: Session, actor: ActorContext, appointment_id: uuid.UUID) -> None:
+    """Item 6 (Etapa I, "Faltou") — ao marcar `NO_SHOW`, se existir uma
+    Comanda ABERTA ligada a ESTE agendamento (e só a ele — `Order` é
+    1:1 com `Appointment` enquanto não cancelada, ver
+    `uq_orders_appointment_id_active`), cancela-a automaticamente: sem
+    pagamento, sem baixa de estoque (mesma trava de `orders.cancel_order`
+    — só sai de `OPEN`). NUNCA toca em comandas de OUTROS agendamentos
+    relacionados (mesma cliente/dia) — item explícito "não cancelar
+    silenciosamente todas". Mesmo lock-antes-de-checar-status de
+    `close_order`/`cancel_order` pra ficar retry-safe."""
+    organization_id = actor.organization_id
+    order = order_repo.get_by_appointment(session, organization_id, appointment_id)
+    if order is None:
+        return
+    locked = order_repo.get_for_update(session, organization_id, order.id)
+    if locked is None or locked.status != OrderStatus.OPEN:
+        return
+    locked.status = OrderStatus.CANCELLED
+    session.flush()
+    audit_log_repo.create(
+        session, organization_id=organization_id, user_id=actor.user_id, entity_type="order",
+        entity_id=locked.id, action=AuditAction.UPDATE,
+        old_values={"status": "open"},
+        new_values={
+            "status": "cancelled", "change_type": "auto_cancel_no_show",
+            "reason": "Agendamento marcado como Faltou — comanda vinculada exclusivamente a ele.",
+            "appointment_id": str(appointment_id),
+        },
+    )
+
+
+def _apply_status_change(
     session: Session, actor: ActorContext, appointment_id: uuid.UUID, target_status: AppointmentStatus
-) -> Appointment:
-    """PATCH genérico de status — grafo LIVRE entre os 6 status
-    operacionais (avançar ou regredir manualmente, sem sequência
-    obrigatória). `CANCELLED` e `PAID` nunca são destino aqui (ver
-    `appointment_state_machine.next_status`)."""
+) -> None:
     appointment = get_appointment(session, actor, appointment_id)
     _assert_can_edit(actor, {item.professional_id for item in appointment.items})
     old_status = appointment.status
@@ -417,6 +707,37 @@ def update_status(
         old_values={"status": old_status.value},
         new_values={"status": new_status.value, "change_type": "manual_status_change"},
     )
+    if new_status == AppointmentStatus.NO_SHOW:
+        _auto_cancel_order_for_no_show(session, actor, appointment_id)
+
+
+def update_status(
+    session: Session,
+    actor: ActorContext,
+    appointment_id: uuid.UUID,
+    target_status: AppointmentStatus,
+    *,
+    scope: str = "only_this",
+) -> Appointment:
+    """PATCH genérico de status — grafo LIVRE entre os 6 status
+    operacionais (avançar ou regredir manualmente, sem sequência
+    obrigatória). `CANCELLED` e `PAID` nunca são destino aqui (ver
+    `appointment_state_machine.next_status`).
+
+    `scope="all_related"` (Etapa I, item "Alteração de status") aplica
+    a MESMA mudança também a todo agendamento relacionado (mesma
+    cliente, mesmo dia — `get_related_appointments`) que ainda esteja
+    num status OPERACIONAL (nunca força um relacionado já `PAID`/
+    `CANCELLED`, que fica de fora silenciosamente — item "não cancelar/
+    alterar silenciosamente" aplicado aqui também). O frontend só deve
+    perguntar "somente este / todos" quando `get_related_appointments`
+    devolver pelo menos um resultado; com zero relacionados, `scope` é
+    irrelevante (nada pra propagar)."""
+    _apply_status_change(session, actor, appointment_id, target_status)
+    if scope == "all_related":
+        for related in get_related_appointments(session, actor, appointment_id):
+            if related.status in OPERATIONAL_STATUSES and related.status != target_status:
+                _apply_status_change(session, actor, related.id, target_status)
     return _reload(session, actor.organization_id, appointment_id)
 
 
@@ -460,3 +781,185 @@ def cancel_appointment(session: Session, actor: ActorContext, appointment_id: uu
         new_values={"status": AppointmentStatus.CANCELLED.value, "change_type": "cancel"},
     )
     return _reload(session, actor.organization_id, appointment_id)
+
+
+def update_appointment_item(
+    session: Session, actor: ActorContext, appointment_id: uuid.UUID, item_id: uuid.UUID, data: AppointmentItemUpdate
+) -> Appointment:
+    """PATCH parcial de UM item, em vez do PUT que apaga+recria tudo
+    (`replace_appointment`) — necessário assim que existe uma Comanda
+    aberta linkada (`OrderItem.appointment_item_id`, RESTRICT: apagar o
+    item quebraria a referência). Cobre DOIS itens do pedido com o
+    MESMO código, porque no fundo são o mesmo tipo de edição:
+
+      - "editar valor e duração no agendamento" (drawer da Agenda):
+        `price_override`/`duration_override` (+ `reason` obrigatório
+        quando o preço muda de fato — nunca só confiado ao frontend);
+      - "drag and drop": `professional_id`/`start_at`.
+
+    Regra ÚNICA pra Agenda/Comanda nunca divergirem silenciosamente
+    (item explícito do pedido): se existe uma Comanda ATIVA
+    (`order_repo.get_by_appointment`, já filtra cancelada) linkada a
+    este agendamento —
+      - `CLOSED` (paga): recusa qualquer mudança de PREÇO (alteração
+        financeira depois do fechamento exige um fluxo de estorno, não
+        implementado). Duração/horário/profissional continuam livres
+        (são só agenda, não tocam a comanda já fechada/congelada).
+      - `OPEN`: a linha correspondente da comanda (`OrderItem` com o
+        mesmo `appointment_item_id`) é sincronizada automaticamente —
+        nada ainda está financeiramente comprometido, então as duas
+        camadas continuam mostrando o MESMO número."""
+    organization_id = actor.organization_id
+    appointment = get_appointment(session, actor, appointment_id)
+    item = next((i for i in appointment.items if i.id == item_id), None)
+    if item is None:
+        raise NotFoundError("Item do agendamento não encontrado.")
+
+    target_professional_id = data.professional_id if data.professional_id is not None else item.professional_id
+    target_start_at = data.start_at if data.start_at is not None else item.start_at
+    target_duration = data.duration_override if data.duration_override is not None else item.duration_minutes
+    target_end_at = target_start_at + timedelta(minutes=target_duration)
+    target_price = data.price_override if data.price_override is not None else item.price
+    price_changing = data.price_override is not None and data.price_override != item.price
+
+    _assert_can_edit(actor, {item.professional_id, target_professional_id})
+
+    if price_changing and not data.reason:
+        raise ValidationDomainError(
+            "Informe o motivo da alteração de valor (campo 'reason') — obrigatório sempre que o preço "
+            "de um atendimento é editado pela Agenda."
+        )
+
+    professional_changing = target_professional_id != item.professional_id
+    if professional_changing:
+        professional = professional_repo.get(session, organization_id, target_professional_id)
+        if professional is None:
+            raise NotFoundError("Profissional não encontrado.")
+        if not professional.is_active:
+            raise ValidationDomainError("Profissional está inativo.")
+        if professional.branch_id is not None and professional.branch_id != appointment.branch_id:
+            raise ValidationDomainError("Profissional não atende nesta unidade.")
+        professional_service = professional_service_repo.get_for_pair(
+            session, organization_id, target_professional_id, item.service_id
+        )
+        if professional_service is None or not professional_service.is_active:
+            raise ValidationDomainError("Este profissional não executa este serviço.")
+
+    # Já existe uma Comanda ATIVA linkada? Guarda financeira ANTES de
+    # tocar em qualquer coisa — nunca aplica a mudança pra só depois
+    # descobrir que precisava recusar (item "impedir alteração
+    # financeira silenciosa" quando a comanda já está fechada).
+    order = order_repo.get_by_appointment(session, organization_id, appointment_id)
+    if order is not None and order.status == OrderStatus.CLOSED and price_changing:
+        raise ValidationDomainError(
+            "Esta comanda já foi fechada — não é possível alterar o valor deste atendimento "
+            "silenciosamente. Use o fluxo financeiro de estorno/reversão."
+        )
+
+    _assert_within_working_hours(session, organization_id, appointment.branch_id, target_professional_id, target_start_at, target_end_at)
+    _assert_no_schedule_block(session, organization_id, appointment.branch_id, target_professional_id, target_start_at, target_end_at)
+
+    sibling_conflict = any(
+        sibling.id != item.id
+        and sibling.professional_id == target_professional_id
+        and sibling.start_at < target_end_at
+        and sibling.end_at > target_start_at
+        for sibling in appointment.items
+    )
+    db_conflicts = appointment_item_repo.list_conflicts(
+        session, organization_id, professional_id=target_professional_id,
+        start_at=target_start_at, end_at=target_end_at, exclude_appointment_id=appointment.id,
+    )
+    has_conflict = sibling_conflict or bool(db_conflicts)
+    any_forced = False
+    if has_conflict:
+        effective_force_overlap = _resolve_force_overlap(actor, data.force_overlap)
+        if not effective_force_overlap:
+            raise ConflictError(f"Profissional já tem um atendimento nesse horário ({target_start_at.isoformat()}).")
+        any_forced = True
+    _maybe_allow_overlap(session, any_forced)
+
+    old_professional_id = item.professional_id
+    old_start_at = item.start_at
+    old_price = item.price
+    old_duration = item.duration_minutes
+    old_values = {
+        "professional_id": str(old_professional_id),
+        "start_at": old_start_at.isoformat(),
+        "price": str(old_price),
+        "duration_minutes": str(old_duration),
+    }
+
+    item.professional_id = target_professional_id
+    item.start_at = target_start_at
+    item.end_at = target_end_at
+    item.duration_minutes = target_duration
+    item.price = target_price
+    appointment.updated_by = actor.user_id
+    session.flush()  # dispara o trigger recalc_appointment_bounds (migration 0006)
+
+    if order is not None and order.status == OrderStatus.OPEN:
+        order_item = next((oi for oi in order.items if oi.appointment_item_id == item.id), None)
+        if order_item is not None:
+            order_item_changes: dict[str, tuple[str, str]] = {}
+            if professional_changing:
+                new_professional = professional_repo.get(session, organization_id, target_professional_id)
+                order_item_changes["professional_id"] = (str(order_item.professional_id), str(target_professional_id))
+                order_item.professional_id = target_professional_id
+                order_item.professional_name = (
+                    new_professional.name if new_professional is not None else "Profissional removido"
+                )
+            if target_duration != order_item.duration_minutes:
+                order_item_changes["duration_minutes"] = (str(order_item.duration_minutes), str(target_duration))
+                order_item.duration_minutes = target_duration
+            if target_price != order_item.price:
+                order_item_changes["price"] = (str(order_item.price), str(target_price))
+                order_item.price = target_price
+            if order_item_changes:
+                session.flush()
+                audit_log_repo.create(
+                    session, organization_id=organization_id, user_id=actor.user_id, entity_type="order_item",
+                    entity_id=order_item.id, action=AuditAction.UPDATE,
+                    old_values={k: v[0] for k, v in order_item_changes.items()},
+                    new_values={
+                        **{k: v[1] for k, v in order_item_changes.items()},
+                        "change_type": "synced_from_appointment_edit", "order_id": str(order.id),
+                    },
+                )
+
+    change_types: list[str] = []
+    if professional_changing:
+        change_types.append("professional_change")
+    if target_start_at != old_start_at:
+        change_types.append("reschedule")
+    if price_changing:
+        change_types.append("manual_price_edit")
+    if target_duration != old_duration:
+        change_types.append("manual_duration_edit")
+
+    audit_log_repo.create(
+        session, organization_id=organization_id, user_id=actor.user_id, entity_type="appointment_item",
+        entity_id=item.id, action=AuditAction.UPDATE,
+        old_values=old_values,
+        new_values={
+            "professional_id": str(target_professional_id),
+            "start_at": target_start_at.isoformat(),
+            "price": str(target_price),
+            "duration_minutes": str(target_duration),
+            "reason": data.reason,
+            "change_type": change_types or ["no_op"],
+        },
+    )
+    if any_forced:
+        _audit_force_overlap(
+            session, actor, appointment_id,
+            [
+                _ItemSnapshot(
+                    professional_id=target_professional_id, service_id=item.service_id,
+                    start_at=target_start_at, end_at=target_end_at, duration_minutes=target_duration,
+                    price=target_price, has_conflict=True,
+                )
+            ],
+        )
+
+    return _reload(session, organization_id, appointment_id)

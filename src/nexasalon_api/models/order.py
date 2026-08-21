@@ -33,7 +33,16 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Integer, Numeric, String, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,20 +51,32 @@ from .enums import CardBrand, OrderStatus, PaymentMethod, pg_enum
 
 
 class Order(Base, UUIDPKMixin, TimestampMixin):
-    """Comanda — 1:1 com um `Appointment` (uma reserva vira, no máximo,
-    uma comanda). `client_id`/`branch_id` são denormalizados a partir do
-    Appointment no momento da criação só pra permitir uma futura tela de
-    histórico do cliente sem precisar sempre juntar com `appointments`
-    — mesmo espírito de `AppointmentItem.price` (snapshot, não
-    recalculado depois)."""
+    """Comanda — 1:1 com um `Appointment` ATIVO (uma reserva tem, no
+    máximo, uma comanda ABERTA ou FECHADA por vez — ver índice único
+    parcial abaixo). `client_id`/`branch_id` são denormalizados a
+    partir do Appointment no momento da criação só pra permitir uma
+    futura tela de histórico do cliente sem precisar sempre juntar com
+    `appointments` — mesmo espírito de `AppointmentItem.price`
+    (snapshot, não recalculado depois)."""
 
     __tablename__ = "orders"
     __table_args__ = (
         CheckConstraint(
-            "(status = 'open' AND closed_at IS NULL) OR (status = 'closed' AND closed_at IS NOT NULL)",
+            "(status = 'open' AND closed_at IS NULL) OR (status = 'closed' AND closed_at IS NOT NULL) "
+            "OR (status = 'cancelled' AND closed_at IS NULL)",
             name="closed_at_matches_status",
         ),
         UniqueConstraint("organization_id", "order_number", name="uq_orders_organization_order_number"),
+        # Parcial (não um UniqueConstraint simples de coluna): ignora
+        # comandas CANCELLED (migration 0024) — cancelar uma comanda
+        # criada por engano precisa liberar o Appointment pra uma
+        # comanda nova, sem deixar a linha cancelada "segurando" a
+        # unicidade pra sempre. `services/orders.py::get_by_appointment`
+        # já filtra `!= cancelled` no mesmo espírito.
+        Index(
+            "uq_orders_appointment_id_active", "appointment_id", unique=True,
+            postgresql_where="status <> 'cancelled'",
+        ),
     )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
@@ -69,7 +90,7 @@ class Order(Base, UUIDPKMixin, TimestampMixin):
     # `services/orders.py`.
     order_number: Mapped[int] = mapped_column(BigInteger, nullable=False)
     appointment_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="RESTRICT"), nullable=False, unique=True
+        UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="RESTRICT"), nullable=False
     )
     branch_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("branches.id", ondelete="RESTRICT"), nullable=False

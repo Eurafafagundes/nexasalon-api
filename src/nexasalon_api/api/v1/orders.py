@@ -8,6 +8,8 @@ from nexasalon_api.api.deps import get_db, require_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.models.enums import OrderStatus
 from nexasalon_api.schemas.order import (
+    ConsolidatedOrderClose,
+    OrderCancel,
     OrderClose,
     OrderCreate,
     OrderItemUpdate,
@@ -15,6 +17,7 @@ from nexasalon_api.schemas.order import (
     OrderProductItemUpdate,
     OrderRead,
     OrderReceiptRead,
+    OrderRelatedRead,
 )
 from nexasalon_api.services import orders as orders_service
 
@@ -24,6 +27,7 @@ _view = require_permission("orders.view")
 _manage = require_permission("orders.manage")
 _edit_price = require_permission("orders.edit_price")
 _register_payment = require_permission("payments.register")
+_cancel = require_permission("orders.cancel")
 
 # Produto na comanda reaproveita as MESMAS fronteiras de autorização de
 # serviço na comanda — adicionar/remover produto é "gerenciar a
@@ -83,6 +87,24 @@ def get_order(
 ) -> OrderRead:
     order = orders_service.get_order(session, actor, order_id)
     return OrderRead.from_order(order)
+
+
+@router.get(
+    "/{order_id}/related",
+    response_model=OrderRelatedRead,
+    summary="Comandas relacionadas (mesma cliente, mesmo dia) — Etapa I",
+)
+def get_related_orders(
+    order_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> OrderRelatedRead:
+    _order, related, client_name = orders_service.get_order_related(session, actor, order_id)
+    return OrderRelatedRead(
+        client_name=client_name,
+        total_today=len(related) + 1,
+        related=[OrderRead.from_order(o) for o in related],
+    )
 
 
 @router.get(
@@ -175,4 +197,30 @@ def close_order(
     actor: ActorContext = Depends(_register_payment),
 ) -> OrderRead:
     order = orders_service.close_order(session, actor, order_id, payload)
+    return OrderRead.from_order(order)
+
+
+@router.post(
+    "/{order_id}/close-consolidated",
+    response_model=list[OrderRead],
+    summary="Fechar várias comandas relacionadas juntas (mesma cliente, mesmo dia) — Etapa I",
+)
+def close_orders_consolidated(
+    order_id: uuid.UUID,
+    payload: ConsolidatedOrderClose,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_register_payment),
+) -> list[OrderRead]:
+    orders = orders_service.close_orders_consolidated(session, actor, order_id, payload)
+    return [OrderRead.from_order(o) for o in orders]
+
+
+@router.post("/{order_id}/cancel", response_model=OrderRead, summary="Cancelar uma comanda aberta (motivo obrigatório)")
+def cancel_order(
+    order_id: uuid.UUID,
+    payload: OrderCancel,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_cancel),
+) -> OrderRead:
+    order = orders_service.cancel_order(session, actor, order_id, payload)
     return OrderRead.from_order(order)

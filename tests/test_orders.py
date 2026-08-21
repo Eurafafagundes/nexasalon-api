@@ -5,7 +5,7 @@ abordagem de `test_appointments.py`: direto no service layer via
 em `test_auth.py`/`test_agenda.py`, e o parâmetro que importa aqui é a
 regra de negócio, não o transporte)."""
 import uuid
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -13,15 +13,30 @@ from sqlalchemy import text
 
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.db import SessionLocal
-from nexasalon_api.core.exceptions import ConflictError, NotFoundError, ValidationDomainError
+from nexasalon_api.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    ValidationDomainError,
+)
+from nexasalon_api.models.audit import AuditLog
 from nexasalon_api.models.client import Client
+from nexasalon_api.models.enums import (
+    AppointmentStatus,
+    CardBrand,
+    OrderStatus,
+    PaymentMethod,
+)
 from nexasalon_api.models.identity import User
-from nexasalon_api.models.enums import AppointmentStatus, CardBrand, OrderStatus, PaymentMethod
 from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.service import ProfessionalService, Service
 from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate
-from nexasalon_api.schemas.order import OrderClose, OrderItemPriceUpdate, PaymentCreate
+from nexasalon_api.schemas.order import (
+    OrderCancel,
+    OrderClose,
+    OrderItemPriceUpdate,
+    PaymentCreate,
+)
 from nexasalon_api.services import appointments, cash_register, orders
 
 _ALL_AGENDA_PERMS = frozenset(
@@ -100,8 +115,16 @@ def _dt(hour, minute=0):
 
 def _finished_appointment_with_two_services(session, org_id, actor):
     """Um agendamento com 2 serviços (Corte R$100, Coloração R$280),
-    já FINISHED — pronto pra abrir comanda."""
+    já FINISHED — pronto pra abrir comanda.
+
+    Etapa H ("exigir caixa aberto para criar Comanda", padrão ON): já
+    abre, aqui, um caixa nesta MESMA unidade — a maioria dos testes
+    deste arquivo não testa essa regra em si (isso vive em
+    `test_cash_register_config.py`), só precisa que `orders.create_order`
+    não seja recusado por falta de caixa aberto na unidade do
+    agendamento."""
     branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
     prof = _professional(session, org_id, branch.id)
     corte = _service(session, org_id, name="Corte", duration=60, price=Decimal("100.00"))
     coloracao = _service(session, org_id, name="Coloração", duration=90, price=Decimal("280.00"))
@@ -127,8 +150,10 @@ def _scheduled_appointment_with_one_service(session, org_id, actor):
     """Agendamento com 1 serviço (Corte R$100), ainda no status
     default `SCHEDULED` — item "não condicione a Comanda a ter passado
     por todos os status": abrir/fechar comanda não deve exigir
-    `FINISHED`."""
+    `FINISHED`. Também já abre caixa nesta unidade — ver docstring de
+    `_finished_appointment_with_two_services`."""
     branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
     prof = _professional(session, org_id, branch.id)
     corte = _service(session, org_id, name="Corte", duration=60, price=Decimal("100.00"))
     _link(session, prof.id, corte.id)
@@ -574,6 +599,7 @@ def test_order_number_e_sequencial_por_organizacao(org_session):
     order1 = orders.create_order(session, actor, appt1.id)
 
     branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
     prof = _professional(session, org_id, branch.id)
     svc = _service(session, org_id, name="Escova", duration=30, price=Decimal("80.00"))
     _link(session, prof.id, svc.id)
@@ -610,3 +636,99 @@ def test_snapshot_de_nome_do_item_nao_muda_se_servico_for_renomeado(org_session)
 
     reloaded = orders.get_order(session, actor, order.id)
     assert {item.service_name for item in reloaded.items} == original_names
+
+
+# ---------------------------------------------------------------------
+# Cancelar comanda (Etapa F, item "Cancelar/Excluir Comanda") — nunca
+# apaga, some das operações abertas mas continua em `GET /orders`.
+# ---------------------------------------------------------------------
+
+
+def test_cancela_comanda_aberta_sem_pagamento(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+
+    cancelled = orders.cancel_order(session, actor, order.id, OrderCancel(reason="Aberta por engano"))
+    assert cancelled.status == OrderStatus.CANCELLED
+
+
+def test_cancelar_comanda_registra_auditoria_com_motivo(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+
+    orders.cancel_order(session, actor, order.id, OrderCancel(reason="Cliente desistiu"))
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == order.id, AuditLog.entity_type == "order",
+        AuditLog.action == "update",
+    ).all()
+    cancel_logs = [log for log in logs if log.new_values.get("change_type") == "cancel"]
+    assert len(cancel_logs) == 1
+    assert cancel_logs[0].new_values["reason"] == "Cliente desistiu"
+    assert cancel_logs[0].old_values["status"] == "open"
+
+
+def test_nao_cancela_comanda_ja_fechada(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    total = sum((i.price for i in order.items), Decimal("0"))
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+
+    with pytest.raises(ConflictError):
+        orders.cancel_order(session, actor, order.id, OrderCancel(reason="teste"))
+
+
+def test_retry_de_cancelamento_nao_gera_erro_estranho_nem_duplica(org_session):
+    """Retry-safety: cancelar duas vezes a MESMA comanda recusa a
+    segunda tentativa com clareza (nunca "cancela de novo" silenciosamente)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+
+    orders.cancel_order(session, actor, order.id, OrderCancel(reason="teste"))
+    with pytest.raises(ConflictError):
+        orders.cancel_order(session, actor, order.id, OrderCancel(reason="teste"))
+
+
+def test_cancelar_comanda_libera_o_agendamento_para_uma_comanda_nova(org_session):
+    """Item explícito: cancelar uma comanda criada por engano precisa
+    permitir abrir uma comanda NOVA pro mesmo agendamento — a linha
+    cancelada não pode "segurar" a unicidade pra sempre."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    orders.cancel_order(session, actor, order.id, OrderCancel(reason="Engano"))
+
+    # `get_by_appointment` não enxerga mais a comanda cancelada.
+    assert orders.get_order_by_appointment(session, actor, appt.id) is None
+
+    new_order = orders.create_order(session, actor, appt.id)
+    assert new_order.id != order.id
+    assert new_order.status == OrderStatus.OPEN
+
+    # A comanda cancelada continua acessível por id (histórico).
+    reloaded_cancelled = orders.get_order(session, actor, order.id)
+    assert reloaded_cancelled.status == OrderStatus.CANCELLED
+
+
+def test_comanda_cancelada_nao_aparece_como_a_comanda_ativa_do_agendamento(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    assert orders.get_order_by_appointment(session, actor, appt.id).id == order.id
+
+    orders.cancel_order(session, actor, order.id, OrderCancel(reason="teste"))
+    assert orders.get_order_by_appointment(session, actor, appt.id) is None
