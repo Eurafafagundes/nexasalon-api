@@ -34,9 +34,16 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from nexasalon_api.core.db import SessionLocal
+from nexasalon_api.core.normalize import normalize_slug
 from nexasalon_api.core.security import hash_password
 from nexasalon_api.models.enums import MembershipStatus
-from nexasalon_api.repositories import branch_repo, membership_repo, organization_repo, rbac_repo, user_repo
+from nexasalon_api.repositories import (
+    branch_repo,
+    membership_repo,
+    organization_repo,
+    rbac_repo,
+    user_repo,
+)
 
 
 def _prompt(label: str, default: str | None = None) -> str:
@@ -70,6 +77,26 @@ def main() -> int:
     if not all([org_name, org_slug, branch_name, branch_slug, owner_name, owner_email]):
         print("Todos os campos são obrigatórios. Abortando.", file=sys.stderr)
         return 1
+
+    # Correção pós-publicação (item "Agendamento Online — slug"): esta
+    # era a ÚNICA forma de criar uma organização (não existe rota HTTP
+    # de criação) e gravava o slug CRU, sem passar por `normalize_slug`
+    # — diferente de `PUT /organizations` (`OrganizationUpdate`), que já
+    # normalizava. Um slug digitado como "Meu Salão" (espaço, acento,
+    # maiúscula) ficava assim gravado, quebrando o link público
+    # `/agendar/<slug>`. Normaliza os dois slugs aqui, mesma função
+    # usada pelo backend HTTP.
+    normalized_org_slug = normalize_slug(org_slug)
+    normalized_branch_slug = normalize_slug(branch_slug)
+    if not normalized_org_slug or not normalized_branch_slug:
+        print("Slug inválido — use letras, números e hífen (ex.: meu-salao). Abortando.", file=sys.stderr)
+        return 1
+    if normalized_org_slug != org_slug:
+        print(f"Slug da organização normalizado para '{normalized_org_slug}'.")
+    if normalized_branch_slug != branch_slug:
+        print(f"Slug da unidade normalizado para '{normalized_branch_slug}'.")
+    org_slug = normalized_org_slug
+    branch_slug = normalized_branch_slug
 
     password = _prompt_password()
 

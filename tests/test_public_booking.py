@@ -362,6 +362,56 @@ def test_antecedencia_maxima_rejeita_horario_muito_distante(client_as, org_a_act
     assert resp.status_code == 422, resp.text
 
 
+def test_disponibilidade_listagem_respeita_antecedencia_minima(client_as, org_a_actor):
+    """Correção real do item: antes, só a CONFIRMAÇÃO (`POST
+    .../{slug}`, testada acima) respeitava `online_booking_min_lead_minutes`
+    — a LISTAGEM (`GET .../availability`) continuava oferecendo horários
+    que a confirmação recusaria em seguida (usuário via e clicava num
+    horário que a API rejeitava). Consulta amanhã inteiro (jornada
+    00:00-23:59) pra não depender da hora do dia em que o teste roda:
+    `earliest_allowed` (agora + antecedência) cai sempre bem antes do
+    fim do dia de amanhã, garantindo horários sobrando."""
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c, online_booking_min_lead_minutes=120)  # 2h
+    _branch, professionals, svc = _setup_service_and_professional(c)
+    prof = professionals[0]
+    p = _public()
+
+    now = datetime.now(timezone.utc)
+    tomorrow = (now + timedelta(days=1)).date().isoformat()
+    resp = p.get(
+        f"/api/v1/public/booking/{org['slug']}/availability",
+        params={"service_id": svc["id"], "professional_id": prof["id"], "date": tomorrow},
+    )
+    assert resp.status_code == 200, resp.text
+    slots = resp.json()
+    assert len(slots) > 0  # sobra parte do dia de amanhã mesmo com a antecedência
+
+    earliest_allowed = now + timedelta(minutes=120)
+    for slot in slots:
+        assert datetime.fromisoformat(slot["start_at"]) >= earliest_allowed
+
+
+def test_disponibilidade_listagem_respeita_antecedencia_maxima(client_as, org_a_actor):
+    """Mesma lacuna do teste acima, agora pro limite MÁXIMO
+    (`online_booking_max_lead_days`) — um dia muito distante não pode
+    aparecer na listagem, mesmo que a jornada do profissional o
+    contemplasse (00:00-23:59 todo dia da semana)."""
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c, online_booking_max_lead_days=1)
+    _branch, professionals, svc = _setup_service_and_professional(c)
+    prof = professionals[0]
+    p = _public()
+
+    far_date = (datetime.now(timezone.utc) + timedelta(days=30)).date().isoformat()
+    resp = p.get(
+        f"/api/v1/public/booking/{org['slug']}/availability",
+        params={"service_id": svc["id"], "professional_id": prof["id"], "date": far_date},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == []  # dia inteiro além do limite -> nenhum horário
+
+
 # ---------------------------------------------------------------------
 # Serviço/profissional desabilitados para online
 # ---------------------------------------------------------------------

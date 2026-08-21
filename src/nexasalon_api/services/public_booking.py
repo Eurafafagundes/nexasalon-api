@@ -10,6 +10,7 @@ inclui campo financeiro/interno/de estoque/de usuário.
 """
 import uuid
 from datetime import date as date_type
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
@@ -19,12 +20,30 @@ from nexasalon_api.models.professional import Professional
 from nexasalon_api.models.service import Service
 from nexasalon_api.repositories import (
     branch_repo,
+    organization_repo,
     professional_repo,
     professional_service_repo,
     service_repo,
 )
 from nexasalon_api.services import availability
 from nexasalon_api.services.availability import AvailabilitySlot
+
+
+def _lead_time_bounds(session: Session, organization_id: uuid.UUID) -> tuple[datetime, datetime]:
+    """`earliest_start`/`latest_start` pra `compute_availability`, a
+    partir de `Organization.online_booking_min_lead_minutes`/
+    `online_booking_max_lead_days` (Etapa K, já existentes) — os MESMOS
+    campos já aplicados na CONFIRMAÇÃO
+    (`services/appointments.py::_assert_online_booking_lead_time`), só
+    que agora também na LISTAGEM (correção: antes só a confirmação
+    respeitava a antecedência, então a listagem oferecia horários que a
+    confirmação ia recusar em seguida). `now` em UTC — comparável
+    direto com `AvailabilitySlot.start_at`, que também é UTC-aware."""
+    organization = organization_repo.get(session, organization_id)
+    now = datetime.now(timezone.utc)
+    earliest = now + timedelta(minutes=organization.online_booking_min_lead_minutes)
+    latest = now + timedelta(days=organization.online_booking_max_lead_days)
+    return earliest, latest
 
 
 def get_default_branch(session: Session, organization_id: uuid.UUID) -> Branch:
@@ -86,6 +105,8 @@ def get_public_availability(
     serviço, deduplicados por horário de início — o profissional real só
     é resolvido na confirmação (`services/appointments.py::
     resolve_public_professional_for_slot`)."""
+    earliest_start, latest_start = _lead_time_bounds(session, organization_id)
+
     if professional_id is not None:
         return availability.compute_availability(
             session,
@@ -94,6 +115,8 @@ def get_public_availability(
             professional_id=professional_id,
             service_id=service_id,
             target_date=target_date,
+            earliest_start=earliest_start,
+            latest_start=latest_start,
         )
 
     merged: dict = {}
@@ -105,6 +128,8 @@ def get_public_availability(
             professional_id=professional.id,
             service_id=service_id,
             target_date=target_date,
+            earliest_start=earliest_start,
+            latest_start=latest_start,
         ):
             merged.setdefault(slot.start_at, slot)
     return sorted(merged.values(), key=lambda s: s.start_at)

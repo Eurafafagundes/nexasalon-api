@@ -12,9 +12,9 @@ from sqlalchemy import select, text
 from nexasalon_api.cli import bootstrap_owner
 from nexasalon_api.core.config import settings
 from nexasalon_api.core.db import SessionLocal
+from nexasalon_api.models.enums import MembershipStatus
 from nexasalon_api.models.identity import OrganizationMembership, User
 from nexasalon_api.models.organization import Branch, Organization
-from nexasalon_api.models.enums import MembershipStatus
 
 _ORG_ID_RE = re.compile(r"organization_id:\s*([0-9a-fA-F-]{36})")
 
@@ -79,6 +79,51 @@ def test_bootstrap_cria_organization_branch_user_membership_owner(monkeypatch, c
         assert membership.status == MembershipStatus.ACTIVE
         assert membership.role.name == "OWNER"
         assert membership.role.organization_id is None  # role de sistema, não fabricado
+
+
+def test_bootstrap_normaliza_slug_com_espacos_maiusculas_e_acentos(monkeypatch, capsys):
+    """Item "Agendamento Online — slug": o único caminho de CRIAÇÃO de
+    organização (não existe rota HTTP de criação, só este CLI) gravava o
+    slug cru digitado, sem passar pela mesma `normalize_slug` já usada no
+    PATCH (`OrganizationUpdate`). Ex.: "Mega Hair Studio" tinha que virar
+    "mega-hair-studio" — nunca ficar com espaço/maiúscula/acento."""
+    org_id_suffix = uuid.uuid4().hex[:8]
+    raw_org_slug = f"Mega Hair Studio {org_id_suffix}"
+    raw_branch_slug = "Unidade Ãgua Fresca"
+    owner_email = f"owner-normaliza-{org_id_suffix}@example.com"
+
+    exit_code = _run_bootstrap(
+        monkeypatch, org_slug=raw_org_slug, branch_slug=raw_branch_slug, owner_email=owner_email
+    )
+    assert exit_code == 0
+
+    printed = capsys.readouterr().out
+    match = _ORG_ID_RE.search(printed)
+    assert match, f"organization_id não encontrado na saída do CLI: {printed!r}"
+    org_id = match.group(1)
+
+    expected_org_slug = f"mega-hair-studio-{org_id_suffix}"
+    expected_branch_slug = "unidade-agua-fresca"
+    assert "normalizado para" in printed
+
+    with _scoped_session(org_id) as session:
+        organization = session.execute(select(Organization).where(Organization.id == uuid.UUID(org_id))).scalar_one()
+        assert organization.slug == expected_org_slug
+        branch = session.execute(select(Branch).where(Branch.organization_id == organization.id)).scalar_one()
+        assert branch.slug == expected_branch_slug
+
+
+def test_bootstrap_recusa_slug_que_normaliza_para_vazio(monkeypatch):
+    """Guarda-costas simétrico: um slug feito só de caracteres inválidos
+    (ex.: "!!!") normaliza para string vazia — o CLI precisa abortar em
+    vez de criar uma organização com slug vazio/ambíguo."""
+    exit_code = _run_bootstrap(
+        monkeypatch,
+        org_slug="!!!",
+        branch_slug="matriz",
+        owner_email=f"owner-vazio-{uuid.uuid4().hex[:8]}@example.com",
+    )
+    assert exit_code == 1
 
 
 def test_bootstrap_recusa_slug_duplicado(monkeypatch):

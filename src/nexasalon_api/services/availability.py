@@ -136,7 +136,20 @@ def compute_availability(
     service_id: uuid.UUID,
     target_date: date_type,
     slot_minutes: int = 15,
+    earliest_start: datetime | None = None,
+    latest_start: datetime | None = None,
 ) -> list[AvailabilitySlot]:
+    """`earliest_start`/`latest_start` (ambos `None` por padrão — sem
+    nenhuma restrição extra, comportamento IDÊNTICO ao de antes desta
+    correção) recortam os slots retornados por horário de início. Só o
+    Agendamento Online público passa esses dois parâmetros hoje
+    (`services/public_booking.py::get_public_availability`) — "nunca
+    retornar data/horário passado, nem violar a antecedência mín/máx
+    configurada" (item de correção). A Agenda interna continua sem
+    nenhuma restrição de "agora"/antecedência aqui (a recepção pode
+    legitimamente agendar num horário que já passou, ex. registrar um
+    atendimento feito sem hora marcada — essa é uma decisão de produto
+    já existente, não alterada por esta correção)."""
     if slot_minutes not in ALLOWED_SLOT_MINUTES:
         raise ValidationDomainError("slot_minutes deve ser 15 ou 30.")
 
@@ -185,4 +198,9 @@ def compute_availability(
         busy.append((block.start_at, block.end_at))
 
     free_intervals = _subtract_busy(windows, busy)
-    return _generate_slots(free_intervals, duration_minutes, slot_minutes, tz)
+    slots = _generate_slots(free_intervals, duration_minutes, slot_minutes, tz)
+    if earliest_start is not None:
+        slots = [s for s in slots if s.start_at >= earliest_start]
+    if latest_start is not None:
+        slots = [s for s in slots if s.start_at <= latest_start]
+    return slots
