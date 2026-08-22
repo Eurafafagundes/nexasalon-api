@@ -162,7 +162,8 @@ def test_estabelecimento_fechado_bloqueia_criacao_de_agendamento_interno():
     mesmo com a jornada do profissional cobrindo o dia inteiro. Direto
     no service layer, mesma abordagem de `test_appointments.py`."""
     import uuid as uuid_mod
-    from datetime import date as date_type, time as time_of_day
+    from datetime import date as date_type
+    from datetime import time as time_of_day
     from datetime import timezone as tz_type
 
     from sqlalchemy import text as sa_text
@@ -172,10 +173,17 @@ def test_estabelecimento_fechado_bloqueia_criacao_de_agendamento_interno():
     from nexasalon_api.core.exceptions import ValidationDomainError as VDE
     from nexasalon_api.models.client import Client as ClientModel
     from nexasalon_api.models.identity import User as UserModel
-    from nexasalon_api.models.organization import BusinessHours, Branch as BranchModel, Organization as OrgModel
-    from nexasalon_api.models.professional import Professional as ProfessionalModel, WorkingHours as WHModel
-    from nexasalon_api.models.service import ProfessionalService as PSModel, Service as ServiceModel
-    from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate
+    from nexasalon_api.models.organization import Branch as BranchModel
+    from nexasalon_api.models.organization import BusinessHours
+    from nexasalon_api.models.organization import Organization as OrgModel
+    from nexasalon_api.models.professional import Professional as ProfessionalModel
+    from nexasalon_api.models.professional import WorkingHours as WHModel
+    from nexasalon_api.models.service import ProfessionalService as PSModel
+    from nexasalon_api.models.service import Service as ServiceModel
+    from nexasalon_api.schemas.appointment import (
+        AppointmentCreate,
+        AppointmentItemCreate,
+    )
     from nexasalon_api.services import appointments as appointments_service
 
     org_id = uuid_mod.uuid4()
@@ -292,6 +300,89 @@ def test_mesmo_dia_ligado_oferece_horario_hoje_respeitando_antecedencia(client_a
     )
     assert resp.status_code == 200, resp.text
     assert len(resp.json()) > 0
+
+
+# ---------------------------------------------------------------------
+# Testes de regressão — "Nenhum horário disponível nesta data" pra
+# QUALQUER data, reportado logo após a Etapa M. Cobre exatamente os
+# pontos pedidos: configuração ausente = sem restrição, empresa aberta
+# retorna slots, empresa fechada retorna zero, "mesmo dia" nunca
+# bloqueia datas futuras, e timezone não desloca o dia da semana.
+# ---------------------------------------------------------------------
+
+
+def test_regressao_organizacao_sem_nenhuma_configuracao_extra_continua_oferecendo_horarios(client_as, org_a_actor):
+    """O cenário mais comum e mais crítico: organização recém-habilitada
+    pro Agendamento Online, SEM jamais ter aberto a tela de "Horário de
+    funcionamento" (0 linhas em `business_hours`) e com as regras de
+    agendamento no padrão de fábrica (`same_day` ligado, jornada normal
+    do profissional). Isto tem que continuar oferecendo horários
+    normalmente — é exatamente o caso que regrediu."""
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c)  # min_lead=0, max_lead=3650, same_day não é enviado (fica no default=True)
+    c.post("/api/v1/branches", json={"name": "Matriz", "slug": f"matriz-{uuid.uuid4().hex[:8]}"})
+    svc = c.post(
+        "/api/v1/services", json={"name": "Corte", "default_duration_minutes": 60, "default_price": "100.00"}
+    ).json()
+    prof = c.post("/api/v1/professionals", json={"name": "Profissional"}).json()
+    c.put(f"/api/v1/professionals/{prof['id']}/services", json={"items": [{"service_id": svc["id"]}]})
+    # jornada REALISTA (não 00:00-23:59) — segunda a sábado, 09h-18h.
+    c.put(
+        f"/api/v1/professionals/{prof['id']}/working-hours",
+        json={"items": [{"weekday": w, "start_time": "09:00:00", "end_time": "18:00:00"} for w in range(1, 7)]},
+    )
+    tuesday = _next_date_for_weekday(2)
+
+    resp = c.get(
+        f"/api/v1/public/booking/{org['slug']}/availability",
+        params={"service_id": svc["id"], "professional_id": prof["id"], "date": tuesday.isoformat()},
+    )
+    assert resp.status_code == 200, resp.text
+    slots = resp.json()
+    assert len(slots) > 0, "REGRESSAO: disponibilidade vazia mesmo sem nenhuma configuracao extra"
+
+
+def test_mesmo_dia_desligado_nao_bloqueia_datas_futuras(client_as, org_a_actor):
+    """"same_day" só recorta HOJE — nunca deve derrubar a disponibilidade
+    de dias futuros (item explícito de regressão a cobrir)."""
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c, online_booking_same_day_enabled=False, online_booking_min_lead_minutes=0)
+    _branch, prof, svc = _setup_service_and_professional(c)
+    future_date = (datetime.now(timezone.utc) + timedelta(days=6)).date()
+
+    resp = c.get(
+        f"/api/v1/public/booking/{org['slug']}/availability",
+        params={"service_id": svc["id"], "professional_id": prof["id"], "date": future_date.isoformat()},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()) > 0, "REGRESSAO: same_day=False bloqueando uma data futura, nao so hoje"
+
+
+def test_timezone_nao_desloca_dia_da_semana_na_disponibilidade(client_as, org_a_actor):
+    """Organização num fuso bem distante de UTC (`America/Los_Angeles`,
+    UTC-7/-8) — a conversão de weekday (`(date.weekday()+1)%7`) usa o
+    `target_date` local recebido na query, não `datetime.now()`, então
+    não pode deslocar de dia por causa do fuso."""
+    c = client_as(org_a_actor)
+    c.put("/api/v1/organization", json={"timezone": "America/Los_Angeles"})
+    org = _enable_online_booking(c)
+    _branch, prof, svc = _setup_service_and_professional(c)
+    _set_business_hours(c, closed_weekdays={1})  # segunda fechada
+    monday = _next_date_for_weekday(1)
+    tuesday = _next_date_for_weekday(2)
+
+    resp_monday = c.get(
+        f"/api/v1/public/booking/{org['slug']}/availability",
+        params={"service_id": svc["id"], "professional_id": prof["id"], "date": monday.isoformat()},
+    )
+    resp_tuesday = c.get(
+        f"/api/v1/public/booking/{org['slug']}/availability",
+        params={"service_id": svc["id"], "professional_id": prof["id"], "date": tuesday.isoformat()},
+    )
+    assert resp_monday.status_code == 200, resp_monday.text
+    assert resp_tuesday.status_code == 200, resp_tuesday.text
+    assert resp_monday.json() == [], "REGRESSAO: fuso deslocou o dia — segunda deveria continuar fechada"
+    assert len(resp_tuesday.json()) > 0, "terça (aberta) precisa continuar oferecendo horarios"
 
 
 # ---------------------------------------------------------------------
