@@ -11,3 +11,6 @@ __pycache__/
 *.pem
 *.key
 *.sqlite3
+
+# VS Code local
+.vscode/
