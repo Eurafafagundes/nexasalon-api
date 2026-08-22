@@ -13,9 +13,8 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
-from nexasalon_api.core.normalize import normalize_phone
 from nexasalon_api.models.enums import AppointmentStatus
 
 
@@ -60,17 +59,19 @@ class PublicAvailabilitySlotRead(BaseModel):
 class PublicBookingCreate(BaseModel):
     """`professional_id=None` = "Qualquer profissional" (item explícito
     do pedido) — resolvido no backend, nunca escolhido às cegas pelo
-    cliente. Dados da cliente: só nome + WhatsApp obrigatórios, e-mail
-    opcional — "não pedir CPF/endereço/etc.", item explícito do pedido.
-    `force_overlap` de propósito NÃO EXISTE neste schema — o fluxo
-    público nunca oferece encaixe forçado."""
+    cliente. `force_overlap` de propósito NÃO EXISTE neste schema — o
+    fluxo público nunca oferece encaixe forçado.
+
+    Etapa L, Bloco 4/5 — evolução do fluxo: "Dados" virou "Identificação"
+    (login/conta obrigatórios, ver `api/v1/public_booking.py::create_booking`,
+    que agora exige `get_current_customer`). Os dados da cliente
+    (nome/telefone/e-mail) NÃO vêm mais neste payload — vêm da
+    `CustomerAccount` autenticada, resolvida/vinculada ao `Client` da
+    organização por `services/customer_accounts.py` (Bloco 8)."""
 
     service_id: uuid.UUID
     professional_id: uuid.UUID | None = None
     start_at: datetime
-    client_name: str = Field(min_length=1, max_length=255)
-    client_phone: str = Field(min_length=8, max_length=32)
-    client_email: str | None = Field(default=None, max_length=255)
 
     @field_validator("start_at")
     @classmethod
@@ -78,21 +79,6 @@ class PublicBookingCreate(BaseModel):
         if value.tzinfo is None:
             raise ValueError("start_at deve incluir informação de fuso horário (ISO 8601 com offset).")
         return value
-
-    @field_validator("client_phone", mode="after")
-    @classmethod
-    def _normalize_phone(cls, value: str) -> str:
-        normalized = normalize_phone(value)
-        if len(normalized) < 8:
-            raise ValueError("WhatsApp/telefone inválido.")
-        return normalized
-
-    @field_validator("client_email", mode="after")
-    @classmethod
-    def _strip_empty_email(cls, value: str | None) -> str | None:
-        if value is None or not value.strip():
-            return None
-        return value.strip()
 
 
 class PublicBookingRead(BaseModel):

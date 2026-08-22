@@ -9,6 +9,7 @@ from . import (
     cash_register_config,
     cash_registers,
     clients,
+    customer_auth,
     dashboard,
     extract,
     inventory_counts,
@@ -48,3 +49,4 @@ api_v1_router.include_router(products.router)
 api_v1_router.include_router(stock.router)
 api_v1_router.include_router(inventory_counts.router)
 api_v1_router.include_router(public_booking.router)
+api_v1_router.include_router(customer_auth.router)

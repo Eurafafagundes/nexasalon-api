@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from datetime import time as time_of_day
 
 import pytest
 from fastapi.testclient import TestClient
@@ -80,6 +81,31 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+def _register_customer(p, *, name: str = "Cliente Teste", phone: str = "61999990000", email: str | None = None) -> str:
+    """Etapa L, Blocos 5/9 — "Identificação" agora é uma `CustomerAccount`
+    de verdade: cria uma conta manual (nome/WhatsApp/e-mail/senha, nunca
+    CPF/endereço) e devolve o `access_token` pronto pra autenticar a
+    confirmação (`POST /public/booking/{slug}`, que agora exige
+    `get_current_customer`)."""
+    email = email or f"cliente-{uuid.uuid4().hex[:10]}@example.com"
+    resp = p.post(
+        "/api/v1/customer-auth/register",
+        json={
+            "name": name,
+            "email": email,
+            "phone": phone,
+            "password": "Senha123!",
+            "password_confirm": "Senha123!",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["access_token"]
+
+
+def _auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
 # ---------------------------------------------------------------------
 # Fluxo feliz
 # ---------------------------------------------------------------------
@@ -114,21 +140,22 @@ def test_fluxo_completo_ate_confirmacao(client_as, org_a_actor):
     assert len(availability.json()) > 0
     start_at = availability.json()[0]["start_at"]
 
+    # Etapa L, Bloco 5/9 — "Identificação" agora é criar/usar uma
+    # CustomerAccount antes de confirmar (nunca mais nome/telefone soltos
+    # no corpo do POST de confirmação).
+    token = _register_customer(p, name="Maria Cliente", phone="(61) 99999-1234")
+
     booking = p.post(
         f"/api/v1/public/booking/{slug}",
-        json={
-            "service_id": svc["id"],
-            "professional_id": prof["id"],
-            "start_at": start_at,
-            "client_name": "Maria Cliente",
-            "client_phone": "(61) 99999-1234",
-        },
+        json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at},
+        headers=_auth(token),
     )
     assert booking.status_code == 201, booking.text
     body = booking.json()
     assert body["status"] == "confirmed"  # online_booking_auto_confirm=true
 
-    # Lado interno: origem PUBLIC_BOOKING, cliente criado só com nome/telefone.
+    # Lado interno: origem PUBLIC_BOOKING, cliente resolvido/criado pela
+    # CustomerAccount (Bloco 8) só com nome/telefone.
     appt = c.get(f"/api/v1/appointments/{body['id']}").json()
     assert appt["source"] == "public_booking"
 
@@ -140,6 +167,13 @@ def test_fluxo_completo_ate_confirmacao(client_as, org_a_actor):
 
 
 def test_cliente_existente_pelo_telefone_nao_duplica_cadastro(client_as, org_a_actor):
+    """Etapa L, Bloco 8 — agora o cenário real é: um `Client` já existe
+    (ex.: atendido presencialmente) com um telefone; uma `CustomerAccount`
+    nova se cadastra com esse MESMO telefone e reserva — a resolução deve
+    encontrar a ficha existente pelo telefone (passo 2 do Bloco 8), nunca
+    criar uma duplicata. A segunda reserva da MESMA conta reusa o vínculo
+    já gravado (passo 1), reforçando que nenhuma reserva extra cria outro
+    `Client`."""
     c = client_as(org_a_actor)
     org = _enable_online_booking(c)
     _branch, professionals, svc = _setup_service_and_professional(c)
@@ -147,25 +181,25 @@ def test_cliente_existente_pelo_telefone_nao_duplica_cadastro(client_as, org_a_a
     p = _public()
     slug = org["slug"]
 
-    base = datetime.now(timezone.utc) + timedelta(days=11)
+    existing_client = c.post("/api/v1/clients", json={"name": "João Repetido", "phone": "61988887777"}).json()
     clients_before = len(c.get("/api/v1/clients").json())
 
+    token = _register_customer(p, name="João Repetido", phone="61988887777")
+
+    base = datetime.now(timezone.utc) + timedelta(days=11)
     for hour_offset in (0, 2):
         start_at = _iso(base.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(hours=hour_offset))
         resp = p.post(
             f"/api/v1/public/booking/{slug}",
-            json={
-                "service_id": svc["id"],
-                "professional_id": prof["id"],
-                "start_at": start_at,
-                "client_name": "João Repetido",
-                "client_phone": "61988887777",
-            },
+            json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at},
+            headers=_auth(token),
         )
         assert resp.status_code == 201, resp.text
+        appt = c.get(f"/api/v1/appointments/{resp.json()['id']}").json()
+        assert appt["client_id"] == existing_client["id"]
 
     clients_after = c.get("/api/v1/clients").json()
-    assert len(clients_after) == clients_before + 1  # um único cliente novo, não dois
+    assert len(clients_after) == clients_before  # nenhum cliente novo criado (nem por telefone, nem por repetição)
 
 
 def test_pagina_desativada_retorna_404(client_as, org_a_actor):
@@ -204,20 +238,64 @@ def test_qualquer_profissional_resolve_um_elegivel_automaticamente(client_as, or
     assert len(availability.json()) > 0
     start_at = availability.json()[0]["start_at"]
 
+    token = _register_customer(p, name="Cliente Sem Preferência", phone="61977776666")
     booking = p.post(
         f"/api/v1/public/booking/{slug}",
-        json={
-            "service_id": svc["id"],
-            "professional_id": None,
-            "start_at": start_at,
-            "client_name": "Cliente Sem Preferência",
-            "client_phone": "61977776666",
-        },
+        json={"service_id": svc["id"], "professional_id": None, "start_at": start_at},
+        headers=_auth(token),
     )
     assert booking.status_code == 201, booking.text
     appt = c.get(f"/api/v1/appointments/{booking.json()['id']}").json()
     assigned = appt["items"][0]["professional_id"]
     assert assigned in {p["id"] for p in professionals}
+
+
+# ---------------------------------------------------------------------
+# Etapa L, Bloco 2/6 — bloqueio de agenda respeitado pelo Agendamento
+# Online (mesmo motor de disponibilidade da Agenda interna, nenhuma
+# lógica nova — só confirma que a correção do Bloco 2 não deixou um
+# buraco na listagem/confirmação pública).
+# ---------------------------------------------------------------------
+
+
+def test_bloqueio_de_agenda_e_respeitado_pelo_agendamento_online(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c)
+    _branch, professionals, svc = _setup_service_and_professional(c)
+    prof = professionals[0]
+
+    blocked_date = (datetime.now(timezone.utc) + timedelta(days=16)).date()
+    block_start = datetime.combine(blocked_date, time_of_day(0, 0), tzinfo=_TZ)
+    block_end = datetime.combine(blocked_date, time_of_day(23, 59), tzinfo=_TZ)
+    resp = c.post(
+        "/api/v1/schedule-blocks",
+        json={
+            "scope": "professional", "professional_id": prof["id"],
+            "block_type": "other", "title": "Bloqueio total do dia",
+            "start_at": _iso(block_start), "end_at": _iso(block_end),
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    p = _public()
+    slug = org["slug"]
+    availability = p.get(
+        f"/api/v1/public/booking/{slug}/availability",
+        params={"service_id": svc["id"], "professional_id": prof["id"], "date": blocked_date.isoformat()},
+    )
+    assert availability.status_code == 200, availability.text
+    assert availability.json() == []
+
+    token = _register_customer(p, name="Cliente Bloqueada", phone="61900004444")
+    booking = p.post(
+        f"/api/v1/public/booking/{slug}",
+        json={
+            "service_id": svc["id"], "professional_id": prof["id"],
+            "start_at": _iso(block_start.replace(hour=10, minute=0)),
+        },
+        headers=_auth(token),
+    )
+    assert booking.status_code in (409, 422), booking.text
 
 
 # ---------------------------------------------------------------------
@@ -236,18 +314,14 @@ def test_segunda_reserva_do_mesmo_horario_recebe_409(client_as, org_a_actor):
         (datetime.now(timezone.utc) + timedelta(days=13)).replace(hour=10, minute=0, second=0, microsecond=0)
     )
 
-    payload = {
-        "service_id": svc["id"],
-        "professional_id": prof["id"],
-        "start_at": start_at,
-        "client_name": "Primeira Cliente",
-        "client_phone": "61911112222",
-    }
-    first = p.post(f"/api/v1/public/booking/{slug}", json=payload)
+    payload = {"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at}
+
+    token1 = _register_customer(p, name="Primeira Cliente", phone="61911112222")
+    first = p.post(f"/api/v1/public/booking/{slug}", json=payload, headers=_auth(token1))
     assert first.status_code == 201, first.text
 
-    second_payload = {**payload, "client_name": "Segunda Cliente", "client_phone": "61933334444"}
-    second = p.post(f"/api/v1/public/booking/{slug}", json=second_payload)
+    token2 = _register_customer(p, name="Segunda Cliente", phone="61933334444")
+    second = p.post(f"/api/v1/public/booking/{slug}", json=payload, headers=_auth(token2))
     assert second.status_code == 409, second.text
 
 
@@ -333,12 +407,11 @@ def test_antecedencia_minima_rejeita_horario_muito_proximo(client_as, org_a_acto
     prof = professionals[0]
     p = _public()
     start_at = _iso(datetime.now(timezone.utc) + timedelta(hours=1))
+    token = _register_customer(p, name="Cliente Apressada", phone="61900001111")
     resp = p.post(
         f"/api/v1/public/booking/{org['slug']}",
-        json={
-            "service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at,
-            "client_name": "Cliente Apressada", "client_phone": "61900001111",
-        },
+        json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at},
+        headers=_auth(token),
     )
     assert resp.status_code == 422, resp.text
 
@@ -352,12 +425,11 @@ def test_antecedencia_maxima_rejeita_horario_muito_distante(client_as, org_a_act
     start_at = _iso(
         (datetime.now(timezone.utc) + timedelta(days=30)).replace(hour=9, minute=0, second=0, microsecond=0)
     )
+    token = _register_customer(p, name="Cliente Ansiosa", phone="61900002222")
     resp = p.post(
         f"/api/v1/public/booking/{org['slug']}",
-        json={
-            "service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at,
-            "client_name": "Cliente Ansiosa", "client_phone": "61900002222",
-        },
+        json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at},
+        headers=_auth(token),
     )
     assert resp.status_code == 422, resp.text
 
@@ -432,12 +504,11 @@ def test_servico_desabilitado_para_online_nao_aparece_nem_aceita_reserva(client_
     start_at = _iso(
         (datetime.now(timezone.utc) + timedelta(days=15)).replace(hour=9, minute=0, second=0, microsecond=0)
     )
+    token = _register_customer(p, name="Cliente X", phone="61900003333")
     resp = p.post(
         f"/api/v1/public/booking/{org['slug']}",
-        json={
-            "service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at,
-            "client_name": "Cliente X", "client_phone": "61900003333",
-        },
+        json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at},
+        headers=_auth(token),
     )
     assert resp.status_code == 422, resp.text
 
@@ -543,15 +614,11 @@ def test_origem_public_booking_aparece_na_listagem_da_agenda(client_as, org_a_ac
         },
     ).json()
     public_slot = next(slot for slot in availability if slot["start_at"] != _iso(internal_start))
+    token = _register_customer(p, name="Maria Cliente", phone="(61) 99999-1234")
     booking = p.post(
         f"/api/v1/public/booking/{slug}",
-        json={
-            "service_id": svc["id"],
-            "professional_id": prof["id"],
-            "start_at": public_slot["start_at"],
-            "client_name": "Maria Cliente",
-            "client_phone": "(61) 99999-1234",
-        },
+        json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": public_slot["start_at"]},
+        headers=_auth(token),
     )
     assert booking.status_code == 201, booking.text
     public_appointment_id = booking.json()["id"]

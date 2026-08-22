@@ -563,14 +563,110 @@ def create_public_appointment(
         session, organization_id, name=client_name, phone=normalize_phone(client_phone), email=client_email
     )
 
-    item_in = AppointmentItemCreate(
-        professional_id=resolved_professional_id, service_id=service_id, start_at=start_at
+    return _finalize_public_appointment(
+        session,
+        organization,
+        branch_id=branch_id,
+        professional_id=resolved_professional_id,
+        service_id=service_id,
+        start_at=start_at,
+        client_id=client_id,
     )
+
+
+def create_public_appointment_for_customer(
+    session: Session,
+    organization: Organization,
+    *,
+    branch_id: uuid.UUID,
+    professional_id: uuid.UUID | None,
+    service_id: uuid.UUID,
+    start_at: datetime,
+    client_id: uuid.UUID,
+) -> Appointment:
+    """Etapa L, Blocos 4/5/8 — evolução do fluxo público: a "Identificação"
+    do pedido original virou um GATE de autenticação (`get_current_customer`,
+    ver `api/v1/public_booking.py`), então esta função já recebe o
+    `client_id` PRONTO (resolvido por
+    `services/customer_accounts.py::resolve_client_for_customer_account`,
+    o passo a passo do Bloco 8 — reusar o mesmo `Client` sempre) em vez de
+    nome/telefone/e-mail avulsos. Todo o resto (validação de
+    serviço/profissional, antecedência, resolução de "qualquer
+    profissional", conflito transacional) é EXATAMENTE o mesmo motor de
+    `create_public_appointment` — não uma segunda lógica de agenda."""
+    organization_id = organization.id
+
+    service = service_repo.get(session, organization_id, service_id)
+    if service is None or not service.is_active or not service.allow_online_booking:
+        raise ValidationDomainError("Este serviço não está disponível para agendamento online.")
+
+    if professional_id is not None:
+        professional = professional_repo.get(session, organization_id, professional_id)
+        if professional is None or not professional.is_active or not professional.allow_online_booking:
+            raise ValidationDomainError("Este profissional não está disponível para agendamento online.")
+        eligible_professional_ids = [professional_id]
+    else:
+        links = professional_service_repo.list_for_service(session, organization_id, service_id)
+        linked_ids = {link.professional_id for link in links if link.is_active}
+        eligible_professional_ids = [
+            p.id
+            for p in professional_repo.list_all(session, organization_id)
+            if p.id in linked_ids and p.allow_online_booking
+        ]
+        if not eligible_professional_ids:
+            raise ValidationDomainError("Nenhum profissional disponível para este serviço no momento.")
+
+    _assert_online_booking_lead_time(organization, start_at)
+    if not branch_repo.exists(session, organization_id, branch_id):
+        raise NotFoundError("Unidade não encontrada.")
+
+    resolved_professional_id = (
+        professional_id
+        if professional_id is not None
+        else resolve_public_professional_for_slot(
+            session,
+            organization_id,
+            branch_id=branch_id,
+            service_id=service_id,
+            start_at=start_at,
+            eligible_professional_ids=eligible_professional_ids,
+        )
+    )
+
+    return _finalize_public_appointment(
+        session,
+        organization,
+        branch_id=branch_id,
+        professional_id=resolved_professional_id,
+        service_id=service_id,
+        start_at=start_at,
+        client_id=client_id,
+    )
+
+
+def _finalize_public_appointment(
+    session: Session,
+    organization: Organization,
+    *,
+    branch_id: uuid.UUID,
+    professional_id: uuid.UUID,
+    service_id: uuid.UUID,
+    start_at: datetime,
+    client_id: uuid.UUID,
+) -> Appointment:
+    """Parte final COMPARTILHADA por `create_public_appointment` (fluxo
+    legado/anônimo, mantido só para não quebrar quem ainda chama a
+    função diretamente — a ROTA pública não usa mais este caminho, ver
+    Bloco 5) e `create_public_appointment_for_customer` (fluxo atual, com
+    conta obrigatória) — monta o snapshot do item, aplica a MESMA
+    checagem de conflito transacional, grava o Appointment e o AuditLog.
+    Nunca oferece `force_overlap` (o fluxo público nunca oferece encaixe
+    forçado)."""
+    organization_id = organization.id
+    item_in = AppointmentItemCreate(professional_id=professional_id, service_id=service_id, start_at=start_at)
     snapshots = _build_all_item_snapshots(
         session, organization_id, branch_id, [item_in], exclude_appointment_id=None
     )
-    # Fluxo público nunca oferece force_overlap — qualquer conflito real
-    # vira 409 direto, sem exceção.
     _apply_conflict_policy(snapshots, effective_force_overlap=False)
 
     appointment = appointment_repo.create(

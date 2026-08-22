@@ -9,10 +9,16 @@ from datetime import date as date_type
 from fastapi import APIRouter, Depends, Query, Request
 
 from nexasalon_api.api.deps import (
+    CustomerActor,
     PublicBookingContext,
+    get_current_customer,
     get_public_context,
     rate_limit_public_booking_create,
 )
+from nexasalon_api.core.config import settings
+from nexasalon_api.core.exceptions import UnauthorizedError
+from nexasalon_api.repositories import customer_account_repo
+from nexasalon_api.schemas.customer_account import PublicMyAppointmentRead
 from nexasalon_api.schemas.public_booking import (
     PublicAvailabilitySlotRead,
     PublicBookingCreate,
@@ -22,6 +28,7 @@ from nexasalon_api.schemas.public_booking import (
     PublicServiceRead,
 )
 from nexasalon_api.services import appointments as appointments_service
+from nexasalon_api.services import customer_accounts as customer_accounts_service
 from nexasalon_api.services import public_booking as public_booking_service
 
 router = APIRouter(prefix="/public/booking/{organization_slug}", tags=["public-booking"])
@@ -81,20 +88,58 @@ def create_booking(
     payload: PublicBookingCreate,
     request: Request,
     ctx: PublicBookingContext = Depends(get_public_context),
+    customer: CustomerActor = Depends(get_current_customer),
 ) -> PublicBookingRead:
+    """Etapa L, Blocos 4/5/8/11 — "Identificação" agora é um GATE de
+    autenticação: só uma `CustomerAccount` válida (Bloco 9) confirma um
+    agendamento, nunca mais um nome/telefone soltos no corpo da
+    requisição (ver docstring de `PublicBookingCreate`). O `Client`
+    usado é sempre resolvido/reaproveitado pela mesma conta na mesma
+    organização (Bloco 8) — nunca um cadastro novo a cada reserva."""
     rate_limit_public_booking_create(request)
+    account = customer_account_repo.get(ctx.session, customer.customer_account_id)
+    if account is None or not account.is_active:
+        raise UnauthorizedError("Conta inválida ou inativa.")
+
+    client_id = customer_accounts_service.resolve_client_for_customer_account(
+        ctx.session, ctx.organization, account
+    )
+    # Bloco 11 — anti-fake: teto de agendamentos FUTUROS ativos por
+    # conta, checado ANTES de tentar reservar (nunca depois — não faz
+    # sentido gastar o trabalho de resolver profissional/conflito só
+    # pra rejeitar no fim).
+    customer_accounts_service.assert_can_book_more(
+        ctx.session,
+        ctx.organization.id,
+        client_id,
+        limit=settings.max_active_future_appointments_per_customer,
+    )
+
     branch = public_booking_service.get_default_branch(ctx.session, ctx.organization.id)
-    appointment = appointments_service.create_public_appointment(
+    appointment = appointments_service.create_public_appointment_for_customer(
         ctx.session,
         ctx.organization,
         branch_id=branch.id,
         professional_id=payload.professional_id,
         service_id=payload.service_id,
         start_at=payload.start_at,
-        client_name=payload.client_name,
-        client_phone=payload.client_phone,
-        client_email=payload.client_email,
+        client_id=client_id,
     )
     return PublicBookingRead(
         id=appointment.id, status=appointment.status, starts_at=appointment.starts_at, ends_at=appointment.ends_at
     )
+
+
+@router.get(
+    "/me/appointments",
+    response_model=list[PublicMyAppointmentRead],
+    summary="Meus agendamentos (Bloco 10) — só os da CustomerAccount autenticada, nesta organização",
+)
+def list_my_appointments(
+    ctx: PublicBookingContext = Depends(get_public_context),
+    customer: CustomerActor = Depends(get_current_customer),
+) -> list[PublicMyAppointmentRead]:
+    account = customer_account_repo.get(ctx.session, customer.customer_account_id)
+    if account is None or not account.is_active:
+        raise UnauthorizedError("Conta inválida ou inativa.")
+    return customer_accounts_service.list_my_appointments(ctx.session, ctx.organization, account)

@@ -14,6 +14,7 @@ from .agenda_access import MembershipAgendaGrant  # noqa: F401
 from .professional import Professional, WorkingHours, ScheduleBlock  # noqa: F401
 from .service import Service, ServiceCategory, ProfessionalService  # noqa: F401
 from .client import Client  # noqa: F401
+from .customer_account import CustomerAccount, CustomerAccountLink, CustomerRefreshToken  # noqa: F401
 from .appointment import Recurrence, Appointment, AppointmentItem  # noqa: F401
 from .appointment_status_style import AppointmentStatusStyle  # noqa: F401
 from .cash_register import CashRegister, CashMovement  # noqa: F401
@@ -43,6 +44,9 @@ __all__ = [
     "ServiceCategory",
     "ProfessionalService",
     "Client",
+    "CustomerAccount",
+    "CustomerAccountLink",
+    "CustomerRefreshToken",
     "Recurrence",
     "Appointment",
     "AppointmentItem",

@@ -7,17 +7,26 @@ import uuid
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
-from nexasalon_api.api.deps import get_db, require_permission
+from nexasalon_api.api.deps import get_db, require_any_permission, require_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.repositories import professional_service_repo
 from nexasalon_api.schemas.professional import ProfessionalServiceRead
-from nexasalon_api.schemas.service import ServiceCreate, ServiceRead, ServiceUpdate
+from nexasalon_api.schemas.service import (
+    ServiceCreate,
+    ServiceLookupRead,
+    ServiceRead,
+    ServiceUpdate,
+)
 from nexasalon_api.services import catalog
 
 router = APIRouter(prefix="/services", tags=["services"])
 
 _view = require_permission("services.view")
 _manage = require_permission("services.manage")
+# Etapa L, Bloco 1 — mesmo raciocínio de `api/v1/clients.py::_lookup`:
+# selecionar um serviço já cadastrado dentro de Agenda/Comanda não deveria
+# exigir a permissão AMPLA de administração do catálogo.
+_lookup = require_any_permission("services.view", "services.lookup")
 
 
 @router.get("", response_model=list[ServiceRead], summary="Listar serviços")
@@ -28,6 +37,19 @@ def list_services(
 ) -> list[ServiceRead]:
     services = catalog.list_services(session, actor.organization_id, include_inactive)
     return [ServiceRead.model_validate(s) for s in services]
+
+
+@router.get(
+    "/lookup",
+    response_model=list[ServiceLookupRead],
+    summary="Pesquisar/selecionar serviço ativo em fluxos operacionais (Agenda/Comanda) — Etapa L, Bloco 1",
+)
+def lookup_services(
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_lookup),
+) -> list[ServiceLookupRead]:
+    services = catalog.list_services(session, actor.organization_id, include_inactive=False)
+    return [ServiceLookupRead.model_validate(s) for s in services]
 
 
 @router.post("", response_model=ServiceRead, status_code=status.HTTP_201_CREATED, summary="Criar serviço")

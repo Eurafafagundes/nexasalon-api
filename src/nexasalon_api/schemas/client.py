@@ -83,6 +83,22 @@ class ClientRead(ClientBase):
     updated_at: datetime
 
 
+class ClientLookupRead(BaseModel):
+    """Etapa L, Bloco 1 — resposta ENXUTA de `GET /clients/lookup`, usada
+    por seletores operacionais (Agenda/Comanda) quando o ator tem
+    `clients.lookup` mas NÃO `clients.view` (não pode abrir Ficha 360°
+    nem listar a base inteira, mas precisa pesquisar/selecionar um
+    cliente já cadastrado). Só o suficiente pra identificar e selecionar
+    — nunca CPF/endereço/observações/histórico."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    phone: str | None
+    whatsapp: str | None
+
+
 class ClientHistory(BaseModel):
     """Resumo (item "Resumo | Histórico | Observações") — tudo derivado
     de `Order`, nunca gravado no `Client` (ver

@@ -66,6 +66,11 @@ os.environ["NEXASALON_DEV_AUTH_ENABLED"] = "true"
 # o cookie de volta, quebrando qualquer teste que dependa dele. Só testes
 # usam isto; o guard de produção em Settings recusa este valor fora daqui.
 os.environ["NEXASALON_REFRESH_COOKIE_SECURE"] = "false"
+# Mesmo raciocínio acima, agora pro cookie de refresh da CLIENTE (ajuste
+# pós-Etapa L, `customer_refresh_cookie_secure` em core/config.py) —
+# tabela/cookie separados do de staff, mas o mesmo problema de TestClient
+# fazer http puro se aplica igual.
+os.environ["NEXASALON_CUSTOMER_REFRESH_COOKIE_SECURE"] = "false"
 
 # só agora é seguro importar qualquer coisa de nexasalon_api.
 import pytest  # noqa: E402

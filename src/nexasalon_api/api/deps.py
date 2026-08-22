@@ -41,6 +41,7 @@ from nexasalon_api.core.security import InvalidTokenError, TokenType, decode_tok
 from nexasalon_api.models.enums import MembershipStatus
 from nexasalon_api.models.organization import Organization
 from nexasalon_api.repositories import (
+    customer_account_repo,
     membership_repo,
     organization_repo,
     professional_repo,
@@ -139,6 +140,97 @@ def get_current_actor(
     if settings.dev_auth_enabled and settings.environment not in ("staging", "production"):
         return get_current_actor_DEV_ONLY()
     return _get_real_current_actor(credentials)
+
+
+@dataclass(frozen=True)
+class CustomerActor:
+    """Quem está autenticado como CLIENTE final (CustomerAccount) —
+    equivalente ao `ActorContext` de funcionário, mas deliberadamente um
+    tipo DIFERENTE (Bloco 7/9: "sessão de cliente separada semanticamente
+    do Actor interno"). Nenhuma rota interna aceita este tipo, e
+    `get_current_customer` nunca aceita um token de funcionário — ver
+    docstring de `TokenType.CUSTOMER_ACCESS` em `core/security.py`."""
+
+    customer_account_id: uuid.UUID
+
+
+def get_current_customer(
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer_scheme),
+) -> CustomerActor:
+    """Dependency das rotas da Conta da Cliente (Bloco 9) — só aceita
+    `type == "customer_access"`. Um token de FUNCIONÁRIO (`type ==
+    "access"`) é rejeitado aqui, e um token de CLIENTE é igualmente
+    rejeitado por `get_current_actor`/`_get_real_current_actor` (que só
+    aceita `type == "access"`) — a separação é garantida nos DOIS
+    sentidos, sem depender de um segredo JWT diferente."""
+    if credentials is None or not credentials.credentials:
+        raise UnauthorizedError("Token de acesso ausente.")
+    try:
+        payload = decode_token(credentials.credentials)
+    except InvalidTokenError as exc:
+        raise UnauthorizedError("Token de acesso inválido ou expirado.") from exc
+    if payload.get("type") != TokenType.CUSTOMER_ACCESS.value:
+        raise UnauthorizedError("Tipo de token inválido para esta operação.")
+    try:
+        customer_account_id = uuid.UUID(payload["sub"])
+    except (KeyError, ValueError) as exc:
+        raise UnauthorizedError("Token de acesso malformado.") from exc
+
+    session = SessionLocal()
+    try:
+        account = customer_account_repo.get(session, customer_account_id)
+        if account is None or not account.is_active:
+            raise UnauthorizedError("Conta inválida ou inativa.")
+    finally:
+        session.close()
+
+    return CustomerActor(customer_account_id=customer_account_id)
+
+
+def get_customer_db() -> Generator[Session, None, None]:
+    """Sessão por request para as rotas de `customer_auth.py` que não
+    dependem de uma Organization (register/login/me) — `customer_accounts`
+    é global e SEM RLS (mesmo padrão de `users`), então não há
+    `app.current_org_id` nenhum pra setar aqui."""
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def rate_limit_customer_register(request: Request) -> None:
+    if not settings.rate_limit_enabled:
+        return
+    rate_limiter.hit(
+        f"customer_register:{_client_ip(request)}",
+        max_attempts=settings.rate_limit_customer_register_max_attempts,
+        window_seconds=settings.rate_limit_customer_register_window_seconds,
+    )
+
+
+def rate_limit_customer_login(request: Request) -> None:
+    if not settings.rate_limit_enabled:
+        return
+    rate_limiter.hit(
+        f"customer_login:{_client_ip(request)}",
+        max_attempts=settings.rate_limit_customer_login_max_attempts,
+        window_seconds=settings.rate_limit_customer_login_window_seconds,
+    )
+
+
+def rate_limit_customer_refresh(request: Request) -> None:
+    if not settings.rate_limit_enabled:
+        return
+    rate_limiter.hit(
+        f"customer_refresh:{_client_ip(request)}",
+        max_attempts=settings.rate_limit_customer_refresh_max_attempts,
+        window_seconds=settings.rate_limit_customer_refresh_window_seconds,
+    )
 
 
 def require_permission(permission_key: str):

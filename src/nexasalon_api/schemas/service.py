@@ -75,6 +75,23 @@ class ServiceBase(BaseModel):
         return self
 
 
+class ServiceLookupRead(BaseModel):
+    """Etapa L, Bloco 1 — resposta ENXUTA de `GET /services/lookup`, para
+    seletores operacionais (Agenda/Comanda) quando o ator tem
+    `services.lookup` mas não `services.view` (não administra o
+    catálogo, só precisa escolher um serviço já cadastrado): nome,
+    duração e preço — o mínimo pra montar um item de agendamento/comanda,
+    nunca campos de configuração administrativa (buffer, depósito,
+    categoria interna etc.)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    default_duration_minutes: int
+    default_price: Decimal
+
+
 class ServiceCreate(ServiceBase):
     pass
 

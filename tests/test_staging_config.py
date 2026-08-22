@@ -11,6 +11,7 @@ from nexasalon_api.core.config import Settings, _INSECURE_DEFAULT_JWT_SECRET
 _SAFE_OVERRIDES = dict(
     jwt_secret="um-segredo-forte-e-unico-soh-para-teste",
     refresh_cookie_secure=True,
+    customer_refresh_cookie_secure=True,
     rate_limit_enabled=True,
     dev_auth_enabled=False,
 )
@@ -46,6 +47,16 @@ def test_recusa_rate_limit_desligado(environment):
 
 
 @pytest.mark.parametrize("environment", ["staging", "production"])
+def test_recusa_cookie_de_refresh_da_cliente_inseguro(environment):
+    """Ajuste pós-Etapa L — mesma trava do cookie de refresh de staff
+    (`test_recusa_cookie_inseguro` acima), agora pro
+    `customer_refresh_cookie_secure` (config próprio, tabela própria,
+    mesma exigência de segurança)."""
+    with pytest.raises(ValidationError, match="CUSTOMER_REFRESH_COOKIE_SECURE"):
+        _settings(environment, customer_refresh_cookie_secure=False)
+
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
 def test_configuracao_segura_sobe_normalmente(environment):
     settings = _settings(environment)
     assert settings.environment == environment
@@ -61,6 +72,7 @@ def test_development_e_test_nao_tem_essas_travas(environment):
         dev_auth_enabled=True,
         jwt_secret=_INSECURE_DEFAULT_JWT_SECRET,
         refresh_cookie_secure=False,
+        customer_refresh_cookie_secure=False,
         rate_limit_enabled=False,
     )
     assert settings.environment == environment

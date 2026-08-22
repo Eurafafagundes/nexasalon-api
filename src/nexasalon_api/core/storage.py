@@ -103,24 +103,52 @@ def get_storage_backend() -> StorageBackend | None:
     return _build_storage_backend()
 
 
-def validate_logo_upload(*, content_type: str | None, size_bytes: int) -> None:
-    """Validação SERVER-SIDE do upload — nunca confia só no `accept` do
-    `<input type="file">` do frontend (mesmo raciocínio já aplicado ao
-    CPF na Etapa C.1: máscara/validação de frontend nunca é a garantia
-    real)."""
+def _validate_image_upload(*, content_type: str | None, size_bytes: int, label: str) -> None:
+    """Validação SERVER-SIDE genérica de upload de imagem — nunca confia
+    só no `accept` do `<input type="file">` do frontend (mesmo
+    raciocínio já aplicado ao CPF na Etapa C.1: máscara/validação de
+    frontend nunca é a garantia real). `label` só entra na mensagem de
+    erro (ex.: "logo", "foto do profissional") — as REGRAS (formatos,
+    tamanho máximo) são as MESMAS pros dois usos, reaproveitando
+    `storage_logo_max_bytes`/`storage_logo_allowed_content_types`
+    (Etapa L, Bloco 3: "reutilizar exatamente essa infraestrutura", não
+    criar uma segunda configuração paralela de limites)."""
     if content_type not in settings.storage_logo_allowed_content_types:
         allowed = ", ".join(settings.storage_logo_allowed_content_types)
         raise ValidationDomainError(f"Formato de imagem não suportado. Formatos aceitos: {allowed}.")
     if size_bytes <= 0:
-        raise ValidationDomainError("Arquivo de logo vazio.")
+        raise ValidationDomainError(f"Arquivo de {label} vazio.")
     if size_bytes > settings.storage_logo_max_bytes:
         max_mb = settings.storage_logo_max_bytes / (1024 * 1024)
-        raise ValidationDomainError(f"Arquivo de logo excede o tamanho máximo permitido ({max_mb:.0f}MB).")
+        raise ValidationDomainError(f"Arquivo de {label} excede o tamanho máximo permitido ({max_mb:.0f}MB).")
+
+
+def validate_logo_upload(*, content_type: str | None, size_bytes: int) -> None:
+    _validate_image_upload(content_type=content_type, size_bytes=size_bytes, label="logo")
+
+
+def validate_professional_photo_upload(*, content_type: str | None, size_bytes: int) -> None:
+    """Etapa L, Bloco 3 — upload real de foto do profissional, mesma
+    validação/limites do logo (ver `_validate_image_upload`)."""
+    _validate_image_upload(content_type=content_type, size_bytes=size_bytes, label="foto do profissional")
 
 
 def build_logo_key(organization_id: uuid.UUID, content_type: str) -> str:
     ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(content_type, "bin")
     return f"organizations/{organization_id}/logo-{uuid.uuid4().hex}.{ext}"
+
+
+def build_professional_photo_key(professional_id: uuid.UUID, content_type: str) -> str:
+    """Chave sempre NOVA (UUID aleatório, nunca reaproveita a anterior) —
+    troca de foto vira "gravar um objeto novo + trocar o ponteiro
+    `Professional.photo_url`", nunca um overwrite in-place (Bloco 3:
+    "substituir foto anterior de forma segura"). Limitação honesta: o
+    objeto antigo no bucket não é apagado automaticamente (ver relatório
+    final) — o ponteiro no banco está sempre correto, mas um
+    housekeeping de storage (lifecycle rule no bucket, ou um job de
+    limpeza) fica fora do escopo desta etapa."""
+    ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}.get(content_type, "bin")
+    return f"professionals/{professional_id}/photo-{uuid.uuid4().hex}.{ext}"
 
 
 def require_storage_backend(backend: StorageBackend | None) -> StorageBackend:

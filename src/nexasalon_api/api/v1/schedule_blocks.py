@@ -5,7 +5,7 @@ from datetime import datetime, time, timedelta
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
-from nexasalon_api.api.deps import get_db, require_permission
+from nexasalon_api.api.deps import get_db, require_any_permission, require_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.exceptions import ValidationDomainError
 from nexasalon_api.repositories import branch_repo, organization_repo
@@ -15,9 +15,19 @@ from nexasalon_api.services import schedule_blocks as schedule_blocks_service
 
 router = APIRouter(prefix="/schedule-blocks", tags=["schedule-blocks"])
 
-# Ver bloqueios é parte normal de visualizar a Agenda — reaproveita as
-# mesmas permissions de leitura da agenda, não cria uma nova de leitura.
-_view = require_permission("agenda.view_all")
+# Etapa L, Bloco 2 — BUG CORRIGIDO: esta rota exigia `agenda.view_all`
+# (permissão exata, sem `require_any_permission`), mas o role PROFISSIONAL
+# de sistema só tem `agenda.view_own` (0007). Resultado: um funcionário
+# comum recebia 403 ao buscar `/schedule-blocks` e a Agenda renderizava a
+# grade SEM os bloqueios — o horário de almoço/indisponibilidade criado
+# pelo Owner "sumia" pra qualquer conta que não fosse OWNER/ADMIN/
+# RECEPTIONIST, embora o próprio bloqueio (linha no banco) sempre tenha
+# sido o MESMO pra todo mundo (`ScheduleBlock` não tem NENHUMA coluna de
+# actor/usuário — organization_id/branch_id/professional_id só, ver
+# `models/professional.py`). Não era um bug de escopo de dado, era um
+# bug de AUTORIZAÇÃO na leitura — corrigido espelhando exatamente o
+# padrão já usado em `api/v1/agenda.py` pra listar agendamentos.
+_view = require_any_permission("agenda.view_own", "agenda.view_all")
 _manage = require_permission("agenda.manage_blocks")
 
 
@@ -54,7 +64,7 @@ def list_schedule_blocks(
         raise ValidationDomainError("Informe 'date', ou o par 'date_from' e 'date_to'.")
 
     blocks = schedule_blocks_service.list_schedule_blocks(
-        session, actor.organization_id, range_start=range_start, range_end=range_end,
+        session, actor, range_start=range_start, range_end=range_end,
         branch_id=branch_id, professional_id=professional_id,
     )
     return [ScheduleBlockRead.model_validate(b) for b in blocks]

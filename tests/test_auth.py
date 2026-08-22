@@ -512,6 +512,11 @@ def test_permissions_efetivas_por_role(client, scenario):
         # Dashboard (migration 0026, Etapa G) — módulo próprio, antes
         # emprestava reports.view.
         "dashboard.view",
+        # Bloco 1 — lookup operacional (migration 0030, Etapa L) —
+        # OWNER/ADMIN recebem de fábrica; RECEPTIONIST/PROFESSIONAL não
+        # (já têm as permissions .view amplas, ver docstring da
+        # migration 0030).
+        "clients.lookup", "clients.create", "services.lookup",
     }
 
     recep_body = _login(client, scenario.recep_email, scenario.password)

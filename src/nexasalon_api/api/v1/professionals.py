@@ -1,10 +1,11 @@
 import uuid
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, File, UploadFile, status
 from sqlalchemy.orm import Session
 
 from nexasalon_api.api.deps import get_db, require_permission
 from nexasalon_api.core.actor import ActorContext
+from nexasalon_api.core.storage import StorageBackend, get_storage_backend
 from nexasalon_api.schemas.professional import (
     ProfessionalCreate,
     ProfessionalRead,
@@ -63,6 +64,30 @@ def update_professional(
 ) -> ProfessionalRead:
     professional = professionals_service.update_professional(
         session, actor.organization_id, professional_id, payload
+    )
+    return ProfessionalRead.model_validate(professional)
+
+
+@router.post(
+    "/{professional_id}/photo",
+    response_model=ProfessionalRead,
+    summary="Upload da foto do profissional (Etapa L, Bloco 3)",
+)
+async def upload_professional_photo(
+    professional_id: uuid.UUID,
+    file: UploadFile = File(...),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_manage),
+    storage: StorageBackend | None = Depends(get_storage_backend),
+) -> ProfessionalRead:
+    content = await file.read()
+    professional = professionals_service.upload_professional_photo(
+        session,
+        actor.organization_id,
+        professional_id,
+        storage=storage,
+        content=content,
+        content_type=file.content_type,
     )
     return ProfessionalRead.model_validate(professional)
 

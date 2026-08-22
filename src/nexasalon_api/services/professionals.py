@@ -3,6 +3,12 @@ import uuid
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.exceptions import NotFoundError, ValidationDomainError
+from nexasalon_api.core.storage import (
+    StorageBackend,
+    build_professional_photo_key,
+    require_storage_backend,
+    validate_professional_photo_upload,
+)
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.service import ProfessionalService
 from nexasalon_api.repositories import (
@@ -55,6 +61,32 @@ def update_professional(
     _assert_branch_in_org(session, organization_id, data.branch_id)
     for field, value in data.model_dump().items():
         setattr(professional, field, value)
+    return professional_repo.save(session, professional)
+
+
+def upload_professional_photo(
+    session: Session,
+    organization_id: uuid.UUID,
+    professional_id: uuid.UUID,
+    *,
+    storage: StorageBackend | None,
+    content: bytes,
+    content_type: str | None,
+) -> Professional:
+    """Etapa L, Bloco 3 — upload REAL de foto (substitui a UX de "cole a
+    URL da foto"), reaproveitando INTEGRALMENTE a infraestrutura já usada
+    pela logo do estabelecimento (`core/storage.py`, mesmo backend
+    S3-compatível, mesma validação server-side de MIME/tamanho). Nunca
+    grava base64 no banco — só a URL pública resultante em
+    `Professional.photo_url`, substituindo o ponteiro anterior (o objeto
+    antigo no bucket não é apagado — ver docstring de
+    `build_professional_photo_key`)."""
+    professional = get_professional(session, organization_id, professional_id)
+    validate_professional_photo_upload(content_type=content_type, size_bytes=len(content))
+    backend = require_storage_backend(storage)
+    key = build_professional_photo_key(professional_id, content_type)  # type: ignore[arg-type]
+    photo_url = backend.upload(key=key, content=content, content_type=content_type)  # type: ignore[arg-type]
+    professional.photo_url = photo_url
     return professional_repo.save(session, professional)
 
 

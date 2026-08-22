@@ -56,6 +56,44 @@ class Settings(BaseSettings):
     refresh_token_ttl_days: int = 30
     org_selection_token_ttl_minutes: int = 5
     invite_token_ttl_days: int = 7
+    # Ajuste pós-Etapa L — persistência segura da sessão da CLIENTE final
+    # (CustomerAccount): access token voltou a ser CURTO (era 30 dias
+    # vivendo só em memória, sem forma de revogar; ver
+    # `customer_refresh_token_ttl_days` abaixo, que agora carrega a
+    # persistência de fato via cookie HttpOnly + rotação, espelhando o
+    # padrão de funcionário — ver core/security.py).
+    customer_access_token_ttl_minutes: int = 60
+    customer_refresh_token_ttl_days: int = 30
+
+    # --- Login com Google (Etapa L, Bloco 6) ---
+    # Fluxo "Sign in with Google" client-side: o FRONTEND obtém um ID token
+    # via Google Identity Services e manda só esse token pro backend
+    # verificar — por isso só o CLIENT ID é necessário aqui (audience
+    # esperada do ID token), nunca um client secret (esse só seria
+    # necessário no fluxo de troca de authorization code, que não é o
+    # usado). `None` = login com Google fica indisponível (mesmo padrão de
+    # `storage_bucket` acima) — a rota correspondente responde 503 em vez
+    # de quebrar a aplicação inteira na subida.
+    google_client_id: str | None = None
+
+    # --- Anti-fake sem custo de WhatsApp (Etapa L, Bloco 11) ---
+    # Conta obrigatória (Bloco 5) já é a primeira barreira; isto é a
+    # segunda: um teto simples de agendamentos FUTUROS ativos por conta,
+    # pra limitar o estrago de uma conta usada pra spam mesmo depois de
+    # criada.
+    max_active_future_appointments_per_customer: int = 5
+
+    # --- Rate limiting da Conta da Cliente (Etapa L, Bloco 9/11) ---
+    # Mesmo padrão/infra de `rate_limit_login_*` (core/rate_limit.py),
+    # chaves por IP dedicadas para não competir pelo mesmo balde do login
+    # de FUNCIONÁRIO.
+    rate_limit_customer_register_max_attempts: int = 5
+    rate_limit_customer_register_window_seconds: int = 3600
+    rate_limit_customer_login_max_attempts: int = 10
+    rate_limit_customer_login_window_seconds: int = 300
+    # Ajuste pós-Etapa L — mesmo padrão de `rate_limit_refresh_*` (staff).
+    rate_limit_customer_refresh_max_attempts: int = 30
+    rate_limit_customer_refresh_window_seconds: int = 300
 
     # --- Pool de conexões (SQLAlchemy) ---
     # Defaults iguais aos que o SQLAlchemy já usava implicitamente (5 +
@@ -121,6 +159,19 @@ class Settings(BaseSettings):
     refresh_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
     csrf_header_name: str = "X-NexaSalon-Csrf"
     cors_allowed_origins: Annotated[list[str], NoDecode] = []
+
+    # --- Transporte do refresh token da CLIENTE (ajuste pós-Etapa L) ---
+    # MESMA técnica do bloco acima, cookie TOTALMENTE separado (nome e
+    # path próprios — nunca o `refresh_cookie_name` de funcionário, nunca
+    # enviado nas rotas internas de staff). Reaproveita
+    # `csrf_header_name` acima (é um mecanismo genérico de mitigação
+    # CSRF, não algo específico da sessão de staff — ver
+    # `require_csrf_header`).
+    customer_refresh_cookie_name: str = "nexasalon_customer_refresh_token"
+    customer_refresh_cookie_path: str = "/api/v1/customer-auth"
+    customer_refresh_cookie_domain: str | None = None
+    customer_refresh_cookie_secure: bool = True
+    customer_refresh_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
 
     # --- Rate limiting (endpoints sensíveis de auth) ---
     rate_limit_enabled: bool = True
@@ -243,6 +294,24 @@ class Settings(BaseSettings):
         if self.refresh_cookie_samesite == "none" and not self.refresh_cookie_secure:
             raise ValueError(
                 "refresh_cookie_samesite='none' exige refresh_cookie_secure=true "
+                "(exigência dos browsers para cookies cross-site)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _guard_customer_refresh_cookie_secure_in_production(self) -> "Settings":
+        if self.environment in ("staging", "production") and not self.customer_refresh_cookie_secure:
+            raise ValueError(
+                f"NEXASALON_CUSTOMER_REFRESH_COOKIE_SECURE não pode ser false em {self.environment} — "
+                "o cookie de sessão da cliente precisa do atributo Secure (HTTPS)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _guard_customer_refresh_samesite_none_requires_secure(self) -> "Settings":
+        if self.customer_refresh_cookie_samesite == "none" and not self.customer_refresh_cookie_secure:
+            raise ValueError(
+                "customer_refresh_cookie_samesite='none' exige customer_refresh_cookie_secure=true "
                 "(exigência dos browsers para cookies cross-site)."
             )
         return self

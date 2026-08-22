@@ -3,13 +3,14 @@ import uuid
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
-from nexasalon_api.api.deps import get_db, require_permission
+from nexasalon_api.api.deps import get_db, require_any_permission, require_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.schemas.appointment import AppointmentRead
 from nexasalon_api.schemas.client import (
     ClientCreate,
     ClientHistory,
     ClientListRead,
+    ClientLookupRead,
     ClientProfile,
     ClientRead,
     ClientUpdate,
@@ -21,6 +22,14 @@ router = APIRouter(prefix="/clients", tags=["clients"])
 
 _view = require_permission("clients.view")
 _manage = require_permission("clients.manage")
+# Etapa L, Bloco 1 — "acesso ao módulo != uso operacional do dado":
+# pesquisar/selecionar cliente num fluxo permitido (Agenda/Comanda) não
+# deveria exigir a permissão AMPLA de Clientes (que abre Ficha 360° e a
+# listagem completa). `_lookup`/`_create_operational` aceitam a permissão
+# granular OU a ampla — quem já tinha `clients.view`/`clients.manage`
+# continua funcionando exatamente igual.
+_lookup = require_any_permission("clients.view", "clients.lookup")
+_create_operational = require_any_permission("clients.manage", "clients.create")
 
 
 @router.get(
@@ -53,10 +62,29 @@ def list_clients(
 def create_client(
     payload: ClientCreate,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(_manage),
+    actor: ActorContext = Depends(_create_operational),
 ) -> ClientRead:
     client = clients_service.create_client(session, actor.organization_id, payload)
     return ClientRead.model_validate(client)
+
+
+@router.get(
+    "/lookup",
+    response_model=list[ClientLookupRead],
+    summary="Pesquisar/selecionar cliente em fluxos operacionais (Agenda/Comanda) — Etapa L, Bloco 1",
+)
+def lookup_clients(
+    search: str | None = None,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_lookup),
+) -> list[ClientLookupRead]:
+    # Reaproveita INTEGRALMENTE `clients_service.list_clients`/o mesmo
+    # repositório de busca já usado por `GET /clients` — só troca o
+    # schema de resposta pro enxuto (nunca CPF/endereço/histórico) e a
+    # permissão exigida. Sempre `include_inactive=False`: um seletor
+    # operacional nunca deveria oferecer um cliente desativado.
+    clients = clients_service.list_clients(session, actor.organization_id, include_inactive=False, search=search)
+    return [ClientLookupRead.model_validate(c) for c in clients]
 
 
 @router.get("/{client_id}", response_model=ClientRead, summary="Detalhar cliente")

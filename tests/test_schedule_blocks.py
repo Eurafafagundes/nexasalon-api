@@ -4,6 +4,7 @@ A parte difícil (bloqueio impedir agendamento) já era coberta por
 `test_appointments.py`/`test_availability.py` inserindo `ScheduleBlock`
 direto via model — aqui validamos que o mesmo efeito acontece passando
 pela API nova de ponta a ponta."""
+import dataclasses
 import uuid
 
 from sqlalchemy import text
@@ -219,3 +220,69 @@ def test_bloqueio_criado_via_api_impede_agendamento_sobreposto(client_as, org_a_
     )
     assert resp.status_code == 422, resp.text
     assert "bloqueio" in resp.json()["error"]["message"].lower()
+
+
+# ---------------------------------------------------------------------
+# Etapa L, Bloco 2 — o bug real reportado: um bloqueio de agenda criado
+# pelo Owner/Admin ficava invisível pra um funcionário logado. NÃO era
+# um bug de dado por usuário (`ScheduleBlock` não tem NENHUMA coluna de
+# escopo por usuário) — era a ROTA de listagem exigir só
+# `agenda.view_all`, nunca aceitando `agenda.view_own`. Os dois testes
+# abaixo cobrem exatamente essa correção: (1) um bloqueio compartilhado
+# (escopo BRANCH) precisa ficar visível pra QUALQUER um com view_own,
+# nunca ser filtrado por profissional; (2) um bloqueio de escopo
+# PROFESSIONAL continua corretamente restrito ao dono daquela agenda —
+# a correção não pode virar um vazamento pro lado oposto.
+# ---------------------------------------------------------------------
+
+
+def _view_own_actor(base_actor, *, professional_id: uuid.UUID | None = None):
+    actor = _restricted_actor(base_actor, permissions={"agenda.view_own"})
+    if professional_id is not None:
+        actor = dataclasses.replace(actor, professional_id=professional_id)
+    return actor
+
+
+def test_bloqueio_de_unidade_e_visivel_para_quem_so_tem_view_own(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    branch = c.post("/api/v1/branches", json={"name": "Matriz", "slug": f"matriz-{uuid.uuid4().hex[:6]}"}).json()
+    block = c.post(
+        "/api/v1/schedule-blocks",
+        json={
+            "scope": "branch", "branch_id": branch["id"],
+            "block_type": "other", "title": "Reforma",
+            "start_at": "2026-08-18T14:00:00-03:00", "end_at": "2026-08-18T16:00:00-03:00",
+        },
+    ).json()
+
+    professional = c.post("/api/v1/professionals", json={"name": "Funcionária"}).json()
+    employee = _view_own_actor(org_a_actor, professional_id=uuid.UUID(professional["id"]))
+
+    resp = client_as(employee).get("/api/v1/schedule-blocks", params={"date": "2026-08-18"})
+    assert resp.status_code == 200, resp.text
+    assert any(b["id"] == block["id"] for b in resp.json())
+
+
+def test_bloqueio_de_profissional_so_e_visivel_para_o_proprio_profissional(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    prof_a = c.post("/api/v1/professionals", json={"name": "Profissional A"}).json()
+    prof_b = c.post("/api/v1/professionals", json={"name": "Profissional B"}).json()
+    block = c.post(
+        "/api/v1/schedule-blocks",
+        json={
+            "scope": "professional", "professional_id": prof_a["id"],
+            "block_type": "other", "title": "Consulta",
+            "start_at": "2026-08-18T14:00:00-03:00", "end_at": "2026-08-18T16:00:00-03:00",
+        },
+    ).json()
+
+    actor_a = _view_own_actor(org_a_actor, professional_id=uuid.UUID(prof_a["id"]))
+    actor_b = _view_own_actor(org_a_actor, professional_id=uuid.UUID(prof_b["id"]))
+
+    resp_a = client_as(actor_a).get("/api/v1/schedule-blocks", params={"date": "2026-08-18"})
+    assert resp_a.status_code == 200, resp_a.text
+    assert any(b["id"] == block["id"] for b in resp_a.json())
+
+    resp_b = client_as(actor_b).get("/api/v1/schedule-blocks", params={"date": "2026-08-18"})
+    assert resp_b.status_code == 200, resp_b.text
+    assert all(b["id"] != block["id"] for b in resp_b.json())

@@ -46,6 +46,14 @@ class TokenType(str, Enum):
     ORG_SELECTION = "org_selection"
     INVITE = "invite"
     PASSWORD_RESET = "password_reset"
+    # Etapa L, Bloco 9 — token de sessão da CLIENTE final (CustomerAccount),
+    # semanticamente separado do `ACCESS` de funcionário. `_get_real_current_actor`
+    # (api/deps.py) exige `type == "access"` e rejeita qualquer outro valor —
+    # um token `CUSTOMER_ACCESS` já é automaticamente inaceitável em toda
+    # rota interna só por isso, sem precisar de um segredo JWT separado.
+    # `get_current_customer` (mesmo arquivo) faz o inverso: só aceita
+    # `type == "customer_access"`, rejeitando um token de funcionário.
+    CUSTOMER_ACCESS = "customer_access"
 
 
 def create_access_token(*, user_id: uuid.UUID, organization_id: uuid.UUID, membership_id: uuid.UUID) -> str:
@@ -116,6 +124,27 @@ def create_password_reset_token(*, user_id: uuid.UUID, membership_id: uuid.UUID)
         "jti": str(uuid.uuid4()),
         "iat": now,
         "exp": now + timedelta(days=settings.invite_token_ttl_days),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+
+def create_customer_access_token(*, customer_account_id: uuid.UUID) -> str:
+    """Sessão da CLIENTE final — vida bem mais longa que o access token
+    de funcionário (`settings.customer_access_token_ttl_minutes`, default
+    30 dias): é um portal de baixíssimo risco (só consulta os PRÓPRIOS
+    agendamentos, nunca escreve dado sensível), então a troca é
+    conveniência de sessão por segurança operacional que o access token
+    de 15 minutos de um funcionário precisa. Sem `org_id`/`membership_id`
+    — a CustomerAccount não pertence a uma única organização (Bloco 7:
+    "deve futuramente poder possuir relacionamento com mais de uma
+    Organization")."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(customer_account_id),
+        "type": TokenType.CUSTOMER_ACCESS.value,
+        "jti": str(uuid.uuid4()),
+        "iat": now,
+        "exp": now + timedelta(minutes=settings.customer_access_token_ttl_minutes),
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
