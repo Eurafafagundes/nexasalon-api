@@ -142,6 +142,7 @@ def get_client_profile(
         orders=[ClientOrderSummary.from_order(o, can_view_finance=profile.can_view_finance) for o in profile.orders],
         can_view_finance=profile.can_view_finance,
         can_view_orders=profile.can_view_orders,
+        has_online_account=profile.has_online_account,
     )
 
 

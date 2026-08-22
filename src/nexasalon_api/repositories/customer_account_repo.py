@@ -51,6 +51,19 @@ def get_link(
     return session.scalars(stmt).first()
 
 
+def get_link_by_client(session: Session, organization_id: uuid.UUID, client_id: uuid.UUID) -> CustomerAccountLink | None:
+    """Etapa M — Ficha de Cliente ("Conta NexaSalon vinculada"): o
+    inverso de `get_link` (por `client_id` em vez de por
+    `customer_account_id`). Nunca expõe dado de autenticação, só serve
+    pra saber SE existe vínculo (ver `services/clients.py::
+    get_client_profile`)."""
+    stmt = select(CustomerAccountLink).where(
+        CustomerAccountLink.organization_id == organization_id,
+        CustomerAccountLink.client_id == client_id,
+    )
+    return session.scalars(stmt).first()
+
+
 def create_link(
     session: Session, *, customer_account_id: uuid.UUID, organization_id: uuid.UUID, client_id: uuid.UUID
 ) -> CustomerAccountLink:

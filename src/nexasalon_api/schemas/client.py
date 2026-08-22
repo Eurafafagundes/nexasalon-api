@@ -150,3 +150,4 @@ class ClientProfile(BaseModel):
     orders: list[ClientOrderSummary]
     can_view_finance: bool
     can_view_orders: bool
+    has_online_account: bool

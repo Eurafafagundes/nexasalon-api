@@ -27,15 +27,41 @@ def get_by_cpf(session: Session, organization_id: uuid.UUID, cpf: str) -> Client
 
 def get_by_phone(session: Session, organization_id: uuid.UUID, phone: str) -> Client | None:
     """`phone` já deve vir NORMALIZADO (só dígitos — ver
-    `core/normalize.py::normalize_phone`) — usado pelo Agendamento
-    Online público (Etapa K) pra achar a cliente existente pelo
-    telefone/WhatsApp DENTRO DA MESMA organização antes de criar um
-    cadastro novo (item explícito do pedido "procurar cliente existente
-    pelo telefone dentro da organização"). Considera ativos E inativos,
-    mesmo raciocínio de `get_by_cpf` — um telefone de um cadastro
-    desativado ainda identifica a mesma pessoa."""
+    `core/normalize.py::normalize_phone`) — usado por buscas internas
+    (ex.: tela Clientes) que precisam achar exatamente pelo campo
+    `phone`. Considera ativos E inativos, mesmo raciocínio de
+    `get_by_cpf` — um telefone de um cadastro desativado ainda
+    identifica a mesma pessoa.
+
+    NÃO usar isto para resolver a identidade de uma `CustomerAccount`
+    (Agendamento Online) — `Client.phone` e `Client.whatsapp` são
+    colunas independentes e um cadastro manual comum preenche só
+    `whatsapp`; usar `list_candidates_by_identity` nesse caso (ver
+    `services/customer_accounts.py::resolve_client_for_customer_account`)."""
     stmt = select(Client).where(Client.organization_id == organization_id, Client.phone == phone)
     return session.scalars(stmt).first()
+
+
+def list_candidates_by_identity(session: Session, organization_id: uuid.UUID, phone: str) -> list[Client]:
+    """`phone` já deve vir NORMALIZADO (só dígitos). Candidatos a "é a
+    mesma pessoa" dentro da organização: qualquer `Client` cujo `phone`
+    OU `whatsapp` bata com o número informado — as duas colunas são
+    independentes no cadastro manual (a recepção comumente preenche só
+    uma delas), e o número da `CustomerAccount` (WhatsApp) precisa achar
+    o cadastro de qualquer um dos dois jeitos pra não duplicar ficha.
+
+    Devolve TODOS os que baterem, propositalmente — quem chama decide o
+    que fazer com 0/1/N resultados. Nunca reduzir aqui a "o primeiro
+    que achar": duas pessoas diferentes podem compartilhar o mesmo
+    número por erro de cadastro antigo, e nesse caso NENHUM vínculo
+    automático é seguro (ver docstring de
+    `services/customer_accounts.py::resolve_client_for_customer_account`,
+    Bloco 8)."""
+    stmt = select(Client).where(
+        Client.organization_id == organization_id,
+        or_(Client.phone == phone, Client.whatsapp == phone),
+    )
+    return list(session.scalars(stmt).all())
 
 
 def list_all(

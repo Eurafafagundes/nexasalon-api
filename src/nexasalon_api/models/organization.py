@@ -113,8 +113,62 @@ class Organization(Base, UUIDPKMixin, TimestampMixin):
     # recortam a janela de datas ofertada/aceita no fluxo público).
     online_booking_min_lead_minutes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="60")
     online_booking_max_lead_days: Mapped[int] = mapped_column(Integer, nullable=False, server_default="60")
+    # Etapa M — "Permitir agendamento para o mesmo dia" (Configurações >
+    # Agendamento Online > Regras de agendamento). `true` (default,
+    # comportamento IDÊNTICO ao de antes desta coluna) = a antecedência
+    # mínima acima já governa hoje normalmente. `false` = hoje nunca é
+    # oferecido, mesmo que `online_booking_min_lead_minutes` fosse baixo
+    # o bastante pra permitir — o primeiro horário possível vira amanhã
+    # 00:00 (ainda recortado pelo horário de funcionamento/jornada
+    # normalmente). Ver `services/public_booking.py::_lead_time_bounds`
+    # e `services/appointments.py::_assert_online_booking_lead_time`.
+    online_booking_same_day_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
 
     branches: Mapped[list["Branch"]] = relationship(back_populates="organization")
+
+
+class BusinessHours(Base, UUIDPKMixin, TimestampMixin):
+    """Etapa M — Horário de funcionamento do ESTABELECIMENTO
+    (Configurações > Informações do Estabelecimento), camada SUPERIOR à
+    jornada do profissional (`WorkingHours`): a disponibilidade real de
+    qualquer profissional é sempre `funcionamento ∩ jornada ∩
+    bloqueios ∩ conflitos`, nunca só a jornada isolada — ver
+    `services/availability.py::effective_working_windows_utc`, o único
+    ponto que combina as duas coisas (Agenda interna, Novo Agendamento e
+    Agendamento Online reaproveitam essa mesma função, nunca uma segunda
+    lógica por tela).
+
+    Por ORGANIZATION (não por `Branch`) — a tela de configurações é uma
+    só por estabelecimento, mesma decisão já tomada pela página pública
+    (`services/public_booking.py::get_default_branch`, primeira unidade
+    ativa). Uma linha por dia da semana (0=domingo…6=sábado, mesma
+    convenção de `WorkingHours`) — sem turno partido aqui (é só
+    aberto/fechado + um intervalo, não a jornada real de ninguém).
+
+    Ausência de QUALQUER linha para a organização = sem restrição
+    nenhuma (comportamento idêntico ao de antes desta tabela existir —
+    "dados existentes precisam continuar funcionando"); a restrição só
+    passa a valer depois que o proprietário salva a tela pela primeira
+    vez (grava as 7 linhas de uma vez, ver
+    `repositories/business_hours_repo.py::replace_all`)."""
+
+    __tablename__ = "business_hours"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "weekday"),
+        CheckConstraint(
+            "(is_open = false AND start_time IS NULL AND end_time IS NULL) OR "
+            "(is_open = true AND start_time IS NOT NULL AND end_time IS NOT NULL AND start_time < end_time)",
+            name="business_hours_open_consistency",
+        ),
+    )
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    weekday: Mapped[int] = mapped_column(SmallInteger, nullable=False)  # 0=domingo … 6=sábado
+    is_open: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    start_time: Mapped[time | None] = mapped_column(Time)
+    end_time: Mapped[time | None] = mapped_column(Time)
 
 
 class Branch(Base, UUIDPKMixin, TimestampMixin):

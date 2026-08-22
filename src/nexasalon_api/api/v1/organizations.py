@@ -4,7 +4,13 @@ from sqlalchemy.orm import Session
 from nexasalon_api.api.deps import get_current_actor, get_db, require_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.storage import StorageBackend, get_storage_backend
-from nexasalon_api.schemas.organization import LogoUploadRead, OrganizationRead, OrganizationUpdate
+from nexasalon_api.schemas.organization import (
+    BusinessHourRead,
+    BusinessHoursReplaceRequest,
+    LogoUploadRead,
+    OrganizationRead,
+    OrganizationUpdate,
+)
 from nexasalon_api.services import organizations as organizations_service
 
 router = APIRouter(prefix="/organization", tags=["organization"])
@@ -73,3 +79,33 @@ async def upload_logo(
         content_type=file.content_type,
     )
     return LogoUploadRead(logo_url=org.logo_url)
+
+
+@router.get(
+    "/business-hours",
+    response_model=list[BusinessHourRead],
+    summary="Ver horário de funcionamento do estabelecimento",
+)
+def list_business_hours(
+    session: Session = Depends(get_db), actor: ActorContext = Depends(get_current_actor)
+) -> list[BusinessHourRead]:
+    """Sem `require_permission` — mesmo raciocínio de `get_current_organization`
+    acima: qualquer membro autenticado (Agenda, Novo Agendamento) precisa
+    saber os dias fechados pra UI refletir isso. Lista vazia = ainda não
+    configurado (sem restrição nenhuma, ver docstring de `BusinessHours`)."""
+    rows = organizations_service.list_business_hours(session, actor.organization_id)
+    return [BusinessHourRead.model_validate(r) for r in rows]
+
+
+@router.put(
+    "/business-hours",
+    response_model=list[BusinessHourRead],
+    summary="Definir horário de funcionamento do estabelecimento (substitui a semana inteira)",
+)
+def replace_business_hours(
+    payload: BusinessHoursReplaceRequest,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_manage),
+) -> list[BusinessHourRead]:
+    rows = organizations_service.replace_business_hours(session, actor.organization_id, payload.items)
+    return [BusinessHourRead.model_validate(r) for r in rows]

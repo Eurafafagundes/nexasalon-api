@@ -19,22 +19,25 @@ Fontes de indisponibilidade combinadas:
 """
 import uuid
 from dataclasses import dataclass
-from datetime import date as date_type, datetime, time, timedelta
+from datetime import date as date_type
+from datetime import datetime, time, timedelta
+from datetime import timezone as timezone_type
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.exceptions import NotFoundError, ValidationDomainError
+from nexasalon_api.models.organization import Organization
 from nexasalon_api.repositories import (
+    appointment_item_repo,
     branch_repo,
+    organization_repo,
     professional_repo,
     professional_service_repo,
     schedule_block_repo,
     service_repo,
 )
-from nexasalon_api.repositories import appointment_item_repo
-from nexasalon_api.repositories import organization_repo
 
 ALLOWED_SLOT_MINUTES = frozenset({15, 30})
 
@@ -43,6 +46,28 @@ ALLOWED_SLOT_MINUTES = frozenset({15, 30})
 class AvailabilitySlot:
     start_at: datetime
     end_at: datetime
+
+
+def earliest_public_booking_start(organization: Organization, now: datetime) -> datetime:
+    """"Permitir agendamento para o mesmo dia" (Etapa M, Configurações >
+    Agendamento Online > Regras de agendamento) — fonte ÚNICA usada
+    tanto pela LISTAGEM de horários (`services/public_booking.py::
+    _lead_time_bounds`) quanto pela CONFIRMAÇÃO
+    (`services/appointments.py::_assert_online_booking_lead_time`), pra
+    nunca a listagem oferecer o que a confirmação recusaria.
+
+    `online_booking_same_day_enabled=True` (default, comportamento
+    IDÊNTICO ao de antes desta função existir): `now +
+    online_booking_min_lead_minutes` — se for baixo o bastante, hoje
+    continua aparecendo. `False`: hoje NUNCA aparece, mesmo com
+    antecedência mínima pequena — o primeiro instante possível é amanhã
+    00:00 no fuso da organização (ainda recortado por
+    `effective_working_windows_utc` como qualquer outro horário)."""
+    if organization.online_booking_same_day_enabled:
+        return now + timedelta(minutes=organization.online_booking_min_lead_minutes)
+    tz = ZoneInfo(organization.timezone)
+    tomorrow_local_date = (now.astimezone(tz) + timedelta(days=1)).date()
+    return datetime.combine(tomorrow_local_date, time.min, tzinfo=tz).astimezone(timezone_type.utc)
 
 
 def effective_timezone(session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID) -> ZoneInfo:
@@ -82,6 +107,53 @@ def working_windows_utc(
         windows.append((start_local, end_local))
     windows.sort(key=lambda w: w[0])
     return windows
+
+
+def _intersect_windows(
+    windows: list[tuple[datetime, datetime]], allowed: list[tuple[datetime, datetime]]
+) -> list[tuple[datetime, datetime]]:
+    """Recorta cada janela de `windows` ao que sobrar depois de
+    intersectar com `allowed` — o oposto de `_subtract_busy` (que
+    remove interseção; isto MANTÉM só a interseção). Usado pra aplicar
+    o horário de funcionamento (`allowed`) por cima da jornada do
+    profissional (`windows`), item explícito "estabelecimento aberto ∩
+    profissional trabalha"."""
+    result: list[tuple[datetime, datetime]] = []
+    for w_start, w_end in windows:
+        for a_start, a_end in allowed:
+            start = max(w_start, a_start)
+            end = min(w_end, a_end)
+            if start < end:
+                result.append((start, end))
+    return result
+
+
+def effective_working_windows_utc(
+    session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID, target_date: date_type, tz: ZoneInfo
+) -> list[tuple[datetime, datetime]]:
+    """Fonte ÚNICA de "quando este profissional pode ser agendado neste
+    dia" — jornada do profissional (`working_windows_utc`) já recortada
+    pelo horário de funcionamento do estabelecimento (camada SUPERIOR,
+    item explícito do pedido: "Horário do estabelecimento é a camada
+    superior"). Usado tanto por `compute_availability` (Agenda interna,
+    Novo Agendamento e, através dele, Agendamento Online) quanto por
+    `services/appointments.py::_assert_within_working_hours` (validação
+    na criação/edição de um agendamento) — nunca dois cálculos
+    diferentes, então a disponibilidade nunca depende de qual usuário
+    está logado nem de qual tela chamou."""
+    from nexasalon_api.services import business_hours as business_hours_service
+
+    windows = working_windows_utc(session, organization_id, professional_id, target_date, tz)
+    if not windows:
+        return []
+
+    business_window = business_hours_service.get_window_utc(session, organization_id, target_date, tz)
+    if business_window is None:
+        return windows  # organização não configurou horário de funcionamento ainda — sem restrição extra
+    if not business_window:
+        return []  # estabelecimento fechado neste dia — ninguém disponível, independente da jornada
+
+    return _intersect_windows(windows, business_window)
 
 
 def _subtract_busy(
@@ -175,7 +247,7 @@ def compute_availability(
     duration_minutes, _price = effective_duration_and_price(service, professional_service)
     tz = effective_timezone(session, organization_id, branch_id)
 
-    windows = working_windows_utc(session, organization_id, professional_id, target_date, tz)
+    windows = effective_working_windows_utc(session, organization_id, professional_id, target_date, tz)
     if not windows:
         return []
 

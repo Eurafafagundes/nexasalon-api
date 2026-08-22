@@ -233,22 +233,33 @@ def revoke_session(session: Session, raw_refresh_token: str) -> None:
 def resolve_client_for_customer_account(
     session: Session, organization: Organization, account: CustomerAccount
 ) -> uuid.UUID:
-    """Passo a passo EXATO do Bloco 8:
+    """Passo a passo EXATO do Bloco 8 (corrigido — bug de integridade real
+    encontrado em produção: uma cliente nova era vinculada a um `Client`
+    ANTIGO/errado):
 
     1. já existe vínculo desta conta com esta organização? reusa o
        MESMO `client_id` sempre — nunca cria um `Client` novo pra quem
-       já tem ficha.
-    2. sem vínculo ainda: procura `Client` existente pelo telefone
-       normalizado dentro da organização (mesma heurística já usada por
-       `_get_or_create_public_client` no fluxo anônimo anterior — uma
-       cliente que já foi atendida presencialmente e agora está criando
-       conta pela primeira vez encontra a própria ficha em vez de
-       ganhar uma duplicata).
-    3. nem vínculo nem Client por telefone: cria um `Client` novo, só
-       com nome/telefone/e-mail (nunca sobrescreve dado sensível
-       existente — este é o caminho de CRIAÇÃO, não de atualização).
-    4. grava o vínculo — a partir daqui, toda reserva futura desta
-       conta nesta organização cai direto no passo 1."""
+       já tem ficha, e nunca reavalia a correspondência de novo.
+    2. sem vínculo ainda: procura candidatos dentro da organização cujo
+       `phone` OU `whatsapp` batam com o WhatsApp normalizado da conta
+       (`list_candidates_by_identity` — as duas colunas são
+       independentes no cadastro manual, então checar só `phone`, como
+       o código fazia antes, deixava passar batido um `Client` cadastrado
+       só com `whatsapp`).
+    3. correspondência só é considerada SEGURA quando existe EXATAMENTE
+       UM candidato. Zero candidatos → cria `Client` novo. Mais de um
+       candidato (dois cadastros antigos distintos compartilhando o
+       mesmo número, por erro de digitação/cadastro) → NUNCA escolhe
+       arbitrariamente: também cria um `Client` novo, em vez de
+       arriscar vincular a pessoa errada (era exatamente esse o bug
+       relatado — um agendamento caindo numa cliente antiga qualquer).
+    4. `Client` novo é criado com `phone` E `whatsapp` preenchidos com o
+       mesmo número (nunca sobrescreve dado sensível existente — este é
+       o caminho de CRIAÇÃO, não de atualização) — assim uma busca
+       futura por qualquer uma das duas colunas encontra este cadastro.
+    5. grava o vínculo — a partir daqui, toda reserva futura desta
+       conta nesta organização cai direto no passo 1, sempre com o
+       MESMO `Client`."""
     link = customer_account_repo.get_link(session, account.id, organization.id)
     if link is not None:
         return link.client_id
@@ -256,7 +267,7 @@ def resolve_client_for_customer_account(
     if not account.phone:
         # Ainda não pediu WhatsApp (caminho comum: primeiro login via
         # Google, que não fornece telefone) — sem telefone não dá pra
-        # nem tentar casar com um Client existente (passo 4 do Bloco 8)
+        # nem tentar casar com um Client existente (passo 2 do Bloco 8)
         # nem preencher o cadastro novo direito. Bloqueia ANTES de criar
         # qualquer coisa; o frontend trata isto pedindo o WhatsApp
         # (`PATCH /customer-auth/me`) antes de deixar confirmar.
@@ -265,12 +276,17 @@ def resolve_client_for_customer_account(
         )
 
     client_id: uuid.UUID
-    existing_client = client_repo.get_by_phone(session, organization.id, account.phone) if account.phone else None
-    if existing_client is not None:
-        client_id = existing_client.id
+    candidates = client_repo.list_candidates_by_identity(session, organization.id, account.phone)
+    if len(candidates) == 1:
+        client_id = candidates[0].id
     else:
         client = client_repo.create(
-            session, organization.id, name=account.name, phone=account.phone, email=account.email
+            session,
+            organization.id,
+            name=account.name,
+            phone=account.phone,
+            whatsapp=account.phone,
+            email=account.email,
         )
         client_id = client.id
 

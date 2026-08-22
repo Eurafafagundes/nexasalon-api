@@ -8,9 +8,9 @@ reuso vs. campo novo) — por isso normalizado/validado aqui com o MESMO
 padrão já usado pra CPF em `schemas/client.py`: nunca confiar só na
 máscara do frontend."""
 import uuid
-from datetime import datetime
+from datetime import datetime, time
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from nexasalon_api.core.normalize import is_valid_cnpj, normalize_cnpj, normalize_slug
 from nexasalon_api.models.enums import BrazilianState, OrganizationStatus
@@ -27,6 +27,7 @@ class OrganizationRead(BaseModel):
     online_booking_auto_confirm: bool
     online_booking_min_lead_minutes: int
     online_booking_max_lead_days: int
+    online_booking_same_day_enabled: bool
     legal_name: str | None
     logo_url: str | None
     email: str | None
@@ -71,6 +72,7 @@ class OrganizationUpdate(BaseModel):
     online_booking_auto_confirm: bool | None = None
     online_booking_min_lead_minutes: int | None = Field(default=None, ge=0, le=10080)
     online_booking_max_lead_days: int | None = Field(default=None, ge=1, le=3650)
+    online_booking_same_day_enabled: bool | None = None
     legal_name: str | None = Field(default=None, max_length=255)
     document: str | None = Field(default=None, max_length=18)
     business_type: str | None = Field(default=None, max_length=50)
@@ -126,3 +128,49 @@ class OrganizationUpdate(BaseModel):
 
 class LogoUploadRead(BaseModel):
     logo_url: str
+
+
+class BusinessHourItem(BaseModel):
+    """Etapa M — uma linha do horário de funcionamento do
+    estabelecimento (Configurações > Informações do Estabelecimento).
+    Diferente de `WorkingHourItem` (jornada do profissional): sem
+    turno partido aqui, só aberto/fechado + um intervalo por dia."""
+
+    weekday: int = Field(ge=0, le=6, description="0=domingo … 6=sábado")
+    is_open: bool = True
+    start_time: time | None = None
+    end_time: time | None = None
+
+    @model_validator(mode="after")
+    def _check_consistency(self) -> "BusinessHourItem":
+        if self.is_open:
+            if self.start_time is None or self.end_time is None:
+                raise ValueError("Informe o horário de abertura e fechamento.")
+            if self.start_time >= self.end_time:
+                raise ValueError("O horário de abertura deve ser menor que o de fechamento.")
+        else:
+            self.start_time = None
+            self.end_time = None
+        return self
+
+
+class BusinessHourRead(BusinessHourItem):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    organization_id: uuid.UUID
+
+
+class BusinessHoursReplaceRequest(BaseModel):
+    """Sempre as 7 linhas de uma vez (semântica de PUT idempotente,
+    mesmo padrão de `WorkingHoursReplaceRequest`) — cada `weekday`
+    0..6 exatamente uma vez."""
+
+    items: list[BusinessHourItem]
+
+    @model_validator(mode="after")
+    def _check_full_week(self) -> "BusinessHoursReplaceRequest":
+        weekdays = [item.weekday for item in self.items]
+        if sorted(weekdays) != list(range(7)):
+            raise ValueError("Informe exatamente uma linha para cada dia da semana (0 a 6).")
+        return self

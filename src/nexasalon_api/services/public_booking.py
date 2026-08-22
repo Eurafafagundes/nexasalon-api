@@ -17,12 +17,13 @@ from sqlalchemy.orm import Session
 from nexasalon_api.core.exceptions import NotFoundError
 from nexasalon_api.models.organization import Branch
 from nexasalon_api.models.professional import Professional
-from nexasalon_api.models.service import Service
+from nexasalon_api.models.service import Service, ServiceCategory
 from nexasalon_api.repositories import (
     branch_repo,
     organization_repo,
     professional_repo,
     professional_service_repo,
+    service_category_repo,
     service_repo,
 )
 from nexasalon_api.services import availability
@@ -41,7 +42,7 @@ def _lead_time_bounds(session: Session, organization_id: uuid.UUID) -> tuple[dat
     direto com `AvailabilitySlot.start_at`, que também é UTC-aware."""
     organization = organization_repo.get(session, organization_id)
     now = datetime.now(timezone.utc)
-    earliest = now + timedelta(minutes=organization.online_booking_min_lead_minutes)
+    earliest = availability.earliest_public_booking_start(organization, now)
     latest = now + timedelta(days=organization.online_booking_max_lead_days)
     return earliest, latest
 
@@ -59,11 +60,45 @@ def get_default_branch(session: Session, organization_id: uuid.UUID) -> Branch:
     return branches[0]
 
 
-def list_public_services(session: Session, organization_id: uuid.UUID) -> list[Service]:
+def list_public_services(
+    session: Session,
+    organization_id: uuid.UUID,
+    *,
+    category_id: uuid.UUID | None = None,
+    uncategorized_only: bool = False,
+) -> list[Service]:
     """Só serviços ATIVOS e com `allow_online_booking=true` — a mesma
     flag já existente em `Service` (sem migration nova), "serviços
-    habilitados para online" do pedido."""
-    return [s for s in service_repo.list_all(session, organization_id) if s.allow_online_booking]
+    habilitados para online" do pedido.
+
+    Etapa M — "Categoria → Serviço": `category_id` filtra por categoria
+    escolhida; `uncategorized_only` filtra pela pseudo-categoria
+    "Outros serviços" (`category_id IS NULL`, ver
+    `list_public_categories`). Os dois nunca são usados juntos."""
+    services = [s for s in service_repo.list_all(session, organization_id) if s.allow_online_booking]
+    if uncategorized_only:
+        return [s for s in services if s.category_id is None]
+    if category_id is not None:
+        return [s for s in services if s.category_id == category_id]
+    return services
+
+
+def list_public_categories(
+    session: Session, organization_id: uuid.UUID
+) -> tuple[list[ServiceCategory], bool]:
+    """Categorias ATIVAS com pelo menos 1 serviço elegível online (item
+    explícito "categoria vazia não aparece") + um flag `has_uncategorized`
+    pra rota montar a pseudo-categoria sintética "Outros serviços" quando
+    aplicável (ver `api/v1/public_booking.py::list_categories` — nunca
+    uma linha real em `service_categories`, então não pertence aqui)."""
+    services = list_public_services(session, organization_id)
+    category_ids = {s.category_id for s in services if s.category_id is not None}
+    has_uncategorized = any(s.category_id is None for s in services)
+    if not category_ids:
+        return [], has_uncategorized
+    all_categories = service_category_repo.list_all(session, organization_id)
+    categories = [c for c in all_categories if c.id in category_ids]
+    return categories, has_uncategorized
 
 
 def list_public_professionals(

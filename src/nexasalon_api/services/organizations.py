@@ -14,9 +14,9 @@ from nexasalon_api.core.storage import (
     require_storage_backend,
     validate_logo_upload,
 )
-from nexasalon_api.models.organization import Organization
-from nexasalon_api.repositories import organization_repo
-from nexasalon_api.schemas.organization import OrganizationUpdate
+from nexasalon_api.models.organization import BusinessHours, Organization
+from nexasalon_api.repositories import business_hours_repo, organization_repo
+from nexasalon_api.schemas.organization import BusinessHourItem, OrganizationUpdate
 
 
 def get_current_organization(session: Session, organization_id: uuid.UUID) -> Organization:
@@ -97,3 +97,19 @@ def upload_organization_logo(
     logo_url = backend.upload(key=key, content=content, content_type=content_type)  # type: ignore[arg-type]
     org.logo_url = logo_url
     return organization_repo.save(session, org)
+
+
+def list_business_hours(session: Session, organization_id: uuid.UUID) -> list[BusinessHours]:
+    """Vazio = organização ainda não configurou horário de
+    funcionamento (ver docstring de `models/organization.py::
+    BusinessHours` — compatibilidade retroativa, sem restrição
+    nenhuma até a primeira gravação)."""
+    return business_hours_repo.list_for_organization(session, organization_id)
+
+
+def replace_business_hours(
+    session: Session, organization_id: uuid.UUID, items: list[BusinessHourItem]
+) -> list[BusinessHours]:
+    get_current_organization(session, organization_id)  # 404 se a org não existir
+    payload = [item.model_dump() for item in items]
+    return business_hours_repo.replace_all(session, organization_id, payload)

@@ -10,7 +10,12 @@ from nexasalon_api.models.appointment import Appointment
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import AppointmentStatus
 from nexasalon_api.models.order import Order
-from nexasalon_api.repositories import appointment_repo, client_repo, order_repo
+from nexasalon_api.repositories import (
+    appointment_repo,
+    client_repo,
+    customer_account_repo,
+    order_repo,
+)
 from nexasalon_api.schemas.client import ClientCreate, ClientUpdate
 
 # Agendamentos ainda "em aberto" (nem concluídos nem descartados) — usado
@@ -212,6 +217,10 @@ class ClientProfile:
     orders: list[Order]
     can_view_finance: bool
     can_view_orders: bool
+    # Etapa M — Ficha de Cliente ("Conta NexaSalon vinculada", discreto).
+    # Nunca expõe dado de autenticação, só SE existe uma CustomerAccount
+    # vinculada a este Client nesta organização.
+    has_online_account: bool
 
 
 def get_client_profile(session: Session, actor: ActorContext, client_id: uuid.UUID) -> ClientProfile:
@@ -240,6 +249,7 @@ def get_client_profile(session: Session, actor: ActorContext, client_id: uuid.UU
     orders = order_repo.list_for_org(session, organization_id, client_id=client_id) if can_view_orders else []
 
     client = get_client(session, organization_id, client_id)
+    has_online_account = customer_account_repo.get_link_by_client(session, organization_id, client_id) is not None
     return ClientProfile(
         client=client,
         client_since=history.client_since,
@@ -253,4 +263,5 @@ def get_client_profile(session: Session, actor: ActorContext, client_id: uuid.UU
         orders=orders,
         can_view_finance=can_view_finance,
         can_view_orders=can_view_orders,
+        has_online_account=has_online_account,
     )

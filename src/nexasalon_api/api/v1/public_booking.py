@@ -17,7 +17,11 @@ from nexasalon_api.api.deps import (
 )
 from nexasalon_api.core.config import settings
 from nexasalon_api.core.exceptions import UnauthorizedError
-from nexasalon_api.repositories import customer_account_repo
+from nexasalon_api.repositories import (
+    customer_account_repo,
+    professional_repo,
+    service_repo,
+)
 from nexasalon_api.schemas.customer_account import PublicMyAppointmentRead
 from nexasalon_api.schemas.public_booking import (
     PublicAvailabilitySlotRead,
@@ -25,6 +29,7 @@ from nexasalon_api.schemas.public_booking import (
     PublicBookingRead,
     PublicOrganizationRead,
     PublicProfessionalRead,
+    PublicServiceCategoryRead,
     PublicServiceRead,
 )
 from nexasalon_api.services import appointments as appointments_service
@@ -39,9 +44,30 @@ def get_organization(ctx: PublicBookingContext = Depends(get_public_context)) ->
     return PublicOrganizationRead.model_validate(ctx.organization)
 
 
+@router.get(
+    "/categories",
+    response_model=list[PublicServiceCategoryRead],
+    summary="Categorias com serviços disponíveis online (Categoria → Serviço)",
+)
+def list_categories(ctx: PublicBookingContext = Depends(get_public_context)) -> list[PublicServiceCategoryRead]:
+    categories, has_uncategorized = public_booking_service.list_public_categories(ctx.session, ctx.organization.id)
+    result = [PublicServiceCategoryRead.model_validate(c) for c in categories]
+    if has_uncategorized:
+        result.append(
+            PublicServiceCategoryRead(id=None, name="Outros serviços", color=None, display_order=len(result) + 1000)
+        )
+    return result
+
+
 @router.get("/services", response_model=list[PublicServiceRead], summary="Serviços habilitados para online")
-def list_services(ctx: PublicBookingContext = Depends(get_public_context)) -> list[PublicServiceRead]:
-    services = public_booking_service.list_public_services(ctx.session, ctx.organization.id)
+def list_services(
+    category_id: uuid.UUID | None = Query(default=None),
+    uncategorized: bool = Query(default=False, description="Filtra pela pseudo-categoria 'Outros serviços'"),
+    ctx: PublicBookingContext = Depends(get_public_context),
+) -> list[PublicServiceRead]:
+    services = public_booking_service.list_public_services(
+        ctx.session, ctx.organization.id, category_id=category_id, uncategorized_only=uncategorized
+    )
     return [PublicServiceRead.model_validate(s) for s in services]
 
 
@@ -125,8 +151,20 @@ def create_booking(
         start_at=payload.start_at,
         client_id=client_id,
     )
+    # Item 3 da Etapa M — tela "Agendamento confirmado!" mostra
+    # serviço/profissional de verdade, inclusive quando a cliente
+    # escolheu "Qualquer profissional" (resolvido dentro do service
+    # acima, não no payload) — resolve pelo item real gravado.
+    item = appointment.items[0]
+    service = service_repo.get(ctx.session, ctx.organization.id, item.service_id)
+    professional = professional_repo.get(ctx.session, ctx.organization.id, item.professional_id)
     return PublicBookingRead(
-        id=appointment.id, status=appointment.status, starts_at=appointment.starts_at, ends_at=appointment.ends_at
+        id=appointment.id,
+        status=appointment.status,
+        starts_at=appointment.starts_at,
+        ends_at=appointment.ends_at,
+        service_name=service.name if service is not None else "Serviço",
+        professional_name=professional.name if professional is not None else "Profissional",
     )
 
 

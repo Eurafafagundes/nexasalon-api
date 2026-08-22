@@ -89,9 +89,16 @@ def _assert_within_working_hours(
     session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID, professional_id: uuid.UUID,
     start_at: datetime, end_at: datetime,
 ) -> None:
+    """Reaproveita `effective_working_windows_utc` (jornada do
+    profissional JÁ recortada pelo horário de funcionamento do
+    estabelecimento, camada superior — Etapa M) — a MESMA função usada
+    por `compute_availability`, nunca uma segunda checagem. Isso garante
+    que nem a Agenda interna consegue criar um agendamento fora do
+    horário de funcionamento, mesmo que o profissional tenha jornada
+    cadastrada naquele dia."""
     tz = availability.effective_timezone(session, organization_id, branch_id)
     local_date = start_at.astimezone(tz).date()
-    windows = availability.working_windows_utc(session, organization_id, professional_id, local_date, tz)
+    windows = availability.effective_working_windows_utc(session, organization_id, professional_id, local_date, tz)
     if not any(w_start <= start_at and end_at <= w_end for w_start, w_end in windows):
         raise ValidationDomainError(
             f"Horário fora da jornada de trabalho do profissional ({start_at.isoformat()})."
@@ -419,7 +426,7 @@ def _assert_online_booking_lead_time(organization: Organization, start_at: datet
     existente (`_build_all_item_snapshots` -> `services/availability.py`)
     — isto aqui só recorta a janela de datas aceita antes de chegar lá."""
     now = datetime.now(timezone.utc)
-    earliest = now + timedelta(minutes=organization.online_booking_min_lead_minutes)
+    earliest = availability.earliest_public_booking_start(organization, now)
     if start_at < earliest:
         raise ValidationDomainError(
             "Este horário está muito próximo — escolha um horário com mais antecedência."
@@ -438,11 +445,17 @@ def _get_or_create_public_client(
     se não existir, criar cadastro" (item explícito do pedido) — nunca
     pede CPF/endereço, mesmo cadastro universal de `Client`, só com
     menos campos preenchidos. `phone` já chega normalizado (só dígitos)
-    de `schemas/public_booking.py::PublicBookingCreate`."""
-    existing = client_repo.get_by_phone(session, organization_id, phone)
-    if existing is not None:
-        return existing.id
-    client = client_repo.create(session, organization_id, name=name, phone=phone, email=email)
+    de `schemas/public_booking.py::PublicBookingCreate`.
+
+    Mesma correção de identidade de
+    `services/customer_accounts.py::resolve_client_for_customer_account`
+    (Bloco 8): busca por `phone` OU `whatsapp`, e só reusa quando existe
+    EXATAMENTE UM candidato — nunca escolhe arbitrariamente entre dois
+    cadastros antigos que por acaso compartilham o mesmo número."""
+    candidates = client_repo.list_candidates_by_identity(session, organization_id, phone)
+    if len(candidates) == 1:
+        return candidates[0].id
+    client = client_repo.create(session, organization_id, name=name, phone=phone, whatsapp=phone, email=email)
     return client.id
 
 
