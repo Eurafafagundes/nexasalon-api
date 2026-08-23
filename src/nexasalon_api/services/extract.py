@@ -25,6 +25,7 @@ from nexasalon_api.repositories import (
     client_repo,
     order_repo,
 )
+from nexasalon_api.schemas.extract import ExtractRowType
 
 
 @dataclass
@@ -44,21 +45,40 @@ def get_extract(
     date_from: datetime | None,
     date_to: datetime | None,
     status: OrderStatus | None = None,
+    row_type: ExtractRowType | None = None,
 ) -> ExtractSummary:
-    sales = order_repo.list_for_org(
+    """`row_type` filtra SÓ as listas `sales`/`movements` devolvidas
+    (e, por consequência, o que a tela mostra e o que o Excel exporta —
+    `build_extract_workbook` reaproveita esta mesma função, nunca uma
+    segunda query). Os totais (`revenue_total`/`expense_total`/`result`)
+    são sempre calculados sobre o PERÍODO INTEIRO, independente do
+    filtro — mesmo comportamento que os cards de resumo já tinham antes
+    deste filtro existir (nunca mudam ao trocar a aba Vendas/Despesas)."""
+    all_sales = order_repo.list_for_org(
         session, actor.organization_id, status=status, date_from=date_from, date_to=date_to
     )
-    movements = cash_movement_repo.list_for_org(
+    all_movements = cash_movement_repo.list_for_org(
         session, actor.organization_id, date_from=date_from, date_to=date_to
     )
 
     revenue_total = sum(
-        (sum((item.price for item in o.items), Decimal(0)) for o in sales if o.status == OrderStatus.CLOSED),
+        (sum((item.price for item in o.items), Decimal(0)) for o in all_sales if o.status == OrderStatus.CLOSED),
         Decimal(0),
     )
     expense_total = sum(
-        (m.amount for m in movements if m.type == CashMovementType.WITHDRAWAL), Decimal(0)
+        (m.amount for m in all_movements if m.type == CashMovementType.WITHDRAWAL), Decimal(0)
     )
+
+    if row_type is None or row_type == ExtractRowType.ALL:
+        sales, movements = all_sales, all_movements
+    elif row_type == ExtractRowType.SALES:
+        sales, movements = all_sales, []
+    elif row_type == ExtractRowType.SUPPLY:
+        sales = []
+        movements = [m for m in all_movements if m.type == CashMovementType.SUPPLY]
+    else:  # ExtractRowType.WITHDRAWAL
+        sales = []
+        movements = [m for m in all_movements if m.type == CashMovementType.WITHDRAWAL]
 
     client_ids = {o.client_id for o in sales}
     client_names = {
@@ -158,15 +178,19 @@ def build_extract_workbook(
     date_from: datetime | None,
     date_to: datetime | None,
     status: OrderStatus | None,
+    row_type: ExtractRowType | None = None,
 ) -> bytes:
     """Gera o `.xlsx` no BACKEND (item explícito do pedido: "preferir
     geração no backend se isso garantir RBAC, consistência e permitir
     volumes maiores") — nunca um CSV disfarçado de xlsx (usa `openpyxl`,
-    formato real do Excel)."""
+    formato real do Excel). `row_type` é o MESMO parâmetro/contrato de
+    `get_extract` (chamado abaixo, integralmente) — "o que está
+    filtrado/visualizado na tela é o que deve ser exportado", nunca uma
+    segunda lógica de filtro que possa divergir."""
     from openpyxl import Workbook
     from openpyxl.utils import get_column_letter
 
-    summary = get_extract(session, actor, date_from=date_from, date_to=date_to, status=status)
+    summary = get_extract(session, actor, date_from=date_from, date_to=date_to, status=status, row_type=row_type)
 
     branch_cache: dict[uuid.UUID, str] = {}
 

@@ -11,6 +11,7 @@ from nexasalon_api.models.enums import OrderStatus
 from nexasalon_api.schemas.extract import (
     ExtractMovementRow,
     ExtractResponse,
+    ExtractRowType,
     ExtractSaleRow,
 )
 from nexasalon_api.services import extract as extract_service
@@ -25,10 +26,13 @@ def get_extract(
     date_from: datetime | None = Query(None),
     date_to: datetime | None = Query(None),
     status_filter: OrderStatus | None = Query(None, alias="status"),
+    row_type: ExtractRowType | None = Query(None, alias="type"),
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_view),
 ) -> ExtractResponse:
-    summary = extract_service.get_extract(session, actor, date_from=date_from, date_to=date_to, status=status_filter)
+    summary = extract_service.get_extract(
+        session, actor, date_from=date_from, date_to=date_to, status=status_filter, row_type=row_type
+    )
     return ExtractResponse(
         date_from=date_from,
         date_to=date_to,
@@ -57,17 +61,18 @@ def export_extract(
     date_from: datetime | None = Query(None),
     date_to: datetime | None = Query(None),
     status_filter: OrderStatus | None = Query(None, alias="status"),
+    row_type: ExtractRowType | None = Query(None, alias="type"),
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_view),
 ) -> StreamingResponse:
     """Mesma permissão (`finance.view`) e MESMOS filtros de
     `GET /extract` acima — nunca uma segunda rota com regra de acesso
-    diferente pro mesmo dado. `date_from`/`date_to` já chegam
+    diferente pro mesmo dado. `date_from`/`date_to`/`type` já chegam
     organization-scoped por `get_extract`/`order_repo.list_for_org`;
     branch/RBAC não podem ser contornados pelo export porque é a MESMA
     consulta, só serializada como planilha em vez de JSON."""
     content = extract_service.build_extract_workbook(
-        session, actor, date_from=date_from, date_to=date_to, status=status_filter
+        session, actor, date_from=date_from, date_to=date_to, status=status_filter, row_type=row_type
     )
     filename = extract_service.build_extract_filename(date_from or datetime.now(timezone.utc))
     return StreamingResponse(

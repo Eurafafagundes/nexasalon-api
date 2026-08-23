@@ -97,6 +97,63 @@ def test_export_exige_finance_view(client_as, org_a_actor):
     assert resp.status_code == 403
 
 
+def test_export_com_type_sales_nunca_inclui_despesas(client_as, org_a_actor):
+    """Etapa N1 — regressão real reportada: filtrar "Vendas" na tela e
+    exportar não podia incluir despesas. `type=sales` tem que produzir
+    uma planilha só com a venda, mesmo havendo uma despesa manual no
+    mesmo período/organização."""
+    c = client_as(org_a_actor)
+    _setup_closed_order(c)
+    branch = c.post("/api/v1/branches", json={"name": "Filial", "slug": f"filial-{uuid.uuid4().hex[:6]}"}).json()
+    register = c.post("/api/v1/cash-registers", json={"branch_id": branch["id"], "initial_amount": "0"}).json()
+    withdrawal = c.post(
+        f"/api/v1/cash-registers/{register['id']}/movements",
+        json={"type": "withdrawal", "amount": "40.00", "description": "Compra de produtos"},
+    )
+    assert withdrawal.status_code == 200, withdrawal.text
+
+    resp = c.get("/api/v1/extract/export", params={"type": "sales"})
+    assert resp.status_code == 200, resp.text
+    rows = list(load_workbook(BytesIO(resp.content)).active.iter_rows(values_only=True))
+    header, *data_rows = rows
+    tipo_col = header.index("Tipo")
+    assert all(r[tipo_col] == "Venda" for r in data_rows)
+    assert len(data_rows) == 1  # só a venda — a despesa NÃO aparece
+
+
+def test_export_com_type_withdrawal_nunca_inclui_vendas(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    _setup_closed_order(c)
+    branch = c.post("/api/v1/branches", json={"name": "Filial", "slug": f"filial-{uuid.uuid4().hex[:6]}"}).json()
+    register = c.post("/api/v1/cash-registers", json={"branch_id": branch["id"], "initial_amount": "0"}).json()
+    withdrawal = c.post(
+        f"/api/v1/cash-registers/{register['id']}/movements",
+        json={"type": "withdrawal", "amount": "40.00", "description": "Compra de produtos"},
+    )
+    assert withdrawal.status_code == 200, withdrawal.text
+
+    resp = c.get("/api/v1/extract/export", params={"type": "withdrawal"})
+    assert resp.status_code == 200, resp.text
+    rows = list(load_workbook(BytesIO(resp.content)).active.iter_rows(values_only=True))
+    header, *data_rows = rows
+    tipo_col = header.index("Tipo")
+    assert len(data_rows) == 1
+    assert data_rows[0][tipo_col] == "Despesa"
+
+
+def test_listagem_get_extract_com_type_respeita_o_mesmo_filtro_da_exportacao(client_as, org_a_actor):
+    """Mesmo contrato (`type`) pras duas rotas — "o que está
+    visualizado é o que será exportado"."""
+    c = client_as(org_a_actor)
+    _setup_closed_order(c)
+
+    resp = c.get("/api/v1/extract", params={"type": "sales"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["sales"]) == 1
+    assert body["movements"] == []
+
+
 def test_export_nao_vaza_entre_organizacoes(client_as, org_a_actor, org_b_actor):
     c_a = client_as(org_a_actor)
     client_a = _setup_closed_order(c_a)

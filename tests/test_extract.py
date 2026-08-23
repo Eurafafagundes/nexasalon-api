@@ -284,6 +284,120 @@ def test_filtro_de_data_inclui_comanda_dentro_do_periodo(org_session):
 # ---------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------
+# Etapa N1 — `row_type` (Todos/Vendas/Entradas/Despesas): mesmo filtro
+# usado pela tela E pela exportação Excel (`build_extract_workbook`
+# reaproveita `get_extract` integralmente) — nunca duas lógicas.
+# ---------------------------------------------------------------------
+
+
+def _sales_and_movements_org(session, org_id, actor):
+    """Uma comanda fechada (venda) + uma entrada manual + uma despesa
+    manual, na mesma organização — pra testar que `row_type` recorta
+    CADA combinação sem afetar as outras nem os totais."""
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor, client_name="Cliente N1")
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    total = sum((i.price for i in order.items), Decimal("0"))
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+    cash_register.register_movement(
+        session, actor, register.id, CashMovementType.SUPPLY, Decimal("50.00"), "Aporte",
+    )
+    cash_register.register_movement(
+        session, actor, register.id, CashMovementType.WITHDRAWAL, Decimal("30.00"), "Compra",
+    )
+
+
+def test_row_type_sales_so_mostra_vendas_mas_nao_muda_os_totais(org_session):
+    from nexasalon_api.schemas.extract import ExtractRowType
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    _sales_and_movements_org(session, org_id, actor)
+
+    all_summary = extract.get_extract(session, actor, date_from=None, date_to=None)
+    filtered = extract.get_extract(session, actor, date_from=None, date_to=None, row_type=ExtractRowType.SALES)
+
+    assert len(filtered.sales) == 1
+    assert filtered.movements == []
+    # Totais (cards de resumo) NUNCA mudam com o filtro de linhas —
+    # sempre o período inteiro, igual antes deste filtro existir.
+    assert filtered.revenue_total == all_summary.revenue_total
+    assert filtered.expense_total == all_summary.expense_total
+    assert filtered.result == all_summary.result
+
+
+def test_row_type_withdrawal_so_mostra_despesas(org_session):
+    from nexasalon_api.schemas.extract import ExtractRowType
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    _sales_and_movements_org(session, org_id, actor)
+
+    filtered = extract.get_extract(session, actor, date_from=None, date_to=None, row_type=ExtractRowType.WITHDRAWAL)
+
+    assert filtered.sales == []
+    assert len(filtered.movements) == 1
+    assert filtered.movements[0].type == CashMovementType.WITHDRAWAL
+
+
+def test_row_type_supply_so_mostra_entradas(org_session):
+    from nexasalon_api.schemas.extract import ExtractRowType
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    _sales_and_movements_org(session, org_id, actor)
+
+    filtered = extract.get_extract(session, actor, date_from=None, date_to=None, row_type=ExtractRowType.SUPPLY)
+
+    assert filtered.sales == []
+    assert len(filtered.movements) == 1
+    assert filtered.movements[0].type == CashMovementType.SUPPLY
+
+
+def test_row_type_all_e_none_sao_equivalentes_e_mantem_tudo(org_session):
+    from nexasalon_api.schemas.extract import ExtractRowType
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    _sales_and_movements_org(session, org_id, actor)
+
+    without_filter = extract.get_extract(session, actor, date_from=None, date_to=None)
+    with_all = extract.get_extract(session, actor, date_from=None, date_to=None, row_type=ExtractRowType.ALL)
+
+    assert len(without_filter.sales) == len(with_all.sales) == 1
+    assert len(without_filter.movements) == len(with_all.movements) == 2
+
+
+def test_extract_sale_row_payment_methods_lista_estruturada_para_traducao(org_session):
+    """`payment_methods` (lista) existe ao lado de `payment_methods_summary`
+    (string legada) — o frontend usa a lista pra traduzir cada método
+    com `PAYMENT_METHOD_LABELS` sem fazer split de string."""
+    from nexasalon_api.schemas.extract import ExtractSaleRow
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor, client_name="Ana Souza")
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[
+            PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("300.00"), cash_register_id=register.id),
+            PaymentCreate(method=PaymentMethod.CREDIT, amount=Decimal("500.00"), card_brand=CardBrand.VISA, cash_register_id=register.id),
+        ]),
+    )
+    session.refresh(order)
+
+    row = ExtractSaleRow.from_order(order, "Ana Souza")
+
+    assert row.payment_methods == [PaymentMethod.PIX, PaymentMethod.CREDIT]
+    assert len(row.payment_methods) == 2  # sem duplicar, mesmo dedup de `payment_methods_summary`
+
+
 def test_extrato_nao_vaza_entre_organizacoes():
     org_a = uuid.uuid4()
     org_b = uuid.uuid4()

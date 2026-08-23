@@ -3,11 +3,28 @@ domínio (unidade = Comanda, não item/pagamento)."""
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum
 
 from pydantic import BaseModel
 
 from nexasalon_api.models.enums import CashMovementType, OrderStatus, PaymentMethod
 from nexasalon_api.models.order import Order
+
+
+class ExtractRowType(str, Enum):
+    """Filtro de "o que aparece" no Extrato — item explícito "o que estou
+    visualizando é o que será exportado": o MESMO valor é aceito por
+    `GET /extract` (tela) e `GET /extract/export` (Excel), nunca duas
+    lógicas de filtro divergentes. Não é um enum persistido no banco —
+    só recorta quais linhas de `ExtractSummary.sales`/`.movements`
+    voltam na resposta; os totais (`revenue_total`/`expense_total`/
+    `result`) continuam sempre referentes ao período INTEIRO, igual já
+    era o comportamento dos cards de resumo antes deste filtro existir."""
+
+    ALL = "all"
+    SALES = "sales"
+    SUPPLY = "supply"
+    WITHDRAWAL = "withdrawal"
 
 
 class ExtractSaleRow(BaseModel):
@@ -22,13 +39,19 @@ class ExtractSaleRow(BaseModel):
     client_name: str
     services_summary: str  # "Manutenção + Mechas"
     professionals_summary: str  # "Ianka + Ingrid"
-    payment_methods_summary: str  # "Pix" ou "Pix + Crédito"
+    payment_methods_summary: str  # "pix + credit" — LEGADO, ver `payment_methods` abaixo.
+    # Lista estruturada dos métodos únicos desta comanda (mesma ordem/
+    # dedup de `payment_methods_summary`, sem o "+"-join) — o frontend
+    # traduz cada um pra PT-BR (`PAYMENT_METHOD_LABELS`) sem precisar
+    # fazer split de string nem duplicar a lógica de tradução.
+    payment_methods: list[PaymentMethod]
     total: Decimal
     status: OrderStatus
 
     @classmethod
     def from_order(cls, order: Order, client_name: str) -> "ExtractSaleRow":
         total = sum((item.price for item in order.items), Decimal("0"))
+        unique_methods = list(dict.fromkeys(p.method for p in order.payments))
         return cls(
             order_id=order.id,
             order_number=order.order_number,
@@ -37,7 +60,8 @@ class ExtractSaleRow(BaseModel):
             client_name=client_name,
             services_summary=" + ".join(dict.fromkeys(i.service_name for i in order.items)) or "—",
             professionals_summary=" + ".join(dict.fromkeys(i.professional_name for i in order.items)) or "—",
-            payment_methods_summary=" + ".join(dict.fromkeys(p.method.value for p in order.payments)) or "—",
+            payment_methods_summary=" + ".join(m.value for m in unique_methods) or "—",
+            payment_methods=unique_methods,
             total=total,
             status=order.status,
         )
