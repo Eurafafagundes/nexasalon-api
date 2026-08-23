@@ -37,6 +37,7 @@ from nexasalon_api.schemas.customer_account import (
     CustomerRegisterRequest,
     PublicMyAppointmentRead,
 )
+from nexasalon_api.services import appointment_state_machine
 from nexasalon_api.services.google_oauth import GoogleIdentity
 
 
@@ -343,9 +344,21 @@ def list_my_appointments(
 
     rows: list[PublicMyAppointmentRead] = []
     for appointment in upcoming:
+        # Etapa N5 — `reschedule_by_customer` só aceita agendamento com
+        # exatamente 1 item (nunca reagenda "por item" isolado dentro
+        # de um agendamento com vários serviços); a listagem precisa
+        # concordar com essa mesma regra, senão o botão "Reagendar"
+        # apareceria habilitado numa linha que o backend recusaria.
+        single_item = len(appointment.items) == 1
+        status_allows_cancel = appointment_state_machine.is_cancellable(appointment.status)
+        status_allows_reschedule = single_item and appointment_state_machine.is_reschedulable(appointment.status)
         for item in appointment.items:
             service = service_repo.get(session, organization.id, item.service_id)
             professional = professional_repo.get(session, organization.id, item.professional_id)
+            within_window = appointment_state_machine.within_online_change_window(organization, item.start_at)
+
+            can_cancel = organization.online_cancel_enabled and status_allows_cancel and within_window
+            can_reschedule = organization.online_reschedule_enabled and status_allows_reschedule and within_window
             rows.append(
                 PublicMyAppointmentRead(
                     id=appointment.id,
@@ -355,6 +368,15 @@ def list_my_appointments(
                     starts_at=item.start_at,
                     ends_at=item.end_at,
                     status=appointment.status,
+                    can_cancel=can_cancel,
+                    can_reschedule=can_reschedule,
+                    cancel_lead_time_blocked=(
+                        organization.online_cancel_enabled and status_allows_cancel and not within_window
+                    ),
+                    reschedule_lead_time_blocked=(
+                        organization.online_reschedule_enabled and status_allows_reschedule and not within_window
+                    ),
+                    change_min_hours=organization.online_change_min_hours,
                 )
             )
     return rows

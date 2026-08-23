@@ -7,7 +7,14 @@ sendo o `Client` de cada organização, resolvido/vinculado à parte
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from nexasalon_api.core.normalize import normalize_phone
 from nexasalon_api.models.enums import AppointmentStatus
@@ -84,7 +91,16 @@ class PublicMyAppointmentRead(BaseModel):
     """Bloco 10 — "Meus agendamentos". Schema PRÓPRIO (não reaproveita
     `AppointmentRead` interno) — mesma disciplina de segurança do resto
     do Agendamento Online público: só os campos que a própria cliente
-    tem motivo de ver, nunca preço/comissão/nota interna."""
+    tem motivo de ver, nunca preço/comissão/nota interna.
+
+    Etapa N5 — `can_cancel`/`can_reschedule` já vêm PRONTOS do backend
+    (mesma regra usada por `cancel_by_customer`/`reschedule_by_customer`
+    — nunca uma segunda interpretação no frontend, "não hardcode 24 na
+    UI"). `cancel_lead_time_blocked`/`reschedule_lead_time_blocked` só
+    ficam `true` quando a ÚNICA razão de `can_*` ser `false` é a janela
+    de antecedência (não a configuração desligada nem o status) — é o
+    sinal pro frontend mostrar um botão desabilitado COM explicação em
+    vez de simplesmente esconder a ação (item explícito do pedido)."""
 
     id: uuid.UUID
     organization_name: str
@@ -93,3 +109,30 @@ class PublicMyAppointmentRead(BaseModel):
     starts_at: datetime | None
     ends_at: datetime | None
     status: AppointmentStatus
+    can_cancel: bool
+    can_reschedule: bool
+    cancel_lead_time_blocked: bool
+    reschedule_lead_time_blocked: bool
+    change_min_hours: int
+
+
+class PublicAppointmentCancelRequest(BaseModel):
+    """Motivo é OPCIONAL (item explícito "sem criar complexidade
+    excessiva") — só vai pro `AuditLog`, nunca bloqueia o cancelamento
+    se ausente."""
+
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class PublicAppointmentRescheduleRequest(BaseModel):
+    """Só troca DATA/HORÁRIO (item explícito do pedido) — serviço,
+    profissional, duração e preço nunca fazem parte deste payload."""
+
+    start_at: datetime
+
+    @field_validator("start_at")
+    @classmethod
+    def _require_tz(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("start_at deve incluir informação de fuso horário (ISO 8601 com offset).")
+        return value

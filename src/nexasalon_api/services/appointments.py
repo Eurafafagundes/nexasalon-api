@@ -34,6 +34,7 @@ from nexasalon_api.repositories import (
     audit_log_repo,
     branch_repo,
     client_repo,
+    customer_account_repo,
     order_repo,
     professional_repo,
     professional_service_repo,
@@ -51,6 +52,8 @@ from nexasalon_api.services import cash_register as cash_register_service
 from nexasalon_api.services.appointment_state_machine import (
     OPERATIONAL_STATUSES,
     assert_cancellable,
+    assert_online_change_window,
+    assert_reschedulable,
     next_status,
 )
 from nexasalon_api.services.appointment_state_machine import (
@@ -1072,3 +1075,152 @@ def update_appointment_item(
         )
 
     return _reload(session, organization_id, appointment_id)
+
+
+# ---------------------------------------------------------------------------
+# Etapa N5 — Cancelamento e Reagendamento pelo CLIENTE (área pública "Meus
+# Agendamentos"). Nenhum motor novo: reusa a MESMA validação de
+# jornada/bloqueio/conflito (`_assert_within_working_hours`/
+# `_assert_no_schedule_block`/`appointment_item_repo.list_conflicts`) e a
+# MESMA máquina de estados (`appointment_state_machine`) já usadas pela
+# Agenda interna. `ActorContext` não existe aqui (não há login de staff)
+# — a autorização vem inteiramente de `CustomerAccountLink`, nunca de um
+# `appointment_id` isolado sem dono verificado.
+# ---------------------------------------------------------------------------
+
+
+def get_own_appointment_for_customer(
+    session: Session, organization_id: uuid.UUID, account_id: uuid.UUID, appointment_id: uuid.UUID
+) -> Appointment:
+    """Resolve o `Appointment` só se ele pertencer ao `Client` vinculado
+    a ESTA `CustomerAccount` NESTA organização (`CustomerAccountLink`,
+    mesmo padrão de `services/customer_accounts.py::list_my_appointments`
+    — nunca aceitar `appointment_id` sem essa verificação). Sempre 404
+    (nunca 403) quando não pertence — não revela se o agendamento existe
+    pra outra cliente."""
+    link = customer_account_repo.get_link(session, account_id, organization_id)
+    if link is None:
+        raise NotFoundError("Agendamento não encontrado.")
+    appointment = appointment_repo.get(session, organization_id, appointment_id)
+    if appointment is None or appointment.client_id != link.client_id:
+        raise NotFoundError("Agendamento não encontrado.")
+    return appointment
+
+
+def cancel_by_customer(
+    session: Session,
+    organization: Organization,
+    account_id: uuid.UUID,
+    appointment_id: uuid.UUID,
+    *,
+    reason: str | None,
+) -> Appointment:
+    organization_id = organization.id
+    appointment = get_own_appointment_for_customer(session, organization_id, account_id, appointment_id)
+
+    if not organization.online_cancel_enabled:
+        raise ValidationDomainError("Cancelamento online não está disponível para este estabelecimento.")
+    assert_cancellable(appointment.status)
+    assert_online_change_window(organization, appointment.starts_at)
+
+    old_status = appointment.status
+    appointment.status = AppointmentStatus.CANCELLED
+    session.flush()
+
+    audit_log_repo.create(
+        session, organization_id=organization_id, user_id=None, entity_type="appointment",
+        entity_id=appointment_id, action=AuditAction.UPDATE,
+        old_values={"status": old_status.value},
+        new_values={
+            "status": AppointmentStatus.CANCELLED.value, "change_type": "cancel_by_customer",
+            "customer_account_id": str(account_id), "reason": reason,
+        },
+    )
+    return _reload(session, organization_id, appointment_id)
+
+
+def _validate_reschedule_slot(
+    session: Session,
+    organization_id: uuid.UUID,
+    branch_id: uuid.UUID,
+    appointment_id: uuid.UUID,
+    *,
+    professional_id: uuid.UUID,
+    start_at: datetime,
+    end_at: datetime,
+) -> None:
+    """Reagendamento troca só DATA/HORÁRIO — serviço, profissional,
+    duração e preço continuam exatamente os do item original (item
+    explícito do pedido: "permanecem intactos"). Por isso reusa só a
+    validação de DISPONIBILIDADE (jornada + bloqueio + conflito — as
+    MESMAS funções de `_build_item_snapshot`, nunca uma segunda lógica
+    de agenda), sem recalcular preço/duração do catálogo — o catálogo
+    pode ter mudado desde a reserva original, mas isso nunca pode
+    alterar silenciosamente o que a cliente já contratou.
+    `exclude_appointment_id=appointment_id` garante que o PRÓPRIO
+    horário atual do agendamento nunca conta como conflito contra ele
+    mesmo (item explícito do pedido)."""
+    _assert_within_working_hours(session, organization_id, branch_id, professional_id, start_at, end_at)
+    _assert_no_schedule_block(session, organization_id, branch_id, professional_id, start_at, end_at)
+    conflicts = appointment_item_repo.list_conflicts(
+        session, organization_id, professional_id=professional_id, start_at=start_at, end_at=end_at,
+        exclude_appointment_id=appointment_id,
+    )
+    if conflicts:
+        raise ConflictError(
+            f"Este horário acabou de ficar indisponível ({start_at.isoformat()}) — escolha outro horário."
+        )
+
+
+def reschedule_by_customer(
+    session: Session,
+    organization: Organization,
+    account_id: uuid.UUID,
+    appointment_id: uuid.UUID,
+    new_start_at: datetime,
+) -> Appointment:
+    """Item 9 do pedido (concorrência): esta função SEMPRE revalida
+    disponibilidade no momento da confirmação (`_validate_reschedule_slot`,
+    dentro da mesma transação da request) — nunca confia no horário que
+    estava livre quando a tela de horários foi carregada. Se outra
+    pessoa ocupou o slot nesse meio-tempo, `ConflictError` (409) aqui."""
+    organization_id = organization.id
+    appointment = get_own_appointment_for_customer(session, organization_id, account_id, appointment_id)
+
+    if not organization.online_reschedule_enabled:
+        raise ValidationDomainError("Reagendamento online não está disponível para este estabelecimento.")
+    assert_reschedulable(appointment.status)
+    if len(appointment.items) != 1:
+        raise ValidationDomainError(
+            "Este agendamento tem mais de um serviço e não pode ser reagendado pelo autoatendimento — "
+            "entre em contato com o estabelecimento."
+        )
+    item = appointment.items[0]
+    # Antecedência mínima é checada contra o horário ATUAL do
+    # agendamento (a coisa que está sendo alterada) — checagem SEPARADA
+    # da antecedência do NOVO horário (abaixo), que é a mesma regra que
+    # qualquer reserva online nova precisa cumprir.
+    assert_online_change_window(organization, item.start_at)
+    _assert_online_booking_lead_time(organization, new_start_at)
+
+    new_end_at = new_start_at + timedelta(minutes=item.duration_minutes)
+    _validate_reschedule_slot(
+        session, organization_id, appointment.branch_id, appointment.id,
+        professional_id=item.professional_id, start_at=new_start_at, end_at=new_end_at,
+    )
+
+    old_start_at, old_end_at = item.start_at, item.end_at
+    item.start_at = new_start_at
+    item.end_at = new_end_at
+    session.flush()  # dispara o trigger recalc_appointment_bounds (migration 0006)
+
+    audit_log_repo.create(
+        session, organization_id=organization_id, user_id=None, entity_type="appointment",
+        entity_id=appointment.id, action=AuditAction.UPDATE,
+        old_values={"start_at": old_start_at.isoformat(), "end_at": old_end_at.isoformat()},
+        new_values={
+            "start_at": new_start_at.isoformat(), "end_at": new_end_at.isoformat(),
+            "change_type": "reschedule_by_customer", "customer_account_id": str(account_id),
+        },
+    )
+    return _reload(session, organization_id, appointment.id)

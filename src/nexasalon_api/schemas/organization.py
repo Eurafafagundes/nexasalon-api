@@ -28,6 +28,9 @@ class OrganizationRead(BaseModel):
     online_booking_min_lead_minutes: int
     online_booking_max_lead_days: int
     online_booking_same_day_enabled: bool
+    online_cancel_enabled: bool
+    online_reschedule_enabled: bool
+    online_change_min_hours: int
     legal_name: str | None
     logo_url: str | None
     email: str | None
@@ -73,6 +76,9 @@ class OrganizationUpdate(BaseModel):
     online_booking_min_lead_minutes: int | None = Field(default=None, ge=0, le=10080)
     online_booking_max_lead_days: int | None = Field(default=None, ge=1, le=3650)
     online_booking_same_day_enabled: bool | None = None
+    online_cancel_enabled: bool | None = None
+    online_reschedule_enabled: bool | None = None
+    online_change_min_hours: int | None = Field(default=None, ge=0, le=720)
     legal_name: str | None = Field(default=None, max_length=255)
     document: str | None = Field(default=None, max_length=18)
     business_type: str | None = Field(default=None, max_length=50)

@@ -42,8 +42,11 @@ Resumo das travas de `next_status` (usado pelo PATCH genérico,
     não tem "descancelar").
   - Qualquer outro par operacional -> permitido nos dois sentidos.
 """
+from datetime import datetime, timedelta, timezone
+
 from nexasalon_api.core.exceptions import ValidationDomainError
 from nexasalon_api.models.enums import AppointmentStatus
+from nexasalon_api.models.organization import Organization
 
 # Status operacionais: participam do grafo livre de `next_status`. Fora
 # daqui ficam `PAID` (só automático, via Comanda) e `CANCELLED` (só via
@@ -67,6 +70,21 @@ _TERMINAL_FOR_MANUAL_CHANGE = frozenset({AppointmentStatus.PAID, AppointmentStat
 # De quais estados dá pra cancelar. Terminal -> não dá (inclusive
 # cancelar algo já cancelado, ou um FINISHED/NO_SHOW/PAID).
 _CANCELLABLE_FROM = frozenset(
+    {
+        AppointmentStatus.SCHEDULED,
+        AppointmentStatus.CONFIRMED,
+        AppointmentStatus.WAITING,
+        AppointmentStatus.IN_PROGRESS,
+    }
+)
+
+# Etapa N5 — de quais estados dá pra reagendar (mudar só data/horário,
+# nunca serviço/profissional). Mesmo conjunto de `_CANCELLABLE_FROM`
+# hoje (um agendamento concluído/pago/cancelado/faltou não faz sentido
+# reagendar), mas mantido como constante SEPARADA — as duas regras
+# podem divergir no futuro (ex.: um dia permitir reagendar um
+# `NO_SHOW`) sem precisar reinterpretar `_CANCELLABLE_FROM`.
+_RESCHEDULABLE_FROM = frozenset(
     {
         AppointmentStatus.SCHEDULED,
         AppointmentStatus.CONFIRMED,
@@ -120,6 +138,48 @@ def mark_paid(current: AppointmentStatus) -> AppointmentStatus:
     return AppointmentStatus.PAID
 
 
+def is_cancellable(current: AppointmentStatus) -> bool:
+    return current in _CANCELLABLE_FROM
+
+
 def assert_cancellable(current: AppointmentStatus) -> None:
-    if current not in _CANCELLABLE_FROM:
+    if not is_cancellable(current):
         raise ValidationDomainError(f"Não é possível cancelar um agendamento com status '{current.value}'.")
+
+
+def is_reschedulable(current: AppointmentStatus) -> bool:
+    return current in _RESCHEDULABLE_FROM
+
+
+def assert_reschedulable(current: AppointmentStatus) -> None:
+    if not is_reschedulable(current):
+        raise ValidationDomainError(f"Não é possível reagendar um agendamento com status '{current.value}'.")
+
+
+# ---------------------------------------------------------------------------
+# Etapa N5 — janela de antecedência pra cancelamento/reagendamento ONLINE
+# (`Organization.online_change_min_hours`). ÚNICA fonte desta regra —
+# usada tanto por `services/appointments.py::cancel_by_customer`/
+# `reschedule_by_customer` (pra recusar a ação) quanto por
+# `services/customer_accounts.py::list_my_appointments` (pra decidir se
+# mostra o botão habilitado, desabilitado-com-explicação, ou nem
+# mostra) — nunca duas interpretações da mesma janela.
+# ---------------------------------------------------------------------------
+
+
+def within_online_change_window(organization: Organization, appointment_start_at: datetime | None) -> bool:
+    """`None` (horário do agendamento ainda não resolvido) nunca é
+    tratado como "dentro da janela" — conservador por padrão, nunca
+    libera uma ação online sem um horário real pra comparar."""
+    if appointment_start_at is None:
+        return False
+    now = datetime.now(timezone.utc)
+    return appointment_start_at - now >= timedelta(hours=organization.online_change_min_hours)
+
+
+def assert_online_change_window(organization: Organization, appointment_start_at: datetime | None) -> None:
+    if not within_online_change_window(organization, appointment_start_at):
+        raise ValidationDomainError(
+            f"Alterações online não estão disponíveis com menos de {organization.online_change_min_hours} "
+            "horas de antecedência. Entre em contato com o estabelecimento."
+        )

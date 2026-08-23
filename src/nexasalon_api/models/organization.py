@@ -124,6 +124,20 @@ class Organization(Base, UUIDPKMixin, TimestampMixin):
     # e `services/appointments.py::_assert_online_booking_lead_time`.
     online_booking_same_day_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
 
+    # Etapa N5 — Cancelamento e Reagendamento Online (Configurações >
+    # Agendamento Online). Ambas nascem DESLIGADAS (`false`) pra
+    # organizações existentes — é uma capacidade nova, nenhuma
+    # organização ganha autoatendimento sem o proprietário ligar
+    # explicitamente (mesmo raciocínio de `online_booking_enabled`
+    # acima). `online_change_min_hours` nasce em 24 — antecedência
+    # mínima pra cancelar/reagendar, independente de estar ligado ou
+    # não (só passa a valer quando a respectiva flag está ativa). Ver
+    # `services/appointments.py::cancel_by_customer`/
+    # `reschedule_by_customer`.
+    online_cancel_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    online_reschedule_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    online_change_min_hours: Mapped[int] = mapped_column(Integer, nullable=False, server_default="24")
+
     branches: Mapped[list["Branch"]] = relationship(back_populates="organization")
 
 

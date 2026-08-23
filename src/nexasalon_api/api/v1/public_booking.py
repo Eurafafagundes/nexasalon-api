@@ -22,7 +22,11 @@ from nexasalon_api.repositories import (
     professional_repo,
     service_repo,
 )
-from nexasalon_api.schemas.customer_account import PublicMyAppointmentRead
+from nexasalon_api.schemas.customer_account import (
+    PublicAppointmentCancelRequest,
+    PublicAppointmentRescheduleRequest,
+    PublicMyAppointmentRead,
+)
 from nexasalon_api.schemas.public_booking import (
     PublicAvailabilitySlotRead,
     PublicBookingCreate,
@@ -37,6 +41,24 @@ from nexasalon_api.services import customer_accounts as customer_accounts_servic
 from nexasalon_api.services import public_booking as public_booking_service
 
 router = APIRouter(prefix="/public/booking/{organization_slug}", tags=["public-booking"])
+
+
+def _to_booking_read(session, organization_id: uuid.UUID, appointment) -> PublicBookingRead:
+    """Monta a resposta de confirmação (id/status/horário/serviço/
+    profissional) — usada por `create_booking` e pelas ações da Etapa
+    N5 (`cancel_my_appointment`/`reschedule_my_appointment`), nunca
+    reimplementada em cada rota."""
+    item = appointment.items[0]
+    service = service_repo.get(session, organization_id, item.service_id)
+    professional = professional_repo.get(session, organization_id, item.professional_id)
+    return PublicBookingRead(
+        id=appointment.id,
+        status=appointment.status,
+        starts_at=appointment.starts_at,
+        ends_at=appointment.ends_at,
+        service_name=service.name if service is not None else "Serviço",
+        professional_name=professional.name if professional is not None else "Profissional",
+    )
 
 
 @router.get("", response_model=PublicOrganizationRead, summary="Dados públicos da organização")
@@ -155,17 +177,7 @@ def create_booking(
     # serviço/profissional de verdade, inclusive quando a cliente
     # escolheu "Qualquer profissional" (resolvido dentro do service
     # acima, não no payload) — resolve pelo item real gravado.
-    item = appointment.items[0]
-    service = service_repo.get(ctx.session, ctx.organization.id, item.service_id)
-    professional = professional_repo.get(ctx.session, ctx.organization.id, item.professional_id)
-    return PublicBookingRead(
-        id=appointment.id,
-        status=appointment.status,
-        starts_at=appointment.starts_at,
-        ends_at=appointment.ends_at,
-        service_name=service.name if service is not None else "Serviço",
-        professional_name=professional.name if professional is not None else "Profissional",
-    )
+    return _to_booking_read(ctx.session, ctx.organization.id, appointment)
 
 
 @router.get(
@@ -181,3 +193,76 @@ def list_my_appointments(
     if account is None or not account.is_active:
         raise UnauthorizedError("Conta inválida ou inativa.")
     return customer_accounts_service.list_my_appointments(ctx.session, ctx.organization, account)
+
+
+@router.post(
+    "/me/appointments/{appointment_id}/cancel",
+    response_model=PublicBookingRead,
+    summary="Etapa N5 — cancelar um agendamento próprio (autoatendimento)",
+)
+def cancel_my_appointment(
+    appointment_id: uuid.UUID,
+    payload: PublicAppointmentCancelRequest,
+    ctx: PublicBookingContext = Depends(get_public_context),
+    customer: CustomerActor = Depends(get_current_customer),
+) -> PublicBookingRead:
+    account = customer_account_repo.get(ctx.session, customer.customer_account_id)
+    if account is None or not account.is_active:
+        raise UnauthorizedError("Conta inválida ou inativa.")
+    appointment = appointments_service.cancel_by_customer(
+        ctx.session, ctx.organization, account.id, appointment_id, reason=payload.reason
+    )
+    return _to_booking_read(ctx.session, ctx.organization.id, appointment)
+
+
+@router.patch(
+    "/me/appointments/{appointment_id}/reschedule",
+    response_model=PublicBookingRead,
+    summary="Etapa N5 — reagendar (só data/horário) um agendamento próprio",
+)
+def reschedule_my_appointment(
+    appointment_id: uuid.UUID,
+    payload: PublicAppointmentRescheduleRequest,
+    ctx: PublicBookingContext = Depends(get_public_context),
+    customer: CustomerActor = Depends(get_current_customer),
+) -> PublicBookingRead:
+    account = customer_account_repo.get(ctx.session, customer.customer_account_id)
+    if account is None or not account.is_active:
+        raise UnauthorizedError("Conta inválida ou inativa.")
+    appointment = appointments_service.reschedule_by_customer(
+        ctx.session, ctx.organization, account.id, appointment_id, payload.start_at
+    )
+    return _to_booking_read(ctx.session, ctx.organization.id, appointment)
+
+
+@router.get(
+    "/me/appointments/{appointment_id}/availability",
+    response_model=list[PublicAvailabilitySlotRead],
+    summary="Etapa N5 — horários disponíveis pra reagendar UM agendamento próprio",
+)
+def get_my_appointment_availability(
+    appointment_id: uuid.UUID,
+    date: date_type,
+    ctx: PublicBookingContext = Depends(get_public_context),
+    customer: CustomerActor = Depends(get_current_customer),
+) -> list[PublicAvailabilitySlotRead]:
+    """Nunca recebe `service_id`/`professional_id`/`branch_id` do
+    frontend (evita expor esses IDs internos na listagem de "Meus
+    agendamentos" só pra poder montar esta chamada) — resolve tudo a
+    partir do PRÓPRIO agendamento, já com ownership verificado."""
+    account = customer_account_repo.get(ctx.session, customer.customer_account_id)
+    if account is None or not account.is_active:
+        raise UnauthorizedError("Conta inválida ou inativa.")
+    appointment = appointments_service.get_own_appointment_for_customer(
+        ctx.session, ctx.organization.id, account.id, appointment_id
+    )
+    item = appointment.items[0]
+    slots = public_booking_service.get_public_availability(
+        ctx.session,
+        ctx.organization.id,
+        branch_id=appointment.branch_id,
+        service_id=item.service_id,
+        professional_id=item.professional_id,
+        target_date=date,
+    )
+    return [PublicAvailabilitySlotRead(start_at=s.start_at, end_at=s.end_at) for s in slots]
