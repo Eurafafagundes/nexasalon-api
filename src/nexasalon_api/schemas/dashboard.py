@@ -157,6 +157,41 @@ class DashboardKpis(BaseModel):
     new_clients: KpiValue
 
 
+class RevenueFeeSummary(BaseModel):
+    """Etapa N4 — Bruto/Taxa/Líquido do PERÍODO (não de uma comanda só,
+    ver `ExtractPaymentBreakdownRow`/`ExtractSaleRow` pro equivalente por
+    comanda no Extrato). Mesma semântica financeira dos dois lugares,
+    calculada pela MESMA função (`services/payment_fees.py`) — nunca uma
+    segunda interpretação de `fee_status` aqui.
+
+    `gross_revenue` é EXATAMENTE `kpis.revenue.value` (soma de
+    `OrderItem.price` de comandas fechadas no período) — nunca soma de
+    `Payment.amount`; ver docstring "TRÊS CONCEITOS" em
+    `services/dashboard.py`. As taxas, por sua vez, só existem nos
+    `Payment` — por isso são calculadas a partir de uma população
+    diferente (pagamentos, não itens), sem redefinir o que é Bruto.
+
+    `known_net_revenue` = `gross_revenue - known_fee_total`, SEMPRE
+    calculável (nunca `None`) — mas só pode ser apresentado como
+    "Faturamento Líquido" definitivo quando `has_unconfigured_fee` é
+    `False`. Quando `has_unconfigured_fee` é `True`, este mesmo número
+    ainda é exibível, só que como "Líquido CONHECIDO" (rótulo
+    diferente, nunca fingindo ser o líquido final) — exatamente porque
+    ele deliberadamente NÃO desconta nenhuma taxa dos pagamentos em
+    `unconfigured_card_amount` (a taxa real deles é desconhecida, nunca
+    zero); o frontend é responsável por mostrar `unconfigured_card_amount`
+    junto sempre que `has_unconfigured_fee` for `True`, pra nunca deixar
+    a impressão de que R$X é definitivo. Mesmo raciocínio do item do
+    pedido: "Líquido conhecido: R$9.800" + "R$2.000 aguardando
+    configuração de taxa" (nunca só "Líquido: R$9.800")."""
+
+    gross_revenue: Decimal
+    known_fee_total: Decimal
+    known_net_revenue: Decimal
+    unconfigured_card_amount: Decimal
+    has_unconfigured_fee: bool
+
+
 class DashboardOverviewResponse(BaseModel):
     date_from: datetime
     date_to: datetime
@@ -168,11 +203,15 @@ class DashboardOverviewResponse(BaseModel):
     revenue_series: list[SeriesPoint]
     top_services: list[TopServiceRow]
     professionals: list[ProfessionalPerformanceRow]
+    # Mantido no contrato (evita breaking change em consumidores
+    # futuros) mesmo sem o card correspondente no frontend a partir da
+    # Etapa N4 — ver `services/dashboard.py::_status_distribution`.
     status_distribution: list[StatusDistributionRow]
     payment_methods: list[PaymentMethodRow]
     new_vs_recurring: list[NewVsRecurringPoint]
     retention: RetentionSummary
     heatmap: list[HeatmapCell]
+    revenue_fee_summary: RevenueFeeSummary
 
 
 class RevenueReconciliation(BaseModel):

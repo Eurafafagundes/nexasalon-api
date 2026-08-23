@@ -28,7 +28,14 @@ from nexasalon_api.core.exceptions import ValidationDomainError
 from nexasalon_api.models.appointment import Appointment, AppointmentItem
 from nexasalon_api.models.cash_register import CashRegister
 from nexasalon_api.models.client import Client
-from nexasalon_api.models.enums import AppointmentStatus, CashRegisterStatus, OrderStatus, PaymentMethod
+from nexasalon_api.models.enums import (
+    AppointmentStatus,
+    CardBrand,
+    CashRegisterStatus,
+    OrderStatus,
+    PaymentFeeStatus,
+    PaymentMethod,
+)
 from nexasalon_api.models.identity import User
 from nexasalon_api.models.order import Order, OrderItem, Payment
 from nexasalon_api.models.organization import Branch, Organization
@@ -152,6 +159,10 @@ def _closed_order(
             Payment(
                 organization_id=org_id, order_id=order.id, cash_register_id=cash_register_id,
                 method=p["method"], amount=p["amount"], created_by_name="Teste",
+                card_brand=p.get("card_brand"), fee_status=p.get("fee_status"),
+                fee_percent_snapshot=p.get("fee_percent_snapshot"),
+                fee_amount_snapshot=p.get("fee_amount_snapshot"),
+                net_amount_snapshot=p.get("net_amount_snapshot"),
             )
         )
     session.flush()
@@ -576,6 +587,14 @@ def test_top_servicos_agrega_por_servico_sem_duplicar_faturamento(org_session):
 # soma de pagamentos nunca altera o valor de Faturamento, só sinaliza
 # pendência/excedente.
 # ---------------------------------------------------------------------------
+
+
+def _overview(session, actor, *, date_from=None, date_to=None, branch_id=None):
+    return dashboard_service.get_overview(
+        session, actor, branch_id=branch_id,
+        date_from=date_from or _dt(2026, 8, 1, 0), date_to=date_to or _dt(2026, 9, 1, 0),
+        compare_from=None, compare_to=None,
+    )
 
 
 def _revenue_detail(session, actor):
@@ -1006,6 +1025,513 @@ def test_drill_down_de_kpi_desconhecido_da_not_found(org_session):
             session, actor, key="inexistente", branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
             compare_from=None, compare_to=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# Etapa N4 — Faturamento Bruto/Taxa/Líquido do período
+# (`DashboardOverviewResponse.revenue_fee_summary`). `gross_revenue`
+# sempre igual a `kpis.revenue.value` (soma de `OrderItem`, nunca de
+# `Payment`); taxa/líquido calculados a partir dos `Payment` das MESMAS
+# comandas, via `services/payment_fees.py` (mesma leitura de
+# `fee_status` do Extrato — nunca uma segunda interpretação).
+# ---------------------------------------------------------------------------
+
+
+def test_fee_summary_periodo_so_com_pix_sem_taxa(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 8, 10), price=Decimal("300"), method=PaymentMethod.PIX)
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("300")
+    assert summary.known_fee_total == Decimal("0")
+    assert summary.known_net_revenue == Decimal("300")
+    assert summary.unconfigured_card_amount == Decimal("0")
+    assert summary.has_unconfigured_fee is False
+
+
+def test_fee_summary_periodo_so_com_dinheiro_sem_taxa(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 8, 10), price=Decimal("150"), method=PaymentMethod.CASH)
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("150")
+    assert summary.known_fee_total == Decimal("0")
+    assert summary.known_net_revenue == Decimal("150")
+    assert summary.has_unconfigured_fee is False
+
+
+def test_fee_summary_credito_com_taxa_calculada(org_session):
+    """Pagamento de crédito com regra já resolvida no fechamento
+    (snapshot congelado, `fee_status=calculated`) — a taxa entra em
+    `known_fee_total`, líquido = bruto - taxa."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("1000")}],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("1000"), "card_brand": CardBrand.VISA,
+            "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("2.99"),
+            "fee_amount_snapshot": Decimal("29.90"), "net_amount_snapshot": Decimal("970.10"),
+        }],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("1000")
+    assert summary.known_fee_total == Decimal("29.90")
+    assert summary.known_net_revenue == Decimal("970.10")
+    assert summary.unconfigured_card_amount == Decimal("0")
+    assert summary.has_unconfigured_fee is False
+
+
+def test_fee_summary_debito_com_taxa_calculada(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("500")}],
+        payments=[{
+            "method": PaymentMethod.DEBIT, "amount": Decimal("500"), "card_brand": CardBrand.MASTERCARD,
+            "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("1.50"),
+            "fee_amount_snapshot": Decimal("7.50"), "net_amount_snapshot": Decimal("492.50"),
+        }],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.known_fee_total == Decimal("7.50")
+    assert summary.known_net_revenue == Decimal("492.50")
+
+
+def test_fee_summary_venda_com_pagamento_misto_taxa_so_no_cartao(org_session):
+    """R$300 Pix + R$500 Crédito (com taxa) numa comanda de R$800 — a
+    taxa incide só sobre o Payment de cartão, nunca sobre o total da
+    comanda (item explícito do pedido: pagamento dividido)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("800")}],
+        payments=[
+            {"method": PaymentMethod.PIX, "amount": Decimal("300")},
+            {
+                "method": PaymentMethod.CREDIT, "amount": Decimal("500"), "card_brand": CardBrand.VISA,
+                "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("2.99"),
+                "fee_amount_snapshot": Decimal("14.95"), "net_amount_snapshot": Decimal("485.05"),
+            },
+        ],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("800")
+    assert summary.known_fee_total == Decimal("14.95")
+    assert summary.known_net_revenue == Decimal("785.05")
+
+
+def test_fee_summary_duas_taxas_diferentes_no_mesmo_periodo_somam(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    for i, (price, fee) in enumerate([(Decimal("1000"), Decimal("29.90")), (Decimal("500"), Decimal("7.50"))]):
+        appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10 + i, 9))
+        _closed_order(
+            session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10 + i, 11),
+            items=[{"service_id": service_id, "professional_id": prof.id, "price": price}],
+            payments=[{
+                "method": PaymentMethod.CREDIT, "amount": price, "card_brand": CardBrand.VISA,
+                "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("2.99"),
+                "fee_amount_snapshot": fee, "net_amount_snapshot": price - fee,
+            }],
+            cash_register_id=cr.id,
+        )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("1500")
+    assert summary.known_fee_total == Decimal("37.40")
+    assert summary.known_net_revenue == Decimal("1462.60")
+
+
+def test_fee_summary_cartao_com_taxa_nao_configurada_nunca_vira_liquido_zero_por_cento(org_session):
+    """Pagamento de crédito sem regra correspondente no momento da
+    venda (`fee_status=unconfigured`, snapshots `None`) — NUNCA tratado
+    como taxa zero: `known_net_revenue` continua calculável (não
+    desconta nada do pagamento não configurado), mas
+    `has_unconfigured_fee` sinaliza que ele não pode ser apresentado
+    como líquido definitivo, e o valor bruto do pagamento aparece à
+    parte em `unconfigured_card_amount`."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("400")}],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("400"), "card_brand": CardBrand.ELO,
+            "fee_status": PaymentFeeStatus.UNCONFIGURED,
+        }],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("400")
+    assert summary.known_fee_total == Decimal("0")
+    assert summary.known_net_revenue == Decimal("400")  # "conhecido" = bruto - taxas conhecidas (nenhuma aqui) — não é o líquido definitivo.
+    assert summary.unconfigured_card_amount == Decimal("400")
+    assert summary.has_unconfigured_fee is True
+
+
+def test_fee_summary_periodo_misturando_taxa_conhecida_e_desconhecida(org_session):
+    """Uma comanda com taxa calculada + outra com taxa não configurada
+    no MESMO período — `known_fee_total` soma só a conhecida,
+    `known_net_revenue` reflete só esse desconto conhecido (não pode
+    fingir que o desconhecido é zero, por isso `has_unconfigured_fee`
+    marca o número como não-definitivo) e `unconfigured_card_amount`
+    reflete só o pagamento realmente desconhecido."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    appt1 = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt1.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("1000")}],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("1000"), "card_brand": CardBrand.VISA,
+            "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("2.99"),
+            "fee_amount_snapshot": Decimal("29.90"), "net_amount_snapshot": Decimal("970.10"),
+        }],
+        cash_register_id=cr.id,
+    )
+    appt2 = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 11, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt2.id, closed_at=_dt(2026, 8, 11, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("400")}],
+        payments=[{
+            "method": PaymentMethod.DEBIT, "amount": Decimal("400"), "card_brand": CardBrand.ELO,
+            "fee_status": PaymentFeeStatus.UNCONFIGURED,
+        }],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("1400")
+    assert summary.known_fee_total == Decimal("29.90")
+    assert summary.known_net_revenue == Decimal("1370.10")
+    assert summary.unconfigured_card_amount == Decimal("400")
+    assert summary.has_unconfigured_fee is True
+
+
+def test_fee_summary_pagamento_historico_fee_status_null_cartao_vira_unconfigured(org_session):
+    """Pagamento anterior à migration 0034 (`fee_status IS NULL`
+    simulado) de cartão — deriva pra `unconfigured` (nunca 0%), MESMA
+    regra usada pelo Extrato (`derive_fee_status`)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("250")}],
+        payments=[{"method": PaymentMethod.CREDIT, "amount": Decimal("250"), "card_brand": CardBrand.VISA}],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.known_net_revenue == Decimal("250")
+    assert summary.unconfigured_card_amount == Decimal("250")
+    assert summary.has_unconfigured_fee is True
+
+
+def test_fee_summary_pagamento_historico_fee_status_null_pix_vira_not_applicable(org_session):
+    """Mesmo cenário histórico, mas Pix — nunca teve incidência de
+    taxa, então deriva pra `not_applicable` mesmo sem o snapshot
+    explícito (nunca fica preso como `unconfigured`)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("180")}],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("180")}],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.known_fee_total == Decimal("0")
+    assert summary.known_net_revenue == Decimal("180")
+    assert summary.has_unconfigured_fee is False
+
+
+def test_fee_summary_mudanca_de_regra_nao_altera_numeros_historicos(org_session):
+    """Duas vendas de cartão com percentuais DIFERENTES congelados no
+    snapshot (como se a regra tivesse mudado entre uma e outra) — o
+    Dashboard nunca recalcula a partir de uma regra "atual", só soma os
+    snapshots já congelados de cada `Payment`."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    appt1 = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt1.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("1000")}],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("1000"), "card_brand": CardBrand.VISA,
+            "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("2.99"),
+            "fee_amount_snapshot": Decimal("29.90"), "net_amount_snapshot": Decimal("970.10"),
+        }],
+        cash_register_id=cr.id,
+    )
+    appt2 = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 15, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt2.id, closed_at=_dt(2026, 8, 15, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("1000")}],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("1000"), "card_brand": CardBrand.VISA,
+            "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("3.20"),
+            "fee_amount_snapshot": Decimal("32.00"), "net_amount_snapshot": Decimal("968.00"),
+        }],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("2000")
+    assert summary.known_fee_total == Decimal("61.90")  # 29.90 (2.99%) + 32.00 (3.20%) — cada um seu próprio snapshot.
+    assert summary.known_net_revenue == Decimal("1938.10")
+
+
+def test_fee_summary_dois_servicos_na_mesma_comanda_nao_duplica_bruto(org_session):
+    """Comanda com Manutenção R$230 + Corte R$100 — `gross_revenue`
+    soma R$330 uma única vez (granularidade N2 nunca infla KPI
+    financeiro)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[
+            {"service_id": service_id, "professional_id": prof.id, "price": Decimal("230"), "service_name": "Manutenção"},
+            {"service_id": service_id, "professional_id": prof.id, "price": Decimal("100"), "service_name": "Corte"},
+        ],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("330")}],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("330")
+
+
+def test_fee_summary_venda_com_produto_e_servico_produto_nao_entra_no_bruto(org_session):
+    """Comanda com 1 serviço (`OrderItem`) + 1 produto
+    (`OrderProductItem`) — `gross_revenue` segue a MESMA semântica de
+    `kpis.revenue`/Extrato hoje (só soma `OrderItem`, produto fica de
+    fora), nunca uma definição nova inventada pro Dashboard."""
+    from nexasalon_api.models.order import OrderProductItem
+    from nexasalon_api.models.product import Product
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    product = Product(organization_id=org_id, name="Shampoo")
+    session.add(product)
+    session.flush()
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    order = _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("100")}],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("140")}],
+        cash_register_id=cr.id,
+    )
+    session.add(
+        OrderProductItem(
+            organization_id=org_id, order_id=order.id, product_id=product.id,
+            quantity=Decimal("1"), unit_price=Decimal("40"), product_name="Shampoo",
+        )
+    )
+    session.flush()
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("100")  # nunca 140 — produto fora do Faturamento, mesma regra de hoje.
+
+
+def test_fee_summary_respeita_o_periodo_selecionado(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("300")}],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("300"), "card_brand": CardBrand.VISA,
+            "fee_status": PaymentFeeStatus.UNCONFIGURED,
+        }],
+        cash_register_id=cr.id,
+    )
+
+    dentro = _overview(session, actor, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0)).revenue_fee_summary
+    fora = _overview(session, actor, date_from=_dt(2026, 9, 1, 0), date_to=_dt(2026, 10, 1, 0)).revenue_fee_summary
+
+    assert dentro.gross_revenue == Decimal("300")
+    assert dentro.has_unconfigured_fee is True
+    assert fora.gross_revenue == Decimal("0")
+    assert fora.has_unconfigured_fee is False
+
+
+def test_fee_summary_taxa_de_comanda_fora_do_periodo_nao_entra_no_calculo(org_session):
+    """Duas comandas — uma fechada ANTES do período consultado (com
+    taxa conhecida), outra DENTRO do período (com taxa desconhecida) —
+    o período fora não contamina nem `known_fee_total` nem
+    `unconfigured_card_amount` do período consultado."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    appt_fora = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 7, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt_fora.id, closed_at=_dt(2026, 7, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("1000")}],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("1000"), "card_brand": CardBrand.VISA,
+            "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("2.99"),
+            "fee_amount_snapshot": Decimal("29.90"), "net_amount_snapshot": Decimal("970.10"),
+        }],
+        cash_register_id=cr.id,
+    )
+    appt_dentro = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt_dentro.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("400")}],
+        payments=[{
+            "method": PaymentMethod.DEBIT, "amount": Decimal("400"), "card_brand": CardBrand.ELO,
+            "fee_status": PaymentFeeStatus.UNCONFIGURED,
+        }],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0)).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("400")
+    assert summary.known_fee_total == Decimal("0")
+    assert summary.unconfigured_card_amount == Decimal("400")
+
+
+def test_fee_summary_isolamento_entre_organizacoes(org_session):
+    session, org_a = org_session
+    actor_a = _actor(session, org_a)
+    branch_a = _branch(session, org_a)
+    client_a = _client(session, org_a)
+    prof_a = _professional(session, org_a, branch_a.id)
+    cr_a = _cash_register(session, org_a, branch_a.id, actor_a.user_id)
+    service_a = _service(session, org_a)
+    appt_a = _appointment(session, org_a, branch_a.id, client_a.id, prof_a.id, service_a.id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_a, branch_a.id, client_a.id, appt_a.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_a.id, "professional_id": prof_a.id, "price": Decimal("500")}],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("500"), "card_brand": CardBrand.VISA,
+            "fee_status": PaymentFeeStatus.UNCONFIGURED,
+        }],
+        cash_register_id=cr_a.id,
+    )
+
+    org_b = uuid.uuid4()
+    session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_b)})
+    session.add(Organization(id=org_b, name="Org B fee", slug=f"org-b-fee-{org_b.hex[:8]}"))
+    session.flush()
+    actor_b = _actor(session, org_b)
+    branch_b = _branch(session, org_b)
+    client_b = _client(session, org_b)
+    prof_b = _professional(session, org_b, branch_b.id)
+    cr_b = _cash_register(session, org_b, branch_b.id, actor_b.user_id)
+    service_b = _service(session, org_b)
+    _sale(session, org_b, branch_b.id, client_b.id, prof_b.id, service_b.id, cr_b.id, closed_at=_dt(2026, 8, 10), price=Decimal("200"), method=PaymentMethod.PIX)
+
+    session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_b)})
+    summary_b = _overview(session, actor_b).revenue_fee_summary
+    assert summary_b.gross_revenue == Decimal("200")
+    assert summary_b.has_unconfigured_fee is False  # taxa/UNCONFIGURED da org A não vaza pra org B.
+
+    session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_a)})
+    summary_a = _overview(session, actor_a).revenue_fee_summary
+    assert summary_a.gross_revenue == Decimal("500")
+    assert summary_a.has_unconfigured_fee is True
 
 
 # ---------------------------------------------------------------------------

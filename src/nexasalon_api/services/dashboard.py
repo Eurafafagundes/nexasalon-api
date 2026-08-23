@@ -112,6 +112,27 @@ MENOR — a diferença fica explícita em `RevenueReconciliation`
 (`pending_amount`/`overpaid_amount`), nunca escondida nem absorvida
 silenciosamente pelo Faturamento.
 
+FATURAMENTO LÍQUIDO (Etapa N4, `RevenueFeeSummary`) = FATURAMENTO
+(acima, `OrderItem`, nunca `Payment`) MENOS a soma de
+`fee_amount_snapshot` dos `Payment` em estado `calculated` das mesmas
+comandas fechadas do período (mesma leitura de `fee_status` do
+Extrato, via `services/payment_fees.py::breakdown_for_display` — nunca
+uma segunda interpretação). Pagamentos de cartão em estado
+`unconfigured` (sem regra configurada, incluindo pagamentos
+HISTÓRICOS anteriores à migration 0034, `fee_status IS NULL`) NUNCA
+são tratados como taxa zero: seu valor bruto fica de fora do desconto
+(não vira 0% escondido) e é exposto à parte em
+`unconfigured_card_amount`; `has_unconfigured_fee` sinaliza quando
+isso acontece no período. `known_net_revenue` é sempre calculável (não
+é `None`), mas só pode ser apresentado como Líquido definitivo quando
+`has_unconfigured_fee` é `False` — com pagamento não configurado no
+período, é "Líquido CONHECIDO" (rótulo explícito, nunca um número final
+fingido), sempre acompanhado de `unconfigured_card_amount` na
+apresentação. Como a taxa só existe no `Payment` (não no `OrderItem`),
+este cálculo lê uma população diferente da do Faturamento — mas o
+Bruto usado aqui é sempre o MESMO `_revenue(data)` de cima, nunca
+recalculado a partir da soma de `Payment.amount`.
+
 RETENÇÃO 90 DIAS: ver docstring de `_compute_retention_rate` — cuidado
 extra com censura temporal (não pode confundir "cliente não voltou"
 com "cliente ainda não teve tempo de voltar").
@@ -134,7 +155,12 @@ from sqlalchemy.orm import Session
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.exceptions import NotFoundError, ValidationDomainError
 from nexasalon_api.models.appointment import Appointment
-from nexasalon_api.models.enums import AppointmentStatus, OrderStatus, PaymentMethod
+from nexasalon_api.models.enums import (
+    AppointmentStatus,
+    OrderStatus,
+    PaymentFeeStatus,
+    PaymentMethod,
+)
 from nexasalon_api.models.order import Order, OrderItem, Payment
 from nexasalon_api.repositories import branch_repo, organization_repo
 from nexasalon_api.schemas.dashboard import (
@@ -149,11 +175,13 @@ from nexasalon_api.schemas.dashboard import (
     PaymentMethodRow,
     ProfessionalPerformanceRow,
     RetentionSummary,
+    RevenueFeeSummary,
     RevenueReconciliation,
     SeriesPoint,
     StatusDistributionRow,
     TopServiceRow,
 )
+from nexasalon_api.services import payment_fees as payment_fees_service
 
 _RETENTION_WINDOW_DAYS = 90
 _TOP_SERVICES_LIMIT = 20
@@ -719,6 +747,51 @@ def _payment_methods(session: Session, filters: DashboardFilters) -> list[Paymen
     return rows
 
 
+def _revenue_fee_summary(session: Session, filters: DashboardFilters, gross_revenue: Decimal) -> RevenueFeeSummary:
+    """Etapa N4 — Bruto/Taxa/Líquido do período. `gross_revenue` é
+    SEMPRE recebido de fora (= `_revenue(data)`, o mesmo Faturamento de
+    sempre) — esta função nunca soma `Payment.amount` pra formar o
+    Bruto, só usa `Payment` pra achar a taxa (item explícito do pedido:
+    "não calcular bruto somando Payments").
+
+    Reaproveita `services/payment_fees.py::breakdown_for_display` —
+    MESMA função usada pelo Extrato — pra nunca duplicar a
+    interpretação de `fee_status` (incl. o caso histórico
+    `fee_status IS NULL`, ver `derive_fee_status`)."""
+    stmt = (
+        select(Payment)
+        .join(Order, Order.id == Payment.order_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Order.status == OrderStatus.CLOSED,
+            Order.closed_at >= filters.date_from,
+            Order.closed_at < filters.date_to,
+        )
+    )
+    if filters.branch_id is not None:
+        stmt = stmt.where(Order.branch_id == filters.branch_id)
+    payments = session.execute(stmt).scalars().all()
+
+    known_fee_total = Decimal("0")
+    unconfigured_card_amount = Decimal("0")
+    has_unconfigured_fee = False
+    for payment in payments:
+        breakdown = payment_fees_service.breakdown_for_display(payment)
+        if breakdown.fee_status == PaymentFeeStatus.CALCULATED:
+            known_fee_total += breakdown.fee_amount or Decimal("0")
+        elif breakdown.fee_status == PaymentFeeStatus.UNCONFIGURED:
+            unconfigured_card_amount += payment.amount
+            has_unconfigured_fee = True
+
+    return RevenueFeeSummary(
+        gross_revenue=gross_revenue,
+        known_fee_total=known_fee_total,
+        known_net_revenue=gross_revenue - known_fee_total,
+        unconfigured_card_amount=unconfigured_card_amount,
+        has_unconfigured_fee=has_unconfigured_fee,
+    )
+
+
 def _heatmap(session: Session, filters: DashboardFilters, org_timezone: str) -> list[HeatmapCell]:
     local_start = func.timezone(org_timezone, Appointment.starts_at)
     weekday_expr = func.extract("isodow", local_start) - 1  # 1..7 (seg..dom) -> 0..6
@@ -925,6 +998,7 @@ def get_overview(
         new_vs_recurring=_new_vs_recurring_series(session, filters, buckets, current),
         retention=_retention_summary(session, filters),
         heatmap=_heatmap(session, filters, org_timezone),
+        revenue_fee_summary=_revenue_fee_summary(session, filters, revenue_current),
     )
 
 
