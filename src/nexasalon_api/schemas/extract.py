@@ -27,10 +27,29 @@ class ExtractRowType(str, Enum):
     WITHDRAWAL = "withdrawal"
 
 
+class ExtractSaleItemRow(BaseModel):
+    """Etapa N2 — granularidade ANALÍTICA (por serviço/profissional),
+    nunca financeira: cada linha aqui é um `OrderItem` já existente,
+    exposto tal como está (dado relacional, não string concatenada) —
+    "dados relacionais primeiro; strings apenas para apresentação".
+    NUNCA some junto com outra comanda pra formar um "faturamento" — a
+    unidade financeira continua sendo `ExtractSaleRow.total`."""
+
+    order_item_id: uuid.UUID
+    service_id: uuid.UUID
+    service_name: str
+    professional_id: uuid.UUID
+    professional_name: str
+    price: Decimal
+
+
 class ExtractSaleRow(BaseModel):
     """Uma linha = uma Comanda, nunca um serviço/pagamento isolado —
     "Manutenção + Mechas" numa linha só de R$ 800, não duas linhas de
-    R$ 800 (item 18)."""
+    R$ 800 (item 18). `total`/`payment_methods`/`status` são sempre da
+    COMANDA inteira — a granularidade por serviço vive só em `items`
+    (Etapa N2), que o frontend pode expandir/detalhar sem nunca virar
+    uma segunda "venda"."""
 
     order_id: uuid.UUID
     order_number: int
@@ -45,6 +64,12 @@ class ExtractSaleRow(BaseModel):
     # traduz cada um pra PT-BR (`PAYMENT_METHOD_LABELS`) sem precisar
     # fazer split de string nem duplicar a lógica de tradução.
     payment_methods: list[PaymentMethod]
+    # Etapa N2 — granularidade por serviço/profissional (item explícito
+    # "evite strings concatenadas quando dado estruturado estiver
+    # disponível"). `sum(i.price for i in items) == total` sempre — não
+    # é uma segunda fonte de valor, é o MESMO `OrderItem.price` que já
+    # compõe `total` acima.
+    items: list[ExtractSaleItemRow]
     total: Decimal
     status: OrderStatus
 
@@ -62,6 +87,17 @@ class ExtractSaleRow(BaseModel):
             professionals_summary=" + ".join(dict.fromkeys(i.professional_name for i in order.items)) or "—",
             payment_methods_summary=" + ".join(m.value for m in unique_methods) or "—",
             payment_methods=unique_methods,
+            items=[
+                ExtractSaleItemRow(
+                    order_item_id=i.id,
+                    service_id=i.service_id,
+                    service_name=i.service_name,
+                    professional_id=i.professional_id,
+                    professional_name=i.professional_name,
+                    price=i.price,
+                )
+                for i in order.items
+            ],
             total=total,
             status=order.status,
         )

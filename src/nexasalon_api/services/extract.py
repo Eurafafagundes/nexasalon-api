@@ -124,31 +124,59 @@ _HEADER = [
 ]
 
 
-def _sale_row(order: Order, client_name: str, branch_name: str) -> list:
-    total = sum((item.price for item in order.items), Decimal(0)) + sum(
-        (item.unit_price * item.quantity for item in order.product_items), Decimal(0)
-    )
-    services_summary = " + ".join(dict.fromkeys(i.service_name for i in order.items)) or "—"
-    products_summary = " + ".join(dict.fromkeys(i.product_name for i in order.product_items))
-    item_summary = " + ".join(part for part in (services_summary, products_summary) if part) or "—"
-    professionals_summary = " + ".join(dict.fromkeys(i.professional_name for i in order.items)) or "—"
+def _sale_item_rows(order: Order, client_name: str, branch_name: str) -> list[list]:
+    """Etapa N2 — granularidade analítica no Excel: UMA LINHA POR
+    `OrderItem` (serviço) + uma linha por `OrderProductItem` (produto),
+    todas carregando a MESMA referência de comanda (`Comanda` repetida,
+    igual ao exemplo do pedido) — nunca uma linha única por Order como
+    antes desta etapa. `Valor` de cada linha é o preço DAQUELE item, não
+    o total da comanda repetido — a soma de todas as linhas desta
+    comanda continua batendo com `order.total` (nem infla nem perde
+    faturamento, só muda a granularidade de exibição)."""
     payment_summary = " + ".join(dict.fromkeys(p.method.value for p in order.payments)) or "—"
     moment = order.closed_at or order.created_at
-    return [
+    common = [
         moment.date().isoformat(),
         moment.strftime("%H:%M"),
         "Venda",
         client_name,
         f"#{order.order_number}",
-        item_summary,
-        item_summary,
-        professionals_summary,
-        payment_summary,
-        float(total),
-        "—",
-        branch_name,
-        order.status.value,
     ]
+    rows = []
+    for item in order.items:
+        rows.append(
+            [
+                *common,
+                item.service_name,
+                item.service_name,
+                item.professional_name,
+                payment_summary,
+                float(item.price),
+                "—",
+                branch_name,
+                order.status.value,
+            ]
+        )
+    for product_item in order.product_items:
+        rows.append(
+            [
+                *common,
+                product_item.product_name,
+                product_item.product_name,
+                "—",
+                payment_summary,
+                float(product_item.unit_price * product_item.quantity),
+                "—",
+                branch_name,
+                order.status.value,
+            ]
+        )
+    if not rows:
+        # Comanda fechada sem nenhum item/produto (caso de borda —
+        # nunca deveria acontecer na prática, mas não pode simplesmente
+        # desaparecer da planilha se acontecer).
+        rows.append([*common, "—", "—", "—", payment_summary, 0.0, "—", branch_name, order.status.value])
+    return rows
 
 
 def _movement_row(movement: CashMovement, branch_name: str) -> list:
@@ -209,7 +237,8 @@ def build_extract_workbook(
 
     for order in summary.sales:
         client_name = summary.client_names.get(order.client_id, "Cliente removido")
-        sheet.append(_sale_row(order, client_name, branch_name(order.branch_id)))
+        for row in _sale_item_rows(order, client_name, branch_name(order.branch_id)):
+            sheet.append(row)
 
     for movement in summary.movements:
         register = cash_register_repo.get(session, actor.organization_id, movement.cash_register_id)

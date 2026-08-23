@@ -97,6 +97,87 @@ def test_export_exige_finance_view(client_as, org_a_actor):
     assert resp.status_code == 403
 
 
+def _setup_closed_order_two_items(c):
+    """Mesmo padrão de `_setup_closed_order`, mas com 2 serviços e 2
+    profissionais na mesma comanda — pra testar a granularidade por
+    item (Etapa N2) na exportação."""
+    branch = c.post("/api/v1/branches", json={"name": "Matriz", "slug": f"matriz-{uuid.uuid4().hex[:6]}"}).json()
+    ianka = c.post("/api/v1/professionals", json={"name": "Ianka"}).json()
+    duda = c.post("/api/v1/professionals", json={"name": "Duda"}).json()
+    manutencao = c.post(
+        "/api/v1/services",
+        json={"name": "Manutenção Mega Hair 1 Tela", "default_duration_minutes": 120, "default_price": "230.00"},
+    ).json()
+    corte = c.post(
+        "/api/v1/services", json={"name": "Corte", "default_duration_minutes": 30, "default_price": "100.00"}
+    ).json()
+    for prof, svc in ((ianka, manutencao), (duda, corte)):
+        c.put(f"/api/v1/professionals/{prof['id']}/services", json={"items": [{"service_id": svc["id"]}]})
+        c.put(
+            f"/api/v1/professionals/{prof['id']}/working-hours",
+            json={"items": [{"weekday": 4, "start_time": "09:00:00", "end_time": "20:00:00"}]},
+        )
+    client = c.post("/api/v1/clients", json={"name": "Maria"}).json()
+    appt = c.post(
+        "/api/v1/appointments",
+        json={
+            "branch_id": branch["id"], "client_id": client["id"],
+            "items": [
+                {"professional_id": ianka["id"], "service_id": manutencao["id"], "start_at": _START},
+                {"professional_id": duda["id"], "service_id": corte["id"], "start_at": _START},
+            ],
+        },
+    ).json()
+    for target in ["confirmed", "waiting", "in_progress", "finished"]:
+        assert c.patch(f"/api/v1/appointments/{appt['id']}/status", json={"status": target}).status_code == 200
+
+    register = c.post("/api/v1/cash-registers", json={"branch_id": branch["id"], "initial_amount": "0"}).json()
+    order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
+    closed = c.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={"payments": [{"method": "pix", "amount": "330.00", "cash_register_id": register["id"]}]},
+    )
+    assert closed.status_code == 200, closed.text
+    return client, order
+
+
+def test_export_gera_uma_linha_por_servico_mantendo_a_mesma_comanda(client_as, org_a_actor):
+    """Etapa N2 — item explícito do pedido: "o Excel deve gerar uma
+    linha por OrderItem", preservando a referência da mesma comanda,
+    sem repetir o valor total em cada linha nem inflar o faturamento."""
+    c = client_as(org_a_actor)
+    client, order = _setup_closed_order_two_items(c)
+
+    resp = c.get("/api/v1/extract/export", params={"type": "sales"})
+    assert resp.status_code == 200, resp.text
+    rows = list(load_workbook(BytesIO(resp.content)).active.iter_rows(values_only=True))
+    header, *data_rows = rows
+
+    comanda_col = header.index("Comanda")
+    servico_col = header.index("Serviço/Produto")
+    profissional_col = header.index("Profissional")
+    valor_col = header.index("Valor")
+
+    matching = [r for r in data_rows if r[comanda_col] == f"#{order['order_number']}"]
+    # UMA linha por serviço — 2 serviços na comanda = 2 linhas.
+    assert len(matching) == 2
+    # as duas linhas mantêm o MESMO identificador de comanda.
+    assert {r[comanda_col] for r in matching} == {f"#{order['order_number']}"}
+
+    services = {r[servico_col]: r[profissional_col] for r in matching}
+    assert services["Manutenção Mega Hair 1 Tela"] == "Ianka"
+    assert services["Corte"] == "Duda"
+
+    values = {r[servico_col]: r[valor_col] for r in matching}
+    assert values["Manutenção Mega Hair 1 Tela"] == 230.0
+    assert values["Corte"] == 100.0
+
+    # a soma das linhas desta comanda continua batendo com o total real
+    # (R$ 330) — nunca R$ 660 (item explícito do pedido: não inflar
+    # faturamento por causa da granularidade por serviço).
+    assert sum(r[valor_col] for r in matching) == 330.0
+
+
 def test_export_com_type_sales_nunca_inclui_despesas(client_as, org_a_actor):
     """Etapa N1 — regressão real reportada: filtrar "Vendas" na tela e
     exportar não podia incluir despesas. `type=sales` tem que produzir

@@ -137,6 +137,36 @@ def _open_register(session, actor, initial_amount=Decimal("0")):
     return cash_register.open_register(session, actor, branch_id, initial_amount, None)
 
 
+def _finished_appointment_two_services_two_professionals(session, org_id, actor, client_name="Cliente"):
+    """Mesmo espírito de `_finished_appointment_with_two_services`, mas
+    com DOIS profissionais distintos — exatamente o cenário do pedido
+    (Manutenção/Ianka + Corte/Duda) que `_finished_appointment_with_two_services`
+    não cobre (usa o MESMO profissional pros dois serviços)."""
+    branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    ianka = _professional(session, org_id, branch.id, name="Ianka")
+    duda = _professional(session, org_id, branch.id, name="Duda")
+    manutencao = _service(session, org_id, name="Manutenção Mega Hair 1 Tela", duration=120, price=Decimal("230.00"))
+    corte = _service(session, org_id, name="Corte", duration=30, price=Decimal("100.00"))
+    _link(session, ianka.id, manutencao.id)
+    _link(session, duda.id, corte.id)
+    _working_hours(session, org_id, ianka.id, _THURSDAY, time(9, 0), time(20, 0))
+    _working_hours(session, org_id, duda.id, _THURSDAY, time(9, 0), time(20, 0))
+    client = _client(session, org_id, name=client_name)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[
+            AppointmentItemCreate(professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(9, 0)),
+            AppointmentItemCreate(professional_id=duda.id, service_id=corte.id, start_at=_dt(9, 0)),
+        ],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    appt.status = AppointmentStatus.FINISHED
+    session.flush()
+    return appt, branch, client
+
+
 # ---------------------------------------------------------------------
 # Comanda com múltiplos serviços/pagamento misto = UMA linha só
 # ---------------------------------------------------------------------
@@ -396,6 +426,111 @@ def test_extract_sale_row_payment_methods_lista_estruturada_para_traducao(org_se
 
     assert row.payment_methods == [PaymentMethod.PIX, PaymentMethod.CREDIT]
     assert len(row.payment_methods) == 2  # sem duplicar, mesmo dedup de `payment_methods_summary`
+
+
+# ---------------------------------------------------------------------
+# Etapa N2 — granularidade por serviço/profissional (`ExtractSaleRow.items`,
+# `OrderItem` exposto tal como está, nunca vira uma segunda venda).
+# ---------------------------------------------------------------------
+
+
+def test_comanda_com_um_servico_gera_um_unico_item(org_session):
+    from nexasalon_api.schemas.extract import ExtractSaleRow
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    prof = _professional(session, org_id, branch.id, name="Duda")
+    corte = _service(session, org_id, name="Corte", duration=30, price=Decimal("100.00"))
+    _link(session, prof.id, corte.id)
+    _working_hours(session, org_id, prof.id, _THURSDAY, time(9, 0), time(20, 0))
+    client = _client(session, org_id, name="Cliente Único Serviço")
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=corte.id, start_at=_dt(9, 0))],
+        ),
+    )
+    appt.status = AppointmentStatus.FINISHED
+    session.flush()
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("100.00"), cash_register_id=register.id)]),
+    )
+    session.refresh(order)
+
+    row = ExtractSaleRow.from_order(order, "Cliente Único Serviço")
+
+    assert len(row.items) == 1
+    assert row.items[0].service_name == "Corte"
+    assert row.items[0].professional_name == "Duda"
+    assert row.items[0].price == Decimal("100.00")
+
+
+def test_comanda_com_dois_servicos_dois_profissionais_gera_dois_itens_corretos(org_session):
+    """Cenário exato do pedido: Manutenção Mega Hair 1 Tela/Ianka/R$230
+    + Corte/Duda/R$100 — cada item com seu próprio serviço, profissional
+    e valor, sem strings concatenadas ("Duda + Ianka")."""
+    from nexasalon_api.schemas.extract import ExtractSaleRow
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, _branch, client = _finished_appointment_two_services_two_professionals(
+        session, org_id, actor, client_name="Maria"
+    )
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("330.00"), cash_register_id=register.id)]),
+    )
+    session.refresh(order)
+
+    row = ExtractSaleRow.from_order(order, "Maria")
+
+    assert len(row.items) == 2
+    by_service = {item.service_name: item for item in row.items}
+    assert by_service["Manutenção Mega Hair 1 Tela"].professional_name == "Ianka"
+    assert by_service["Manutenção Mega Hair 1 Tela"].price == Decimal("230.00")
+    assert by_service["Corte"].professional_name == "Duda"
+    assert by_service["Corte"].price == Decimal("100.00")
+    # cada item referencia service_id/professional_id/order_item_id
+    # ESTRUTURADOS (dado relacional), não strings concatenadas.
+    assert all(item.service_id and item.professional_id and item.order_item_id for item in row.items)
+
+    # soma dos itens == total da comanda (nunca uma segunda fonte de valor).
+    assert sum((item.price for item in row.items), Decimal("0")) == row.total == Decimal("330.00")
+    # continua sendo UMA única venda/comanda no Extrato.
+    summary = extract.get_extract(session, actor, date_from=None, date_to=None)
+    assert len(summary.sales) == 1
+    # nenhum Payment duplicado — 1 pagamento registrado, não 2 (um por item).
+    assert len(order.payments) == 1
+
+
+def test_row_type_sales_preserva_items_por_comanda(org_session):
+    """As linhas de N1 (`row_type`) continuam funcionando com o campo
+    `items` novo presente — filtro de tipo e granularidade por item são
+    ortogonais, um não quebra o outro."""
+    from nexasalon_api.schemas.extract import ExtractRowType, ExtractSaleRow
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, _branch, client = _finished_appointment_two_services_two_professionals(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("330.00"), cash_register_id=register.id)]),
+    )
+
+    filtered = extract.get_extract(session, actor, date_from=None, date_to=None, row_type=ExtractRowType.SALES)
+    assert len(filtered.sales) == 1
+    row = ExtractSaleRow.from_order(filtered.sales[0], "Cliente")
+    assert len(row.items) == 2
 
 
 def test_extrato_nao_vaza_entre_organizacoes():
