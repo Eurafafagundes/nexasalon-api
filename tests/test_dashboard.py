@@ -37,8 +37,9 @@ from nexasalon_api.models.enums import (
     PaymentMethod,
 )
 from nexasalon_api.models.identity import User
-from nexasalon_api.models.order import Order, OrderItem, Payment
+from nexasalon_api.models.order import Order, OrderItem, OrderProductItem, Payment
 from nexasalon_api.models.organization import Branch, Organization
+from nexasalon_api.models.product import Product
 from nexasalon_api.models.professional import Professional
 from nexasalon_api.models.service import Service
 from nexasalon_api.services import dashboard as dashboard_service
@@ -1385,44 +1386,6 @@ def test_fee_summary_dois_servicos_na_mesma_comanda_nao_duplica_bruto(org_sessio
     assert summary.gross_revenue == Decimal("330")
 
 
-def test_fee_summary_venda_com_produto_e_servico_produto_nao_entra_no_bruto(org_session):
-    """Comanda com 1 serviço (`OrderItem`) + 1 produto
-    (`OrderProductItem`) — `gross_revenue` segue a MESMA semântica de
-    `kpis.revenue`/Extrato hoje (só soma `OrderItem`, produto fica de
-    fora), nunca uma definição nova inventada pro Dashboard."""
-    from nexasalon_api.models.order import OrderProductItem
-    from nexasalon_api.models.product import Product
-
-    session, org_id = org_session
-    actor = _actor(session, org_id)
-    branch = _branch(session, org_id)
-    client = _client(session, org_id)
-    prof = _professional(session, org_id, branch.id)
-    cr = _cash_register(session, org_id, branch.id, actor.user_id)
-    service_id = _service(session, org_id).id
-    product = Product(organization_id=org_id, name="Shampoo")
-    session.add(product)
-    session.flush()
-
-    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
-    order = _closed_order(
-        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
-        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("100")}],
-        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("140")}],
-        cash_register_id=cr.id,
-    )
-    session.add(
-        OrderProductItem(
-            organization_id=org_id, order_id=order.id, product_id=product.id,
-            quantity=Decimal("1"), unit_price=Decimal("40"), product_name="Shampoo",
-        )
-    )
-    session.flush()
-
-    summary = _overview(session, actor).revenue_fee_summary
-    assert summary.gross_revenue == Decimal("100")  # nunca 140 — produto fora do Faturamento, mesma regra de hoje.
-
-
 def test_fee_summary_respeita_o_periodo_selecionado(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)
@@ -1532,6 +1495,172 @@ def test_fee_summary_isolamento_entre_organizacoes(org_session):
     summary_a = _overview(session, actor_a).revenue_fee_summary
     assert summary_a.gross_revenue == Decimal("500")
     assert summary_a.has_unconfigured_fee is True
+
+
+# ---------------------------------------------------------------------------
+# Etapa N4.1 — Faturamento passa a incluir PRODUTO (`OrderProductItem`).
+# Corrige um bug: `gross_revenue` (e `kpis.revenue`) somavam só
+# `OrderItem.price`, excluindo produto vendido — mesmo que produto
+# gere baixa REAL de estoque no fechamento (venda de verdade, não uma
+# anotação). Fórmula agora é a canônica compartilhada
+# (`services/order_totals.py::order_total`), a MESMA já usada por
+# `close_order`/`OrderRead`/histórico de compras do cliente.
+# ---------------------------------------------------------------------------
+
+
+def _product(session, org_id, name="Produto") -> Product:
+    p = Product(organization_id=org_id, name=name)
+    session.add(p)
+    session.flush()
+    return p
+
+
+def _add_product_item(session, org_id, order, product, *, quantity, unit_price, name=None):
+    session.add(
+        OrderProductItem(
+            organization_id=org_id, order_id=order.id, product_id=product.id,
+            quantity=quantity, unit_price=unit_price, product_name=name or product.name,
+        )
+    )
+    session.flush()
+
+
+def test_faturamento_somente_servico_sem_produto(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 8, 10), price=Decimal("300"), method=PaymentMethod.PIX)
+
+    overview = _overview(session, actor)
+    assert overview.kpis.revenue.value == Decimal("300")
+    assert overview.revenue_fee_summary.gross_revenue == Decimal("300")
+
+
+def test_faturamento_servico_mais_produto_soma_os_dois(org_session):
+    """Serviço R$300 + Produto R$100 numa MESMA comanda de R$400 — o
+    Dashboard não pode mostrar só R$300 (bug corrigido na N4.1)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    product = _product(session, org_id, "Shampoo")
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    order = _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("300")}],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("400")}],
+        cash_register_id=cr.id,
+    )
+    _add_product_item(session, org_id, order, product, quantity=Decimal("1"), unit_price=Decimal("100"))
+
+    overview = _overview(session, actor)
+    assert overview.kpis.revenue.value == Decimal("400")
+    assert overview.revenue_fee_summary.gross_revenue == Decimal("400")
+
+
+def test_faturamento_comanda_somente_produto_sem_nenhum_servico(org_session):
+    """Comanda sem NENHUM `OrderItem` (só produto) — hoje não é um
+    estado alcançável pelo fluxo real (`create_order` exige pelo menos
+    1 serviço vindo do Appointment, e não existe remoção de OrderItem
+    depois de criado), mas a query do Dashboard não pode depender de
+    JOIN direto com `OrderItem`/`OrderProductItem` pra listar comandas
+    do período — um INNER JOIN faria essa comanda (construída direto
+    via ORM, como este teste faz) sumir silenciosamente do Faturamento.
+    Este teste protege a estrutura da query, não um fluxo de UI."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    product = _product(session, org_id, "Shampoo")
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    order = _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[], payments=[{"method": PaymentMethod.PIX, "amount": Decimal("50")}],
+        cash_register_id=cr.id,
+    )
+    _add_product_item(session, org_id, order, product, quantity=Decimal("1"), unit_price=Decimal("50"))
+
+    overview = _overview(session, actor)
+    assert overview.kpis.revenue.value == Decimal("50")
+    assert overview.revenue_fee_summary.gross_revenue == Decimal("50")
+    assert overview.kpis.clients_served.value == Decimal("1")  # a comanda conta normalmente, mesmo sem serviço.
+
+
+def test_faturamento_dois_servicos_mais_produto_nao_duplica_nenhum_item(org_session):
+    """Manutenção R$230 + Corte R$100 + Shampoo R$50 = R$380 exatos —
+    nunca duplicando serviço (bug de join cartesiano) nem somando
+    produto mais de uma vez."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    product = _product(session, org_id, "Shampoo")
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    order = _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[
+            {"service_id": service_id, "professional_id": prof.id, "price": Decimal("230"), "service_name": "Manutenção"},
+            {"service_id": service_id, "professional_id": prof.id, "price": Decimal("100"), "service_name": "Corte"},
+        ],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("380")}],
+        cash_register_id=cr.id,
+    )
+    _add_product_item(session, org_id, order, product, quantity=Decimal("1"), unit_price=Decimal("50"))
+
+    overview = _overview(session, actor)
+    assert overview.kpis.revenue.value == Decimal("380")
+    assert overview.revenue_fee_summary.gross_revenue == Decimal("380")
+
+
+def test_faturamento_com_produto_taxa_continua_vindo_so_do_payment(org_session):
+    """Serviço R$300 + Produto R$100 (comanda R$400), paga em crédito
+    com taxa calculada sobre o Payment inteiro (R$400) — incluir
+    produto no Bruto não muda de onde vem a taxa: `known_fee_total`
+    continua vindo exclusivamente do snapshot do `Payment`, nunca de um
+    rateio por item de serviço/produto."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    product = _product(session, org_id, "Shampoo")
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    order = _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("300")}],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("400"), "card_brand": CardBrand.VISA,
+            "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("2.99"),
+            "fee_amount_snapshot": Decimal("11.96"), "net_amount_snapshot": Decimal("388.04"),
+        }],
+        cash_register_id=cr.id,
+    )
+    _add_product_item(session, org_id, order, product, quantity=Decimal("1"), unit_price=Decimal("100"))
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("400")
+    assert summary.known_fee_total == Decimal("11.96")  # taxa calculada sobre o Payment (R$400), não sobre item algum.
+    assert summary.known_net_revenue == Decimal("388.04")
+    assert summary.has_unconfigured_fee is False
 
 
 # ---------------------------------------------------------------------------

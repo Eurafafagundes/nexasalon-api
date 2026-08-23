@@ -15,6 +15,7 @@ from nexasalon_api.models.enums import (
     PaymentMethod,
 )
 from nexasalon_api.models.order import Order
+from nexasalon_api.services import order_totals
 from nexasalon_api.services import payment_fees as payment_fees_service
 
 
@@ -108,13 +109,17 @@ class ExtractSaleRow(BaseModel):
     payment_methods: list[PaymentMethod]
     # Etapa N2 — granularidade por serviço/profissional (item explícito
     # "evite strings concatenadas quando dado estruturado estiver
-    # disponível"). `sum(i.price for i in items) == total` sempre — não
-    # é uma segunda fonte de valor, é o MESMO `OrderItem.price` que já
-    # compõe `total` acima.
+    # disponível"). `sum(i.price for i in items)` é a parcela de
+    # SERVIÇO de `total` (ver `product_items` abaixo pra parcela de
+    # produto — juntas as duas compõem `total`, nunca uma sozinha).
     items: list[ExtractSaleItemRow]
     # Ajuste pós-review N2 — produtos da comanda, SEPARADOS de `items`
-    # (nunca misturados numa mesma lista/análise). Não entra em `total`
-    # de novo — é o MESMO valor que já compõe `total` via `order.product_items`.
+    # (nunca misturados numa mesma lista/análise pra BI). Etapa N4.1:
+    # `total` abaixo agora SOMA esta lista também (`quantity *
+    # unit_price` de cada linha) — produto vendido é venda real (baixa
+    # de estoque de verdade no fechamento, ver `services/orders.py::
+    # close_order`), nunca deveria ter ficado fora do valor vendido da
+    # comanda.
     product_items: list[ExtractSaleProductItemRow]
     total: Decimal
     status: OrderStatus
@@ -135,11 +140,12 @@ class ExtractSaleRow(BaseModel):
 
     @classmethod
     def from_order(cls, order: Order, client_name: str) -> "ExtractSaleRow":
-        # `total` continua EXATAMENTE como antes desta etapa (soma só de
-        # `order.items` — nunca produtos) — não é escopo deste ajuste
-        # mudar a definição de "total" da linha/faturamento; isso fica
-        # pra quando o conceito de Bruto/Líquido for tratado (N3/N4).
-        total = sum((item.price for item in order.items), Decimal("0"))
+        # Etapa N4.1 — fórmula CANÔNICA compartilhada (`order_totals.py`),
+        # a MESMA usada por `close_order`/`OrderRead`/Dashboard: serviço
+        # + produto. Corrige um bug em que este `total` (e
+        # `revenue_total` do módulo de serviço) somava só `OrderItem`,
+        # excluindo produto vendido do valor da linha.
+        total = order_totals.order_total(order)
         unique_methods = list(dict.fromkeys(p.method for p in order.payments))
 
         breakdown = []

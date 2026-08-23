@@ -17,6 +17,7 @@ from nexasalon_api.repositories import (
     order_repo,
 )
 from nexasalon_api.schemas.client import ClientCreate, ClientUpdate
+from nexasalon_api.services import order_totals
 
 # Agendamentos ainda "em aberto" (nem concluídos nem descartados) — usado
 # tanto pra achar o "próximo agendamento" (Etapa J) quanto, por exclusão,
@@ -33,12 +34,6 @@ _UPCOMING_STATUSES = frozenset(
 )
 
 
-def _order_total(order: Order) -> Decimal:
-    """Serviços + produtos — mesma fórmula de `OrderRead.from_order`
-    (nunca duas contas de faturamento diferentes pro mesmo domínio)."""
-    services_total = sum((item.price for item in order.items), Decimal("0"))
-    products_total = sum((item.quantity * item.unit_price for item in order.product_items), Decimal("0"))
-    return services_total + products_total
 
 
 def _assert_cpf_not_duplicated(
@@ -117,10 +112,14 @@ class ClientSummary:
 def get_client_history(session: Session, organization_id: uuid.UUID, client_id: uuid.UUID) -> ClientSummary:
     client = get_client(session, organization_id, client_id)
     orders = order_repo.list_for_client(session, organization_id, client_id)
-    # Etapa J: corrigido pra somar TAMBÉM produtos (`_order_total`) —
-    # antes só somava `OrderItem.price` (serviço), subestimando "total
-    # gasto" em qualquer comanda com produto vendido junto.
-    total_spent = sum((_order_total(o) for o in orders), Decimal("0"))
+    # Etapa J: corrigido pra somar TAMBÉM produtos — antes só somava
+    # `OrderItem.price` (serviço), subestimando "total gasto" em
+    # qualquer comanda com produto vendido junto. Etapa N4.1: passou a
+    # usar a fórmula canônica compartilhada (`order_totals.py`) — o
+    # MESMO bug (produto excluído) tinha voltado a acontecer em
+    # `services/dashboard.py`/`services/extract.py` justamente porque
+    # a fórmula não era centralizada.
+    total_spent = sum((order_totals.order_total(o) for o in orders), Decimal("0"))
     return ClientSummary(
         client_since=client.created_at, visits_count=len(orders), total_spent=total_spent, orders=orders
     )

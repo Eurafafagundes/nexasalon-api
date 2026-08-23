@@ -15,6 +15,7 @@ from nexasalon_api.models.enums import (
 )
 from nexasalon_api.models.order import Order
 from nexasalon_api.models.organization import Organization
+from nexasalon_api.services import order_totals
 
 _CARD_METHODS = frozenset({PaymentMethod.DEBIT, PaymentMethod.CREDIT})
 
@@ -246,11 +247,7 @@ class OrderRead(BaseModel):
 
     @classmethod
     def from_order(cls, order: Order) -> "OrderRead":
-        services_total = sum((item.price for item in order.items), Decimal("0"))
-        products_total = sum(
-            (item.quantity * item.unit_price for item in order.product_items), Decimal("0")
-        )
-        subtotal = services_total + products_total
+        subtotal = order_totals.order_total(order)
         return cls(
             id=order.id,
             organization_id=order.organization_id,

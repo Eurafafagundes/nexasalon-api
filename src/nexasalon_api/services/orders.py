@@ -78,7 +78,7 @@ from nexasalon_api.schemas.order import (
     OrderReceiptRead,
 )
 from nexasalon_api.services import appointments as appointments_service
-from nexasalon_api.services import availability
+from nexasalon_api.services import availability, order_totals
 from nexasalon_api.services import cash_register as cash_register_service
 from nexasalon_api.services import payment_fees as payment_fees_service
 from nexasalon_api.services import stock as stock_service
@@ -518,9 +518,8 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
     # unidade).
     cash_register_service.assert_operational_prerequisites(session, actor, order.branch_id, purpose="payment")
 
-    services_total = sum((item.price for item in order.items), Decimal("0"))
-    products_total = sum((item.quantity * item.unit_price for item in order.product_items), Decimal("0"))
-    total = services_total + products_total
+    order_totals_breakdown = order_totals.order_total_breakdown(order)
+    total = order_totals_breakdown.total
     paid_total = sum((p.amount for p in data.payments), Decimal("0"))
     if paid_total < total:
         raise ValidationDomainError(
@@ -624,7 +623,8 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
         old_values={"status": "open"},
         new_values={
             "status": "closed", "change_type": "close_order", "paid_total": str(paid_total),
-            "services_total": str(services_total), "products_total": str(products_total),
+            "services_total": str(order_totals_breakdown.services_total),
+            "products_total": str(order_totals_breakdown.products_total),
         },
     )
     return _reload(session, organization_id, order_id)
@@ -688,11 +688,7 @@ def close_orders_consolidated(
 
     orders_by_number = sorted(orders, key=lambda o: o.order_number)
 
-    totals: dict[uuid.UUID, Decimal] = {}
-    for order in orders_by_number:
-        services_total = sum((item.price for item in order.items), Decimal("0"))
-        products_total = sum((item.quantity * item.unit_price for item in order.product_items), Decimal("0"))
-        totals[order.id] = services_total + products_total
+    totals: dict[uuid.UUID, Decimal] = {order.id: order_totals.order_total(order) for order in orders_by_number}
     grand_total = sum(totals.values(), Decimal("0"))
 
     paid_total = sum((p.amount for p in data.payments), Decimal("0"))

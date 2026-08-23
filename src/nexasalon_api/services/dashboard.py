@@ -44,8 +44,11 @@ FONTE DE VERDADE DE CADA MÉTRICA (documentado aqui porque é o único
 lugar que efetivamente calcula cada uma)
 ===========================================================================
 
-FATURAMENTO = soma de `OrderItem.price` de comandas (`Order`) com
-`status=CLOSED` e `closed_at` dentro do período. Não é
+FATURAMENTO = soma de `OrderItem.price` (serviço) + `OrderProductItem.
+quantity * unit_price` (produto) de comandas (`Order`) com
+`status=CLOSED` e `closed_at` dentro do período — a MESMA fórmula
+canônica de `services/order_totals.py::order_total`, já usada por
+`close_order`/`OrderRead`/histórico de compras do cliente. Não é
 `AppointmentItem.price` (valor no momento da RESERVA, pode nunca virar
 venda) nem `Payment.amount` somado direto (existe só pra "Formas de
 Pagamento" e pra "Recebido", ver abaixo/acima). Uma comanda só fica
@@ -54,6 +57,13 @@ pago cobre o total da comanda — ou seja, é dinheiro EFETIVAMENTE
 registrado, não estimativa. Esta é EXATAMENTE a mesma fórmula que
 `services/extract.py` (Financeiro > Extrato) já usa pra "Receitas" —
 escolhida de propósito pra o Dashboard nunca discordar do Financeiro.
+
+Etapa N4.1 — produto vendido (`OrderProductItem`) SEMPRE entra aqui:
+é venda real (baixa de estoque de verdade acontece no fechamento, ver
+`close_order`), nunca deveria ter ficado fora do Faturamento. Uma
+comanda sem NENHUM `OrderItem` (só produto) também entra — a query
+nunca faz INNER JOIN direto com `OrderItem`/`OrderProductItem` (ver
+`_fetch_period_data`), exatamente pra não sumir comandas assim.
 
 RECEBIDO = soma de `Payment.amount` das mesmas comandas fechadas no
 período (mesmo filtro de organização/unidade/data que o Faturamento,
@@ -161,7 +171,7 @@ from nexasalon_api.models.enums import (
     PaymentFeeStatus,
     PaymentMethod,
 )
-from nexasalon_api.models.order import Order, OrderItem, Payment
+from nexasalon_api.models.order import Order, OrderItem, OrderProductItem, Payment
 from nexasalon_api.repositories import branch_repo, organization_repo
 from nexasalon_api.schemas.dashboard import (
     DashboardKpiDetailResponse,
@@ -258,30 +268,66 @@ def _resolve_branch(session: Session, organization_id: uuid.UUID, branch_id: uui
 
 
 def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: datetime, date_to: datetime) -> _PeriodData:
-    order_stmt = (
-        select(
-            Order.id,
-            Order.client_id,
-            Order.closed_at,
-            func.coalesce(func.sum(OrderItem.price), 0),
-        )
-        .join(OrderItem, OrderItem.order_id == Order.id)
+    # Comandas fechadas no período — SEM join a `OrderItem` (Etapa
+    # N4.1: uma comanda só-produto, sem NENHUM `OrderItem`, não pode
+    # sumir do Faturamento por causa de um INNER JOIN vazio).
+    base_order_stmt = select(Order.id, Order.client_id, Order.closed_at).where(
+        Order.organization_id == filters.organization_id,
+        Order.status == OrderStatus.CLOSED,
+        Order.closed_at >= date_from,
+        Order.closed_at < date_to,
+    )
+    if filters.branch_id is not None:
+        base_order_stmt = base_order_stmt.where(Order.branch_id == filters.branch_id)
+
+    # Serviço e produto somados em queries SEPARADAS — mesmo raciocínio
+    # de `received_stmt` logo abaixo: nunca um join único entre
+    # OrderItem/OrderProductItem/Payment na mesma consulta, que
+    # duplicaria por produto cartesiano (ver
+    # `test_top_servicos_agrega_por_servico_sem_duplicar_faturamento`).
+    # Etapa N4.1 — fórmula CANÔNICA (mesma de
+    # `order_totals.py::order_total`/`close_order`): FATURAMENTO =
+    # serviços (`OrderItem.price`) + produtos (`OrderProductItem.
+    # quantity * unit_price`). Produto vendido é venda real — baixa de
+    # estoque de verdade no fechamento — e nunca deveria ter ficado de
+    # fora daqui (bug corrigido nesta etapa).
+    services_stmt = (
+        select(OrderItem.order_id, func.coalesce(func.sum(OrderItem.price), 0))
+        .join(Order, Order.id == OrderItem.order_id)
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
             Order.closed_at >= date_from,
             Order.closed_at < date_to,
         )
-        .group_by(Order.id, Order.client_id, Order.closed_at)
+        .group_by(OrderItem.order_id)
+    )
+    products_stmt = (
+        select(
+            OrderProductItem.order_id,
+            func.coalesce(func.sum(OrderProductItem.quantity * OrderProductItem.unit_price), 0),
+        )
+        .join(Order, Order.id == OrderProductItem.order_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Order.status == OrderStatus.CLOSED,
+            Order.closed_at >= date_from,
+            Order.closed_at < date_to,
+        )
+        .group_by(OrderProductItem.order_id)
     )
     if filters.branch_id is not None:
-        order_stmt = order_stmt.where(Order.branch_id == filters.branch_id)
+        services_stmt = services_stmt.where(Order.branch_id == filters.branch_id)
+        products_stmt = products_stmt.where(Order.branch_id == filters.branch_id)
+    services_by_order: dict[uuid.UUID, Decimal] = {
+        row[0]: Decimal(row[1]) for row in session.execute(services_stmt).all()
+    }
+    products_by_order: dict[uuid.UUID, Decimal] = {
+        row[0]: Decimal(row[1]) for row in session.execute(products_stmt).all()
+    }
 
-    # RECEBIDO por comanda — query SEPARADA (nunca um join único com
-    # OrderItem+Payment na mesma consulta, que duplicaria por causa do
-    # produto cartesiano itens×pagamentos; ver
-    # `test_top_servicos_agrega_por_servico_sem_duplicar_faturamento`).
-    # Mesmo filtro de organização/unidade/status/data que `order_stmt`,
+    # RECEBIDO por comanda — query SEPARADA (mesmo raciocínio acima).
+    # Mesmo filtro de organização/unidade/status/data que as demais,
     # pra somar Payment só das comandas que também entram no Faturamento.
     received_stmt = (
         select(Payment.order_id, func.coalesce(func.sum(Payment.amount), 0))
@@ -302,10 +348,11 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
 
     orders = [
         _OrderRow(
-            order_id=row[0], client_id=row[1], closed_at=row[2], total=Decimal(row[3]),
+            order_id=row[0], client_id=row[1], closed_at=row[2],
+            total=services_by_order.get(row[0], Decimal("0")) + products_by_order.get(row[0], Decimal("0")),
             received=received_by_order.get(row[0], Decimal("0")),
         )
-        for row in session.execute(order_stmt).all()
+        for row in session.execute(base_order_stmt).all()
     ]
 
     appt_stmt = select(Appointment.starts_at, Appointment.status).where(

@@ -23,14 +23,28 @@ from nexasalon_api.models.enums import (
     CashMovementType,
     OrderStatus,
     PaymentMethod,
+    StockMovementDirection,
+    StockMovementReason,
 )
 from nexasalon_api.models.identity import User
 from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.service import ProfessionalService, Service
 from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate
-from nexasalon_api.schemas.order import OrderClose, PaymentCreate
-from nexasalon_api.services import appointments, cash_register, extract, orders
+from nexasalon_api.schemas.order import (
+    OrderClose,
+    OrderProductItemCreate,
+    PaymentCreate,
+)
+from nexasalon_api.schemas.product import ProductCreate
+from nexasalon_api.services import (
+    appointments,
+    cash_register,
+    extract,
+    orders,
+    products,
+    stock,
+)
 
 _ALL_AGENDA_PERMS = frozenset(
     {"agenda.view_own", "agenda.view_all", "agenda.create", "agenda.edit", "agenda.cancel"}
@@ -135,6 +149,39 @@ def _finished_appointment_with_two_services(session, org_id, actor, client_name=
 def _open_register(session, actor, initial_amount=Decimal("0")):
     branch_id = _branch(session, actor.organization_id).id
     return cash_register.open_register(session, actor, branch_id, initial_amount, None)
+
+
+def _product_with_stock(session, actor, branch_id, *, name="Shampoo", sale=Decimal("40.00"), quantity=Decimal("10")):
+    """Produto vendável + estoque disponível — mesmo padrão de
+    `test_order_products.py`, pra `close_order` conseguir baixar
+    estoque de verdade (não uma anotação) ao fechar a comanda."""
+    product = products.create_product(
+        session, actor, ProductCreate(name=name, cost_price=Decimal("5.00"), sale_price=sale, for_sale=True)
+    )
+    stock.record_movement(
+        session, actor, product_id=product.id, branch_id=branch_id,
+        direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE, quantity=quantity,
+    )
+    return product
+
+
+def _finished_appointment_one_service(session, org_id, actor, client_name="Cliente", price=Decimal("300.00")):
+    branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    prof = _professional(session, org_id, branch.id)
+    service = _service(session, org_id, name="Corte", duration=60, price=price)
+    _link(session, prof.id, service.id)
+    _working_hours(session, org_id, prof.id, _THURSDAY, time(9, 0), time(20, 0))
+    client = _client(session, org_id, name=client_name)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(9, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    appt.status = AppointmentStatus.FINISHED
+    session.flush()
+    return appt, branch, prof, client
 
 
 def _finished_appointment_two_services_two_professionals(session, org_id, actor, client_name="Cliente"):
@@ -591,6 +638,141 @@ def test_excel_discrimina_item_servico_de_item_produto_por_coluna_estruturada(or
     assert item_types["Manutenção"] == "Serviço"
     assert item_types["Mechas"] == "Serviço"
     assert item_types["Shampoo"] == "Produto"
+
+
+# ---------------------------------------------------------------------
+# Etapa N4.1 — Faturamento (revenue_total/ExtractSaleRow.total) passa a
+# incluir PRODUTO (`OrderProductItem`). Corrige um bug: a fórmula
+# somava só `OrderItem.price`, excluindo produto vendido — mesmo com
+# baixa REAL de estoque no fechamento (venda de verdade). Fórmula
+# agora é a canônica compartilhada (`services/order_totals.py`), a
+# MESMA usada por `close_order`/`OrderRead`.
+# ---------------------------------------------------------------------
+
+
+def test_revenue_total_somente_servico_sem_produto(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, _branch, _prof, _client = _finished_appointment_one_service(session, org_id, actor, price=Decimal("300.00"))
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("300.00"), cash_register_id=register.id)]),
+    )
+
+    summary = extract.get_extract(session, actor, date_from=None, date_to=None)
+    assert summary.revenue_total == Decimal("300.00")
+
+
+def test_revenue_total_soma_servico_mais_produto(org_session):
+    """Serviço R$300 + Produto R$40 numa MESMA comanda de R$340 — o
+    Extrato não pode mostrar só R$300 (bug corrigido na N4.1)."""
+    from nexasalon_api.schemas.extract import ExtractSaleRow
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, branch, _prof, _client = _finished_appointment_one_service(session, org_id, actor, price=Decimal("300.00"))
+    order = orders.create_order(session, actor, appt.id)
+    product = _product_with_stock(session, actor, branch.id, sale=Decimal("40.00"))
+    orders.add_product_item(session, actor, order.id, OrderProductItemCreate(product_id=product.id, quantity=Decimal("1")))
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("340.00"), cash_register_id=register.id)]),
+    )
+
+    summary = extract.get_extract(session, actor, date_from=None, date_to=None)
+    assert summary.revenue_total == Decimal("340.00")
+    row = ExtractSaleRow.from_order(summary.sales[0], "Cliente")
+    assert row.total == Decimal("340.00")
+
+
+def test_revenue_total_comanda_somente_produto_sem_nenhum_servico(org_session):
+    """Comanda sem NENHUM `OrderItem` (só produto) — não é um estado
+    alcançável hoje pelo fluxo real (`create_order` sempre copia
+    serviço(s) do Appointment, e não existe remoção de OrderItem
+    depois de criado), mas o Extrato não deve depender disso pra somar
+    corretamente: se um dia esse estado existir (ou for construído
+    fora do fluxo normal, como aqui), o produto ainda precisa compor
+    `revenue_total`."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, branch, _prof, _client = _finished_appointment_one_service(session, org_id, actor, price=Decimal("300.00"))
+    order = orders.create_order(session, actor, appt.id)
+    # Remove o próprio item de serviço direto no banco (fora do fluxo
+    # normal — não existe endpoint pra isso) só pra simular a comanda
+    # "só produto" e provar que a fórmula não depende de haver serviço.
+    for item in list(order.items):
+        session.delete(item)
+    session.flush()
+    session.expire(order)  # força `order.items` a recarregar vazio (evita a coleção em memória "stale").
+    product = _product_with_stock(session, actor, branch.id, sale=Decimal("40.00"))
+    orders.add_product_item(session, actor, order.id, OrderProductItemCreate(product_id=product.id, quantity=Decimal("1")))
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("40.00"), cash_register_id=register.id)]),
+    )
+
+    summary = extract.get_extract(session, actor, date_from=None, date_to=None)
+    assert summary.revenue_total == Decimal("40.00")
+
+
+def test_revenue_total_dois_servicos_mais_produto_nao_duplica_nenhum_item(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, branch, _client = _finished_appointment_two_services_two_professionals(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    product = _product_with_stock(session, actor, branch.id, sale=Decimal("50.00"))
+    orders.add_product_item(session, actor, order.id, OrderProductItemCreate(product_id=product.id, quantity=Decimal("1")))
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("380.00"), cash_register_id=register.id)]),
+    )
+
+    summary = extract.get_extract(session, actor, date_from=None, date_to=None)
+    assert len(summary.sales) == 1
+    assert summary.revenue_total == Decimal("380.00")  # 230 + 100 + 50, nunca duplicado.
+
+
+def test_taxa_de_pagamento_continua_vinda_so_do_payment_com_produto_no_total(org_session):
+    """Serviço R$300 + Produto R$40 (comanda R$340), paga em crédito
+    com taxa calculada sobre o Payment inteiro — incluir produto no
+    `total` não muda de onde vem a taxa: `payments_known_fee_total`
+    continua vindo exclusivamente do snapshot do `Payment`, nunca de um
+    rateio por item de serviço/produto."""
+    from nexasalon_api.schemas.extract import ExtractSaleRow
+    from nexasalon_api.schemas.payment_fee_rule import PaymentFeeRuleCreate
+    from nexasalon_api.services import payment_fee_rules
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, branch, _prof, _client = _finished_appointment_one_service(session, org_id, actor, price=Decimal("300.00"))
+    order = orders.create_order(session, actor, appt.id)
+    product = _product_with_stock(session, actor, branch.id, sale=Decimal("40.00"))
+    orders.add_product_item(session, actor, order.id, OrderProductItemCreate(product_id=product.id, quantity=Decimal("1")))
+    register = _open_register(session, actor)
+    payment_fee_rules.create_rule(
+        session, org_id,
+        PaymentFeeRuleCreate(method=PaymentMethod.CREDIT, card_brand=CardBrand.VISA, installments=1, fee_percent=Decimal("2.99")),
+    )
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[
+            PaymentCreate(method=PaymentMethod.CREDIT, amount=Decimal("340.00"), card_brand=CardBrand.VISA, cash_register_id=register.id),
+        ]),
+    )
+
+    summary = extract.get_extract(session, actor, date_from=None, date_to=None)
+    assert summary.revenue_total == Decimal("340.00")
+    row = ExtractSaleRow.from_order(summary.sales[0], "Cliente")
+    assert row.total == Decimal("340.00")
+    # taxa = 340 * 2.99% = 10.166 -> 10.17 (ROUND_HALF_EVEN, 2 casas).
+    assert row.payments_known_fee_total == Decimal("10.17")
+    assert row.payments_net_total == Decimal("329.83")
+    assert row.has_unconfigured_fee is False
 
 
 def test_row_type_sales_preserva_items_por_comanda(org_session):

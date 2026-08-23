@@ -26,6 +26,7 @@ from nexasalon_api.repositories import (
     order_repo,
 )
 from nexasalon_api.schemas.extract import ExtractRowType
+from nexasalon_api.services import order_totals
 
 
 @dataclass
@@ -61,8 +62,12 @@ def get_extract(
         session, actor.organization_id, date_from=date_from, date_to=date_to
     )
 
+    # Etapa N4.1 — fórmula CANÔNICA compartilhada (`order_totals.py`),
+    # a mesma usada por `close_order`/`OrderRead`: serviço + produto.
+    # Antes somava só `OrderItem.price`, excluindo produto vendido do
+    # Faturamento — mesmo bug que existia em `services/dashboard.py`.
     revenue_total = sum(
-        (sum((item.price for item in o.items), Decimal(0)) for o in all_sales if o.status == OrderStatus.CLOSED),
+        (order_totals.order_total(o) for o in all_sales if o.status == OrderStatus.CLOSED),
         Decimal(0),
     )
     expense_total = sum(
