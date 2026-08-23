@@ -511,6 +511,88 @@ def test_comanda_com_dois_servicos_dois_profissionais_gera_dois_itens_corretos(o
     assert len(order.payments) == 1
 
 
+def test_produto_da_comanda_nunca_aparece_misturado_com_servico(org_session):
+    """Ajuste pós-review N2 — `product_items` é uma lista SEPARADA de
+    `items` (serviços): uma análise de BI que soma `items` nunca inclui
+    produto por engano, e vice-versa."""
+    from nexasalon_api.models.product import Product
+    from nexasalon_api.schemas.extract import ExtractSaleRow
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor, client_name="Ana Souza")
+    order = orders.create_order(session, actor, appt.id)
+
+    product = Product(organization_id=org_id, name="Shampoo")
+    session.add(product)
+    session.flush()
+    from nexasalon_api.models.order import OrderProductItem
+
+    session.add(
+        OrderProductItem(
+            organization_id=org_id, order_id=order.id, product_id=product.id,
+            quantity=Decimal("2"), unit_price=Decimal("15.00"), product_name="Shampoo",
+        )
+    )
+    session.flush()
+
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("830.00"), cash_register_id=register.id)]),
+    )
+    session.refresh(order)
+
+    row = ExtractSaleRow.from_order(order, "Ana Souza")
+
+    assert len(row.items) == 2  # só serviços
+    assert all(i.service_name != "Shampoo" for i in row.items)
+    assert len(row.product_items) == 1  # só produtos, lista separada
+    assert row.product_items[0].product_name == "Shampoo"
+    assert row.product_items[0].price == Decimal("30.00")
+
+
+def test_excel_discrimina_item_servico_de_item_produto_por_coluna_estruturada(org_session):
+    """A coluna "Item" do Excel (Serviço/Produto) é o discriminador
+    ESTRUTURADO — nunca depender só do texto livre de "Serviço/Produto"
+    pra saber o tipo numa análise de BI."""
+    from nexasalon_api.models.order import OrderProductItem
+    from nexasalon_api.models.product import Product
+    from nexasalon_api.services.extract import _HEADER, _sale_item_rows
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor, client_name="Ana Souza")
+    order = orders.create_order(session, actor, appt.id)
+
+    product = Product(organization_id=org_id, name="Shampoo")
+    session.add(product)
+    session.flush()
+    session.add(
+        OrderProductItem(
+            organization_id=org_id, order_id=order.id, product_id=product.id,
+            quantity=Decimal("1"), unit_price=Decimal("30.00"), product_name="Shampoo",
+        )
+    )
+    session.flush()
+
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("830.00"), cash_register_id=register.id)]),
+    )
+    session.refresh(order)
+
+    rows = _sale_item_rows(order, "Ana Souza", "Matriz")
+    item_col = _HEADER.index("Item")
+    servico_col = _HEADER.index("Serviço/Produto")
+
+    item_types = {r[servico_col]: r[item_col] for r in rows}
+    assert item_types["Manutenção"] == "Serviço"
+    assert item_types["Mechas"] == "Serviço"
+    assert item_types["Shampoo"] == "Produto"
+
+
 def test_row_type_sales_preserva_items_por_comanda(org_session):
     """As linhas de N1 (`row_type`) continuam funcionando com o campo
     `items` novo presente — filtro de tipo e granularidade por item são

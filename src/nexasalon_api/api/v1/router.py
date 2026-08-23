@@ -15,6 +15,7 @@ from . import (
     inventory_counts,
     orders,
     organizations,
+    payment_fee_rules,
     products,
     professionals,
     public_booking,
@@ -44,6 +45,7 @@ api_v1_router.include_router(orders.router)
 api_v1_router.include_router(cash_registers.router)
 api_v1_router.include_router(cash_register_config.router)
 api_v1_router.include_router(extract.router)
+api_v1_router.include_router(payment_fee_rules.router)
 api_v1_router.include_router(dashboard.router)
 api_v1_router.include_router(products.router)
 api_v1_router.include_router(stock.router)

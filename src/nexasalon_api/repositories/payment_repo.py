@@ -4,7 +4,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from nexasalon_api.models.enums import CardBrand, PaymentMethod
+from nexasalon_api.models.enums import CardBrand, PaymentFeeStatus, PaymentMethod
 from nexasalon_api.models.order import Payment
 
 
@@ -20,6 +20,11 @@ def create(
     amount: Decimal,
     created_by: uuid.UUID | None,
     created_by_name: str | None = None,
+    payment_fee_rule_id: uuid.UUID | None = None,
+    fee_percent_snapshot: Decimal | None = None,
+    fee_amount_snapshot: Decimal | None = None,
+    net_amount_snapshot: Decimal | None = None,
+    fee_status: PaymentFeeStatus | None = None,
 ) -> Payment:
     payment = Payment(
         organization_id=organization_id,
@@ -31,6 +36,11 @@ def create(
         amount=amount,
         created_by=created_by,
         created_by_name=created_by_name,
+        payment_fee_rule_id=payment_fee_rule_id,
+        fee_percent_snapshot=fee_percent_snapshot,
+        fee_amount_snapshot=fee_amount_snapshot,
+        net_amount_snapshot=net_amount_snapshot,
+        fee_status=fee_status,
     )
     session.add(payment)
     session.flush()

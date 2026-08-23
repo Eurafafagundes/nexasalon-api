@@ -7,7 +7,12 @@ from decimal import Decimal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nexasalon_api.models.client import Client
-from nexasalon_api.models.enums import CardBrand, OrderStatus, PaymentMethod
+from nexasalon_api.models.enums import (
+    CardBrand,
+    OrderStatus,
+    PaymentFeeStatus,
+    PaymentMethod,
+)
 from nexasalon_api.models.order import Order
 from nexasalon_api.models.organization import Organization
 
@@ -191,6 +196,16 @@ class PaymentRead(BaseModel):
     created_by: uuid.UUID | None
     created_by_name: str | None
     created_at: datetime
+    # Etapa N3 — snapshot da taxa aplicada NO MOMENTO desta venda (nunca
+    # recalculado se a regra mudar depois). `fee_status=None` = pagamento
+    # criado antes da migration 0034 (histórico, sem informação de taxa
+    # — ver `services/payment_fees.py::derive_fee_status` pra como
+    # interpretar isso corretamente, nunca como "taxa zero").
+    payment_fee_rule_id: uuid.UUID | None = None
+    fee_percent_snapshot: Decimal | None = None
+    fee_amount_snapshot: Decimal | None = None
+    net_amount_snapshot: Decimal | None = None
+    fee_status: PaymentFeeStatus | None = None
 
 
 class OrderRead(BaseModel):

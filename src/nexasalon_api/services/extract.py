@@ -111,6 +111,12 @@ _HEADER = [
     "Data",
     "Hora",
     "Tipo",
+    # Etapa N2 (ajuste pós-review) — discrimina Serviço/Produto dentro de
+    # uma linha de Venda, pra nunca misturar as duas granularidades numa
+    # análise de BI (a mesma coluna vale "—" pra Entrada/Despesa, que não
+    # tem essa distinção). Nunca depender só da coluna "Serviço/Produto"
+    # (texto livre) pra saber o tipo — este campo é estruturado.
+    "Item",
     "Cliente",
     "Comanda",
     "Descrição",
@@ -132,21 +138,24 @@ def _sale_item_rows(order: Order, client_name: str, branch_name: str) -> list[li
     antes desta etapa. `Valor` de cada linha é o preço DAQUELE item, não
     o total da comanda repetido — a soma de todas as linhas desta
     comanda continua batendo com `order.total` (nem infla nem perde
-    faturamento, só muda a granularidade de exibição)."""
+    faturamento, só muda a granularidade de exibição). A coluna "Item"
+    (Serviço/Produto) é o discriminador ESTRUTURADO — nunca inferir o
+    tipo a partir do texto livre da coluna "Serviço/Produto"."""
     payment_summary = " + ".join(dict.fromkeys(p.method.value for p in order.payments)) or "—"
     moment = order.closed_at or order.created_at
     common = [
         moment.date().isoformat(),
         moment.strftime("%H:%M"),
         "Venda",
-        client_name,
-        f"#{order.order_number}",
     ]
     rows = []
     for item in order.items:
         rows.append(
             [
                 *common,
+                "Serviço",
+                client_name,
+                f"#{order.order_number}",
                 item.service_name,
                 item.service_name,
                 item.professional_name,
@@ -161,6 +170,9 @@ def _sale_item_rows(order: Order, client_name: str, branch_name: str) -> list[li
         rows.append(
             [
                 *common,
+                "Produto",
+                client_name,
+                f"#{order.order_number}",
                 product_item.product_name,
                 product_item.product_name,
                 "—",
@@ -175,7 +187,9 @@ def _sale_item_rows(order: Order, client_name: str, branch_name: str) -> list[li
         # Comanda fechada sem nenhum item/produto (caso de borda —
         # nunca deveria acontecer na prática, mas não pode simplesmente
         # desaparecer da planilha se acontecer).
-        rows.append([*common, "—", "—", "—", payment_summary, 0.0, "—", branch_name, order.status.value])
+        rows.append(
+            [*common, "—", client_name, f"#{order.order_number}", "—", "—", "—", payment_summary, 0.0, "—", branch_name, order.status.value]
+        )
     return rows
 
 
@@ -186,6 +200,7 @@ def _movement_row(movement: CashMovement, branch_name: str) -> list:
         movement.created_at.date().isoformat(),
         movement.created_at.strftime("%H:%M"),
         kind,
+        "—",
         "—",
         "—",
         movement.description,

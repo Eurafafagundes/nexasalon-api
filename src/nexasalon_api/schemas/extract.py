@@ -7,8 +7,15 @@ from enum import Enum
 
 from pydantic import BaseModel
 
-from nexasalon_api.models.enums import CashMovementType, OrderStatus, PaymentMethod
+from nexasalon_api.models.enums import (
+    CardBrand,
+    CashMovementType,
+    OrderStatus,
+    PaymentFeeStatus,
+    PaymentMethod,
+)
 from nexasalon_api.models.order import Order
+from nexasalon_api.services import payment_fees as payment_fees_service
 
 
 class ExtractRowType(str, Enum):
@@ -43,6 +50,41 @@ class ExtractSaleItemRow(BaseModel):
     price: Decimal
 
 
+class ExtractSaleProductItemRow(BaseModel):
+    """Ajuste pós-review da Etapa N2 — produto vendido na comanda, numa
+    lista SEPARADA de `ExtractSaleRow.items` (serviços): nunca no mesmo
+    array, pra uma análise de BI nunca precisar checar um campo
+    "item_type" pra saber se está somando serviço ou produto — o tipo já
+    é a própria coleção. Mesmo raciocínio de `ExtractSaleItemRow`: dado
+    relacional (`product_id`), nunca string concatenada."""
+
+    order_product_item_id: uuid.UUID
+    product_id: uuid.UUID
+    product_name: str
+    quantity: Decimal
+    unit_price: Decimal
+    price: Decimal  # quantity * unit_price — já calculado, não recalcular no frontend.
+
+
+class ExtractPaymentBreakdownRow(BaseModel):
+    """Etapa N3 — bruto/taxa/líquido POR `Payment` individual (item
+    explícito "pagamento dividido": a taxa nunca é calculada sobre o
+    total da comanda, só sobre o valor de cada lançamento). `fee_status`
+    é sempre um dos 3 estados estruturados (nunca `None` aqui — já
+    resolvido por `services/payment_fees.py::derive_fee_status`, que
+    trata pagamento histórico sem dado de taxa corretamente). Quando
+    `fee_status=UNCONFIGURED`, `fee_amount`/`net_amount` ficam `None`
+    DE PROPÓSITO — nunca um líquido inventado."""
+
+    payment_id: uuid.UUID
+    method: PaymentMethod
+    card_brand: CardBrand | None
+    gross_amount: Decimal  # = payment.amount
+    fee_status: PaymentFeeStatus
+    fee_amount: Decimal | None
+    net_amount: Decimal | None
+
+
 class ExtractSaleRow(BaseModel):
     """Uma linha = uma Comanda, nunca um serviço/pagamento isolado —
     "Manutenção + Mechas" numa linha só de R$ 800, não duas linhas de
@@ -70,13 +112,57 @@ class ExtractSaleRow(BaseModel):
     # é uma segunda fonte de valor, é o MESMO `OrderItem.price` que já
     # compõe `total` acima.
     items: list[ExtractSaleItemRow]
+    # Ajuste pós-review N2 — produtos da comanda, SEPARADOS de `items`
+    # (nunca misturados numa mesma lista/análise). Não entra em `total`
+    # de novo — é o MESMO valor que já compõe `total` via `order.product_items`.
+    product_items: list[ExtractSaleProductItemRow]
     total: Decimal
     status: OrderStatus
+    # Etapa N3 — Bruto/Taxa/Líquido, calculado a partir dos PAGAMENTOS
+    # (`Payment.amount`), NUNCA a partir de `total` (que é a soma dos
+    # SERVIÇOS/`OrderItem` — um conceito diferente, ver docstring do
+    # módulo). `payments_gross_total` é a soma de `Payment.amount` desta
+    # comanda — pode diferir de `total` em casos de troco/sobra do
+    # fechamento consolidado; nunca tratados como a mesma coisa aqui.
+    payments_breakdown: list[ExtractPaymentBreakdownRow]
+    payments_gross_total: Decimal
+    payments_known_fee_total: Decimal  # soma só das taxas CONHECIDAS (CALCULATED) — nunca inclui UNCONFIGURED.
+    # `None` quando QUALQUER pagamento desta comanda está com taxa não
+    # configurada — nunca um "líquido" definitivo fingido (item
+    # explícito do pedido: "não apresente um líquido falso").
+    payments_net_total: Decimal | None
+    has_unconfigured_fee: bool
 
     @classmethod
     def from_order(cls, order: Order, client_name: str) -> "ExtractSaleRow":
+        # `total` continua EXATAMENTE como antes desta etapa (soma só de
+        # `order.items` — nunca produtos) — não é escopo deste ajuste
+        # mudar a definição de "total" da linha/faturamento; isso fica
+        # pra quando o conceito de Bruto/Líquido for tratado (N3/N4).
         total = sum((item.price for item in order.items), Decimal("0"))
         unique_methods = list(dict.fromkeys(p.method for p in order.payments))
+
+        breakdown = []
+        for payment in order.payments:
+            fee = payment_fees_service.breakdown_for_display(payment)
+            breakdown.append(
+                ExtractPaymentBreakdownRow(
+                    payment_id=payment.id,
+                    method=payment.method,
+                    card_brand=payment.card_brand,
+                    gross_amount=payment.amount,
+                    fee_status=fee.fee_status,
+                    fee_amount=fee.fee_amount,
+                    net_amount=fee.net_amount,
+                )
+            )
+        has_unconfigured_fee = any(row.fee_status == PaymentFeeStatus.UNCONFIGURED for row in breakdown)
+        payments_gross_total = sum((row.gross_amount for row in breakdown), Decimal("0"))
+        payments_known_fee_total = sum(
+            (row.fee_amount for row in breakdown if row.fee_amount is not None), Decimal("0")
+        )
+        payments_net_total = None if has_unconfigured_fee else (payments_gross_total - payments_known_fee_total)
+
         return cls(
             order_id=order.id,
             order_number=order.order_number,
@@ -98,8 +184,24 @@ class ExtractSaleRow(BaseModel):
                 )
                 for i in order.items
             ],
+            product_items=[
+                ExtractSaleProductItemRow(
+                    order_product_item_id=p.id,
+                    product_id=p.product_id,
+                    product_name=p.product_name,
+                    quantity=p.quantity,
+                    unit_price=p.unit_price,
+                    price=p.unit_price * p.quantity,
+                )
+                for p in order.product_items
+            ],
             total=total,
             status=order.status,
+            payments_breakdown=breakdown,
+            payments_gross_total=payments_gross_total,
+            payments_known_fee_total=payments_known_fee_total,
+            payments_net_total=payments_net_total,
+            has_unconfigured_fee=has_unconfigured_fee,
         )
 
 

@@ -80,6 +80,7 @@ from nexasalon_api.schemas.order import (
 from nexasalon_api.services import appointments as appointments_service
 from nexasalon_api.services import availability
 from nexasalon_api.services import cash_register as cash_register_service
+from nexasalon_api.services import payment_fees as payment_fees_service
 from nexasalon_api.services import stock as stock_service
 
 
@@ -570,6 +571,15 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
     actor_name = actor_user.name if actor_user is not None else None
 
     for payment_in in data.payments:
+        # Etapa N3 — a taxa é resolvida por PAYMENT individual (nunca
+        # sobre o total da comanda — item explícito "pagamento
+        # dividido"), no momento exato da criação, e congelada como
+        # snapshot (ver `services/payment_fees.py::resolve_fee`).
+        fee = payment_fees_service.resolve_fee(
+            session, organization_id,
+            method=payment_in.method, card_brand=payment_in.card_brand,
+            installments=payment_in.installments, amount=payment_in.amount,
+        )
         payment_repo.create(
             session,
             organization_id,
@@ -581,6 +591,11 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
             amount=payment_in.amount,
             created_by=actor.user_id,
             created_by_name=actor_name,
+            payment_fee_rule_id=fee.payment_fee_rule_id,
+            fee_percent_snapshot=fee.fee_percent_snapshot,
+            fee_amount_snapshot=fee.fee_amount_snapshot,
+            net_amount_snapshot=fee.net_amount_snapshot,
+            fee_status=fee.fee_status,
         )
 
     # Promove o Appointment ANTES de marcar a comanda como fechada: se a
@@ -727,10 +742,25 @@ def close_orders_consolidated(
     ]
 
     def _create_payment(order: Order, entry: dict, amount: Decimal) -> None:
+        # Mesma função de domínio de `close_order` acima (nunca duas
+        # implementações da fórmula) — cada Payment resultante do split
+        # resolve a taxa sobre o PRÓPRIO valor (`amount`), nunca sobre o
+        # total consolidado nem sobre o `entry["amount"]` original antes
+        # do split.
+        fee = payment_fees_service.resolve_fee(
+            session, organization_id,
+            method=entry["method"], card_brand=entry["card_brand"],
+            installments=entry["installments"], amount=amount,
+        )
         payment_repo.create(
             session, organization_id, order_id=order.id, cash_register_id=entry["cash_register_id"],
             method=entry["method"], card_brand=entry["card_brand"], installments=entry["installments"],
             amount=amount, created_by=actor.user_id, created_by_name=actor_name,
+            payment_fee_rule_id=fee.payment_fee_rule_id,
+            fee_percent_snapshot=fee.fee_percent_snapshot,
+            fee_amount_snapshot=fee.fee_amount_snapshot,
+            net_amount_snapshot=fee.net_amount_snapshot,
+            fee_status=fee.fee_status,
         )
 
     for order in orders_by_number:

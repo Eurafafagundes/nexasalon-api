@@ -35,11 +35,13 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     ForeignKey,
     Index,
     Integer,
     Numeric,
+    SmallInteger,
     String,
     UniqueConstraint,
 )
@@ -47,7 +49,7 @@ from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, TimestampMixin, UUIDPKMixin
-from .enums import CardBrand, OrderStatus, PaymentMethod, pg_enum
+from .enums import CardBrand, OrderStatus, PaymentFeeStatus, PaymentMethod, pg_enum
 
 
 class Order(Base, UUIDPKMixin, TimestampMixin):
@@ -241,4 +243,61 @@ class Payment(Base, UUIDPKMixin, TimestampMixin):
     )
     created_by_name: Mapped[str | None] = mapped_column(String(255))
 
+    # --- Etapa N3 — Taxas de Pagamento (migration 0034) ---
+    # Todas NULLABLE de propósito, sem backfill (item explícito
+    # "não fazer NOT NULL sobre dados existentes" / "não inventar taxas
+    # históricas") — pagamentos criados ANTES desta coluna existir têm
+    # os 5 campos abaixo sempre `NULL`, e continuam válidos assim pra
+    # sempre (ver `PaymentFeeStatus` pro raciocínio completo do porquê
+    # `fee_status=NULL` não pode ser confundido com "taxa zero").
+    #
+    # `payment_fee_rule_id` é só REFERÊNCIA (auditoria/rastreio de qual
+    # regra foi usada) — a fonte de verdade do valor realmente cobrado é
+    # sempre o SNAPSHOT (`fee_percent_snapshot`/`fee_amount_snapshot`/
+    # `net_amount_snapshot`), nunca a regra ao vivo: editar/desativar a
+    # regra depois NUNCA recalcula um pagamento já criado.
+    payment_fee_rule_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("payment_fee_rules.id", ondelete="SET NULL")
+    )
+    fee_percent_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(5, 2))
+    fee_amount_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    net_amount_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    fee_status: Mapped[PaymentFeeStatus | None] = mapped_column(pg_enum(PaymentFeeStatus, "payment_fee_status"))
+
     order: Mapped["Order"] = relationship(back_populates="payments")
+
+
+class PaymentFeeRule(Base, UUIDPKMixin, TimestampMixin):
+    """Etapa N3 — Taxas de Pagamento (Configurações > Taxas de
+    Pagamento): cada organização cadastra a taxa percentual cobrada
+    pela adquirente/máquina por (forma, bandeira, parcelas). Só
+    débito/crédito fazem sentido aqui — Pix/Dinheiro nunca têm
+    incidência de taxa nesta etapa (ver `services/payment_fees.py`).
+
+    `installments` é sempre um inteiro explícito (nunca `NULL`) — pra
+    débito é normalizado pra `1` (mesmo raciocínio de "parcelas deve ser
+    tratado coerentemente como 1"), o que também mantém a unicidade
+    lógica `(organization, method, card_brand, installments)` simples
+    (Postgres trata `NULL <> NULL` em `UNIQUE`, o que abriria brecha
+    pra duas regras de débito "duplicadas" se o campo pudesse ser nulo).
+
+    Editar `fee_percent`/`is_active` aqui NUNCA recalcula pagamentos já
+    fechados — o valor realmente cobrado fica congelado como snapshot em
+    `Payment` no momento da venda (ver `services/payment_fees.py::resolve_fee`)."""
+
+    __tablename__ = "payment_fee_rules"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "method", "card_brand", "installments"),
+        CheckConstraint("method = 'debit' OR method = 'credit'", name="method_is_card"),
+        CheckConstraint("installments >= 1", name="installments_positive"),
+        CheckConstraint("fee_percent >= 0", name="fee_percent_not_negative"),
+    )
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    method: Mapped[PaymentMethod] = mapped_column(pg_enum(PaymentMethod, "payment_method"), nullable=False)
+    card_brand: Mapped[CardBrand] = mapped_column(pg_enum(CardBrand, "card_brand"), nullable=False)
+    installments: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    fee_percent: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")

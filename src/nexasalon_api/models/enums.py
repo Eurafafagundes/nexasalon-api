@@ -106,6 +106,35 @@ class CardBrand(str, Enum):
     OTHER = "other"
 
 
+class PaymentFeeStatus(str, Enum):
+    """Etapa N3 — Taxas de Pagamento. Estado ESTRUTURADO gravado no
+    `Payment` no momento da criação (nunca `NULL` por omissão pra
+    pagamentos novos) pra nunca depender só da nulidade dos snapshots —
+    "cartão sem taxa NÃO significa taxa zero" é uma regra distinta de
+    "Pix/Dinheiro não têm taxa", e as duas precisam ser diferenciáveis
+    sem ambiguidade, inclusive numa query SQL direta:
+
+      - NOT_APPLICABLE: método sem incidência de taxa nesta etapa
+        (pix/dinheiro/outros não-cartão) — `fee_amount_snapshot=0`,
+        `net_amount_snapshot=amount`, sempre, nunca ambíguo.
+      - CALCULATED: débito/crédito com uma `PaymentFeeRule` encontrada
+        no momento da venda — snapshots preenchidos com o valor REAL
+        aplicado, que nunca muda se a regra for editada depois.
+      - UNCONFIGURED: débito/crédito SEM regra correspondente — os 3
+        snapshots ficam `NULL` de propósito (nunca inventa 0%); o
+        pagamento continua válido, só o líquido fica "desconhecido".
+
+    Pagamentos criados ANTES desta coluna existir (migration 0034) têm
+    `fee_status IS NULL` — nunca são migrados/backfilled com um valor
+    inventado; quem lê precisa tratar `NULL` como "dado histórico sem
+    informação de taxa" (derivando de `method` só pra decidir "sem
+    incidência" vs "desconhecida", nunca fingindo um cálculo)."""
+
+    NOT_APPLICABLE = "not_applicable"
+    CALCULATED = "calculated"
+    UNCONFIGURED = "unconfigured"
+
+
 class CashRegisterStatus(str, Enum):
     """Status do Caixa Diário (`CashRegister`). Um caixa ABERTO pode
     receber pagamentos de comanda e movimentações (sangria/suprimento);
