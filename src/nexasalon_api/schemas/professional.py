@@ -74,7 +74,10 @@ class ProfessionalServiceItem(BaseModel):
     duration_override_minutes: int | None = Field(default=None, gt=0)
     price_override: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     commission_type: CommissionType | None = None
-    commission_value: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    # `gt=0` (não `ge=0`) — Etapa C1: comissão zero não faz sentido nem
+    # como percentual nem como valor fixo (ausência de comissão já é
+    # representada por `commission_type=None`, nunca por um valor 0).
+    commission_value: Decimal | None = Field(default=None, gt=0, max_digits=10, decimal_places=2)
 
     @model_validator(mode="after")
     def _check_commission(self) -> "ProfessionalServiceItem":
