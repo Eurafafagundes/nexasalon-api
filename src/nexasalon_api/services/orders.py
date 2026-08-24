@@ -80,6 +80,7 @@ from nexasalon_api.schemas.order import (
 from nexasalon_api.services import appointments as appointments_service
 from nexasalon_api.services import availability, order_totals
 from nexasalon_api.services import cash_register as cash_register_service
+from nexasalon_api.services import commissions as commissions_service
 from nexasalon_api.services import payment_fees as payment_fees_service
 from nexasalon_api.services import stock as stock_service
 
@@ -597,6 +598,21 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
             fee_status=fee.fee_status,
         )
 
+    # Etapa C2 — comissão resolvida por ITEM individual (nunca sobre o
+    # total da comanda — mesmo raciocínio de "1 OrderItem = 1 serviço +
+    # 1 profissional + 1 valor" já estabelecido pra granularidade
+    # analítica, N2), no momento exato do fechamento, e congelada como
+    # snapshot (ver `services/commissions.py::resolve_commission`).
+    for item in order.items:
+        commission = commissions_service.resolve_commission(
+            session, organization_id,
+            professional_id=item.professional_id, service_id=item.service_id, price=item.price,
+        )
+        item.commission_type_snapshot = commission.commission_type_snapshot
+        item.commission_value_snapshot = commission.commission_value_snapshot
+        item.commission_amount_snapshot = commission.commission_amount_snapshot
+        item.commission_status = commission.commission_status
+
     # Promove o Appointment ANTES de marcar a comanda como fechada: se a
     # transição falhar (ex.: agendamento já `paid` ou `cancelled` — ver
     # `appointment_state_machine.mark_paid`), a comanda não fica
@@ -785,6 +801,19 @@ def close_orders_consolidated(
         for entry in queue:
             if entry["amount"] > 0:
                 _create_payment(last_order, entry, entry["amount"])
+
+    # Etapa C2 — mesma resolução de comissão de `close_order`, item por
+    # item, em CADA comanda do lote (nunca duas implementações).
+    for order in orders_by_number:
+        for item in order.items:
+            commission = commissions_service.resolve_commission(
+                session, organization_id,
+                professional_id=item.professional_id, service_id=item.service_id, price=item.price,
+            )
+            item.commission_type_snapshot = commission.commission_type_snapshot
+            item.commission_value_snapshot = commission.commission_value_snapshot
+            item.commission_amount_snapshot = commission.commission_amount_snapshot
+            item.commission_status = commission.commission_status
 
     now = datetime.now(timezone.utc)
     for order in orders_by_number:

@@ -9,9 +9,11 @@ from nexasalon_api.core.storage import (
     require_storage_backend,
     validate_professional_photo_upload,
 )
+from nexasalon_api.models.enums import AuditAction
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.service import ProfessionalService
 from nexasalon_api.repositories import (
+    audit_log_repo,
     branch_repo,
     professional_repo,
     professional_service_repo,
@@ -127,8 +129,21 @@ def replace_professional_services(
     organization_id: uuid.UUID,
     professional_id: uuid.UUID,
     items: list[ProfessionalServiceItem],
+    *,
+    user_id: uuid.UUID | None = None,
 ) -> list[ProfessionalService]:
     get_professional(session, organization_id, professional_id)
+
+    # Etapa C2 — pendência registrada na C1: `replace_professional_services`
+    # não gerava AuditLog nenhum. Como o endpoint SUBSTITUI o conjunto
+    # inteiro (delete + insert, `replace_all`), o "antes" só existe se
+    # lido ANTES de chamar `replace_all` — daqui pra frente cada linha
+    # some do banco. Audita só o que de fato MUDOU (tipo ou valor de
+    # comissão), por serviço — nunca um log genérico "algo mudou".
+    before_by_service = {
+        row.service_id: row
+        for row in professional_service_repo.list_for_professional(session, organization_id, professional_id)
+    }
 
     payload = []
     for item in items:
@@ -141,4 +156,31 @@ def replace_professional_services(
             )
         payload.append(item.model_dump())
 
-    return professional_service_repo.replace_all(session, organization_id, professional_id, payload)
+    result = professional_service_repo.replace_all(session, organization_id, professional_id, payload)
+
+    for row in result:
+        prior = before_by_service.get(row.service_id)
+        old_type = prior.commission_type if prior is not None else None
+        old_value = prior.commission_value if prior is not None else None
+        if old_type == row.commission_type and old_value == row.commission_value:
+            continue
+        audit_log_repo.create(
+            session,
+            organization_id=organization_id,
+            user_id=user_id,
+            entity_type="professional_service",
+            entity_id=row.id,
+            action=AuditAction.CREATE if prior is None else AuditAction.UPDATE,
+            old_values={
+                "professional_id": str(professional_id), "service_id": str(row.service_id),
+                "commission_type": old_type.value if old_type is not None else None,
+                "commission_value": str(old_value) if old_value is not None else None,
+            },
+            new_values={
+                "professional_id": str(professional_id), "service_id": str(row.service_id),
+                "commission_type": row.commission_type.value if row.commission_type is not None else None,
+                "commission_value": str(row.commission_value) if row.commission_value is not None else None,
+            },
+        )
+
+    return result

@@ -175,6 +175,6 @@ def replace_professional_services(
     actor: ActorContext = Depends(_manage),
 ) -> list[ProfessionalServiceRead]:
     rows = professionals_service.replace_professional_services(
-        session, actor.organization_id, professional_id, payload.items
+        session, actor.organization_id, professional_id, payload.items, user_id=actor.user_id
     )
     return [ProfessionalServiceRead.model_validate(r) for r in rows]

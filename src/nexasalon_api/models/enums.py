@@ -28,6 +28,33 @@ class CommissionType(str, Enum):
     FIXED = "fixed"
 
 
+class CommissionStatus(str, Enum):
+    """Etapa C2 — Comissão por serviço vendido. Estado ESTRUTURADO
+    gravado no `OrderItem` no momento do FECHAMENTO da comanda (nunca
+    `NULL` por omissão pra itens fechados depois desta coluna existir)
+    pra nunca depender só da nulidade dos snapshots — "sem regra
+    configurada NÃO significa comissão zero", mesmo raciocínio de
+    `PaymentFeeStatus` (Etapa N3):
+
+      - CALCULATED: existia uma `ProfessionalService` ativa com
+        `commission_type`/`commission_value` configurados pra este par
+        (profissional, serviço) no momento do fechamento — snapshots
+        preenchidos com o valor REAL aplicado, que nunca muda se a
+        regra for editada depois.
+      - NOT_CONFIGURED: não existia regra (vínculo ausente, inativo, ou
+        sem comissão configurada) — os 3 snapshots ficam `NULL` de
+        propósito (nunca inventa 0%); o item continua válido, só a
+        comissão fica "não configurada".
+
+    `OrderItem` fechados ANTES desta coluna existir (migration 0036)
+    têm `commission_status IS NULL` — nunca são migrados/backfilled com
+    um valor inventado; quem lê precisa tratar `NULL` como "dado
+    histórico sem informação de comissão", nunca fingindo um cálculo."""
+
+    CALCULATED = "calculated"
+    NOT_CONFIGURED = "not_configured"
+
+
 class ScheduleBlockScope(str, Enum):
     PROFESSIONAL = "professional"
     BRANCH = "branch"

@@ -49,7 +49,15 @@ from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, TimestampMixin, UUIDPKMixin
-from .enums import CardBrand, OrderStatus, PaymentFeeStatus, PaymentMethod, pg_enum
+from .enums import (
+    CardBrand,
+    CommissionStatus,
+    CommissionType,
+    OrderStatus,
+    PaymentFeeStatus,
+    PaymentMethod,
+    pg_enum,
+)
 
 
 class Order(Base, UUIDPKMixin, TimestampMixin):
@@ -160,6 +168,25 @@ class OrderItem(Base, UUIDPKMixin, TimestampMixin):
     # no histórico do cliente/Extrato, o que quebraria a auditoria.
     service_name: Mapped[str] = mapped_column(String(255), nullable=False)
     professional_name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # --- Etapa C2 — Comissão por serviço vendido (migration 0036) ---
+    # Todas NULLABLE de propósito, sem backfill (mesmo raciocínio do
+    # snapshot de taxa de pagamento, Etapa N3) — resolvidas UMA VEZ no
+    # fechamento da comanda (`services/orders.py::close_order`/
+    # `close_orders_consolidated` -> `services/commissions.py::
+    # resolve_commission`) e nunca recalculadas depois: editar a
+    # comissão em `ProfessionalService` NUNCA altera um `OrderItem` já
+    # fechado. `commission_status` é o diferenciador ESTRUTURADO entre
+    # "comissão calculada" e "sem regra configurada" — nunca depender
+    # só da nulidade dos snapshots (ver `models/enums.py::CommissionStatus`).
+    commission_type_snapshot: Mapped[CommissionType | None] = mapped_column(
+        pg_enum(CommissionType, "commission_type")
+    )
+    commission_value_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    commission_amount_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
+    commission_status: Mapped[CommissionStatus | None] = mapped_column(
+        pg_enum(CommissionStatus, "commission_status")
+    )
 
     order: Mapped["Order"] = relationship(back_populates="items")
 
