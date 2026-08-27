@@ -169,16 +169,31 @@ def resolve_commission(
 # ---------------------------------------------------------------------------
 
 
+def _has_full_view_scope(actor: ActorContext) -> bool:
+    """`commissions.manage` já autoriza LEITURA na rota (`_view =
+    require_any_permission(view_all, view_own, manage)`, `api/v1/
+    commissions.py`) — quem pode pagar precisa poder ver tudo, nunca só
+    a própria comissão. Tratar `manage` como equivalente a `view_all`
+    aqui é só tornar a rota e a service layer CONSISTENTES entre si
+    (a rota já deixa manage passar; sem isso um ator manage-only viraria
+    NotFoundError/lista vazia mesmo tendo passado pela checagem da
+    rota) — nunca uma regra nova inventada, só a mesma regra da rota
+    aplicada onde o escopo de fato é decidido. Na prática, OWNER/ADMIN
+    sempre têm os dois juntos (migration 0037); isto só importa pra um
+    role customizado que concedesse `manage` sozinho."""
+    return VIEW_ALL_PERMISSION in actor.permissions or MANAGE_PERMISSION in actor.permissions
+
+
 def can_view_professional_commissions(actor: ActorContext, professional_id: uuid.UUID) -> bool:
     """Verdade única de "este ator pode ver a comissão DESTE profissional
     específico" — mesmo raciocínio de `services/agenda_access.py::
-    can_view_professional` (view_all vence sempre; view_own só autoriza
-    o PRÓPRIO `professional_id` do ator), sem a camada extra de escopo
-    granular por membership que a Agenda tem (não pedida aqui).
+    can_view_professional` (view_all/manage vencem sempre; view_own só
+    autoriza o PRÓPRIO `professional_id` do ator), sem a camada extra de
+    escopo granular por membership que a Agenda tem (não pedida aqui).
     Estruturada como função separada de propósito: a Etapa C5 ("Minha
     Comissão") só precisa REUSAR esta função pra decidir o que mostrar,
     nunca duplicar a regra de autorização."""
-    if VIEW_ALL_PERMISSION in actor.permissions:
+    if _has_full_view_scope(actor):
         return True
     return VIEW_OWN_PERMISSION in actor.permissions and actor.professional_id == professional_id
 
@@ -225,13 +240,13 @@ def get_overview(
     N+1: nunca uma query de comissão por profissional depois de listar
     os profissionais). Competência = `Order.closed_at` (ver docstring
     do módulo). `professional_id` (filtro opcional) só é respeitado
-    quando o ator tem `commissions.view_all` — sem essa permission, o
-    filtro é IGNORADO e forçado pro próprio `actor.professional_id`
-    (nunca aceita ver outro profissional só porque pediu no parâmetro
-    — a rota já garante que o ator tem pelo menos uma das duas
-    permissions antes de chegar aqui)."""
+    quando o ator tem `commissions.view_all` ou `commissions.manage`
+    (`_has_full_view_scope`) — sem isso, o filtro é IGNORADO e forçado
+    pro próprio `actor.professional_id` (nunca aceita ver outro
+    profissional só porque pediu no parâmetro — a rota já garante que
+    o ator tem pelo menos uma das permissions antes de chegar aqui)."""
     organization_id = actor.organization_id
-    if VIEW_ALL_PERMISSION not in actor.permissions:
+    if not _has_full_view_scope(actor):
         if actor.professional_id is None:
             return CommissionOverview(
                 date_from=date_from, date_to=date_to, production=Decimal("0"),
@@ -703,11 +718,11 @@ def list_settlements(
     date_from: datetime | None = None,
     date_to: datetime | None = None,
 ) -> list[CommissionSettlementSummary]:
-    """Histórico de pagamentos. Sem `commissions.view_all`, o filtro é
-    forçado pro próprio profissional (mesmo raciocínio de
-    `get_overview`)."""
+    """Histórico de pagamentos. Sem escopo completo (`_has_full_view_scope`
+    — `view_all` ou `manage`), o filtro é forçado pro próprio
+    profissional (mesmo raciocínio de `get_overview`)."""
     organization_id = actor.organization_id
-    if VIEW_ALL_PERMISSION not in actor.permissions:
+    if not _has_full_view_scope(actor):
         if actor.professional_id is None:
             return []
         professional_id = actor.professional_id

@@ -35,9 +35,15 @@ branch_labels = None
 depends_on = None
 
 PERMISSIONS = [
-    ("commissions.view_all", "commissions", "Visualizar produção e comissão de todos os profissionais"),
-    ("commissions.view_own", "commissions", "Visualizar apenas a própria produção e comissão"),
-    ("commissions.manage", "commissions", "Configurar fechamento e pagamento de comissão"),
+    # Etapa C5 — textos revisados pra ficarem amigáveis na tela de
+    # Acessos (item explícito "Ver minhas comissões" / "Ver comissões
+    # de todos" / "Gerenciar comissões"). Migration ainda não aplicada
+    # em nenhum ambiente — seguro editar em vez de criar uma nova
+    # migration só pra 3 UPDATEs de texto (ver CLAUDE.md: só migration
+    # JÁ aplicada em produção nunca pode ser editada).
+    ("commissions.view_all", "commissions", "Ver comissões de todos"),
+    ("commissions.view_own", "commissions", "Ver minhas comissões"),
+    ("commissions.manage", "commissions", "Gerenciar comissões"),
 ]
 GRANTED_TO = {
     "OWNER": ["commissions.view_all", "commissions.manage"],
