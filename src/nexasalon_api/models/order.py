@@ -139,7 +139,17 @@ class OrderItem(Base, UUIDPKMixin, TimestampMixin):
     volta em `AppointmentItem.price` nem em `Service.default_price`."""
 
     __tablename__ = "order_items"
-    __table_args__ = (CheckConstraint("price >= 0", name="price_not_negative"),)
+    __table_args__ = (
+        CheckConstraint("price >= 0", name="price_not_negative"),
+        # Etapa C4 — reforça no banco (não só na service layer) que um
+        # item só pode ser linkado a um settlement se a comissão foi de
+        # fato CALCULADA — `not_configured` e histórico
+        # (`commission_status IS NULL`) nunca entram numa liquidação.
+        CheckConstraint(
+            "commission_settlement_id IS NULL OR commission_status = 'calculated'",
+            name="commission_settlement_id_requires_calculated",
+        ),
+    )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
@@ -186,6 +196,16 @@ class OrderItem(Base, UUIDPKMixin, TimestampMixin):
     commission_amount_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
     commission_status: Mapped[CommissionStatus | None] = mapped_column(
         pg_enum(CommissionStatus, "commission_status")
+    )
+    # --- Etapa C4 — Fechamento/Pagamento de Comissão (migration 0038) ---
+    # `NULL` = "A pagar" (comissão calculada, ainda não liquidada);
+    # preenchido = "Pago", travado no momento em que o settlement é
+    # criado (`services/commissions.py::create_settlement`) — nunca
+    # editado depois disso (ver `models/commission.py::CommissionSettlement`).
+    # RESTRICT: um settlement nunca pode ser apagado por baixo enquanto
+    # itens ainda apontam pra ele (não que exista rota de delete hoje).
+    commission_settlement_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("commission_settlements.id", ondelete="RESTRICT")
     )
 
     order: Mapped["Order"] = relationship(back_populates="items")
