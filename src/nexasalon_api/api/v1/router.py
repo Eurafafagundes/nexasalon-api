@@ -9,6 +9,7 @@ from . import (
     cash_register_config,
     cash_registers,
     clients,
+    commissions,
     customer_auth,
     dashboard,
     extract,
@@ -47,6 +48,7 @@ api_v1_router.include_router(cash_register_config.router)
 api_v1_router.include_router(extract.router)
 api_v1_router.include_router(payment_fee_rules.router)
 api_v1_router.include_router(dashboard.router)
+api_v1_router.include_router(commissions.router)
 api_v1_router.include_router(products.router)
 api_v1_router.include_router(stock.router)
 api_v1_router.include_router(inventory_counts.router)
