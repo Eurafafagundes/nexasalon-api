@@ -48,6 +48,14 @@ class KpiValue(BaseModel):
     # diferença em PONTOS PERCENTUAIS — só relevante/preenchida quando kind == RATE.
     delta_points: float | None = None
     has_comparison: bool = False
+    # Etapa BI (redesign do Dashboard) — trilha do PERÍODO ATUAL apenas
+    # (nunca do comparativo — a sparkline é só pra indicar tendência
+    # recente, não pra sobrepor duas séries num espaço tão pequeno),
+    # mesma granularidade/buckets de `DashboardOverviewResponse.
+    # granularity`. `None` só quando o card não tem trilha definida
+    # (não usado hoje — todo `KpiValue` da visão geral vem com uma
+    # lista, possivelmente de zeros).
+    sparkline: list[Decimal] | None = None
 
 
 class SeriesPoint(BaseModel):
@@ -155,6 +163,26 @@ class DashboardKpis(BaseModel):
     appointments_count: KpiValue
     no_show_rate: KpiValue
     new_clients: KpiValue
+    # --- Redesign BI (mockup "Visão Geral do Seu Salão") — os 6 cards
+    # principais da NOVA visão geral passam a ser: revenue (Faturamento
+    # Bruto), net_revenue, orders_count (Atendimentos), new_clients,
+    # ticket_average, repeat_rate. Os 3 campos ACIMA (`clients_served`/
+    # `appointments_count`/`no_show_rate`) são MANTIDOS no contrato —
+    # nunca removidos — só saem da grade principal (`config/dashboard.ts`
+    # decide o que renderiza); continuam calculáveis/consultáveis via
+    # `GET /dashboard/kpi/{key}` pra nunca quebrar um consumidor futuro.
+    #
+    # `net_revenue` = `revenue_fee_summary.known_net_revenue` (o MESMO
+    # número, aqui só embalado como `KpiValue` com comparação — nunca
+    # uma segunda conta). `orders_count` = comandas FECHADAS no
+    # período ("Atendimentos" no sentido do pedido: venda efetivamente
+    # realizada — nunca `Appointment`, que inclui cancelado/faltou).
+    # `repeat_rate` = ver docstring de `_repeat_rate` em
+    # `services/dashboard.py` — métrica NOVA e DIFERENTE da retenção-90-
+    # dias (`RetentionSummary`, mantida como está, disponível à parte).
+    net_revenue: KpiValue
+    orders_count: KpiValue
+    repeat_rate: KpiValue
 
 
 class RevenueFeeSummary(BaseModel):
@@ -192,6 +220,38 @@ class RevenueFeeSummary(BaseModel):
     has_unconfigured_fee: bool
 
 
+class FinancialSummary(BaseModel):
+    """"Resumo Financeiro" do redesign BI — quatro linhas SEPARADAS,
+    cada uma já com fonte de verdade própria e reaproveitada de um
+    módulo existente; DELIBERADAMENTE sem nenhum "Resultado
+    operacional"/"Lucro Líquido" (item explícito do pedido: só compor
+    esse número quando o sistema tiver base semântica completa pra ele
+    — hoje não tem: falta ao menos impostos e demais custos fixos —
+    nunca fingir um P&L completo com 4 componentes parciais).
+
+    `received` = `RevenueReconciliation.received` (soma de
+    `Payment.amount`, granularidade "Recebido" — ver "TRÊS CONCEITOS"
+    em `services/dashboard.py`). `known_fee_total` = MESMO campo de
+    `RevenueFeeSummary` (nunca uma segunda conta de taxa). `expenses` =
+    soma de `CashMovement` tipo `withdrawal` no período — MESMA
+    definição já usada pelo Extrato (`services/extract.py::
+    ExtractSummary.expense_total`), reaproveitada aqui, nunca uma nova
+    interpretação de "despesa".
+
+    `commissions_calculated` é `None` quando o ator autenticado não tem
+    `commissions.view_all`/`commissions.manage` — Dashboard nunca
+    expõe um dado de outro módulo pra quem não tem escopo nele, mesmo
+    que veja o Dashboard (`dashboard.view` é uma permission
+    independente); o frontend deve mostrar essa linha como
+    indisponível/oculta nesse caso, nunca como R$0,00 (que pareceria
+    "sem comissão" em vez de "sem permissão para ver")."""
+
+    received: Decimal
+    known_fee_total: Decimal
+    commissions_calculated: Decimal | None
+    expenses: Decimal
+
+
 class DashboardOverviewResponse(BaseModel):
     date_from: datetime
     date_to: datetime
@@ -212,6 +272,110 @@ class DashboardOverviewResponse(BaseModel):
     retention: RetentionSummary
     heatmap: list[HeatmapCell]
     revenue_fee_summary: RevenueFeeSummary
+    financial_summary: FinancialSummary
+
+
+# ---------------------------------------------------------------------------
+# Redesign BI — "Ver todos" (análise detalhada de Serviços/Profissionais).
+# ---------------------------------------------------------------------------
+
+
+class ServicePerformanceRow(BaseModel):
+    """Uma linha da tabela "Dashboard > Análise de Serviços". `quantity`
+    é "Atendimentos" no sentido do pedido (nº de vezes que ESTE serviço
+    foi vendido no período — mesma contagem de `TopServiceRow.quantity`,
+    nunca redefinida aqui). `revenue` já vem como `KpiValue` (com
+    comparação/variação embutida) pra o frontend reaproveitar o MESMO
+    componente de formatação/seta dos 6 cards principais, sem duplicar
+    a lógica de "seta pra cima/baixo" numa tabela."""
+
+    service_id: uuid.UUID
+    service_name: str
+    quantity: int
+    revenue: KpiValue
+    ticket_average: Decimal
+
+
+class DashboardServicesResponse(BaseModel):
+    date_from: datetime
+    date_to: datetime
+    compare_from: datetime | None
+    compare_to: datetime | None
+    rows: list[ServicePerformanceRow]
+
+
+class DashboardOrderItemRow(BaseModel):
+    """Linha de drill-down (Serviço OU Profissional) — sempre o
+    SNAPSHOT do `OrderItem` (`service_name`/`professional_name`/
+    `price`), nunca uma leitura ao vivo de `Service`/`Professional`
+    (mesmo raciocínio do Extrato/Comissões: histórico não muda se o
+    cadastro mudar depois)."""
+
+    order_item_id: uuid.UUID
+    order_id: uuid.UUID
+    order_number: int
+    closed_at: datetime
+    client_name: str
+    service_name: str
+    professional_name: str
+    price: Decimal
+
+
+class DashboardServiceDetailResponse(BaseModel):
+    service_id: uuid.UUID
+    service_name: str
+    date_from: datetime
+    date_to: datetime
+    items: list[DashboardOrderItemRow]
+
+
+class ProfessionalPerformanceDetailRow(BaseModel):
+    """Uma linha de "Dashboard > Desempenho dos Profissionais".
+    `commission_calculated` é `None` nas MESMAS condições de
+    `FinancialSummary.commissions_calculated` (sem escopo de
+    Comissões) — nunca R$0 fingido."""
+
+    professional_id: uuid.UUID
+    professional_name: str
+    services_count: int
+    revenue: KpiValue
+    ticket_average: Decimal | None
+    commission_calculated: Decimal | None
+
+
+class DashboardProfessionalsResponse(BaseModel):
+    date_from: datetime
+    date_to: datetime
+    compare_from: datetime | None
+    compare_to: datetime | None
+    # `False` quando o ator não tem escopo de Comissões — o frontend usa
+    # isto (não a nulidade de cada `commission_calculated`) pra decidir
+    # se mostra a coluna inteira ou a omite, evitando uma coluna cheia
+    # de "—" que pareceria um bug em vez de uma permissão ausente.
+    commissions_available: bool
+    rows: list[ProfessionalPerformanceDetailRow]
+
+
+class ProfessionalTopServiceRow(BaseModel):
+    service_name: str
+    revenue: Decimal
+    quantity: int
+
+
+class DashboardProfessionalDetailResponse(BaseModel):
+    professional_id: uuid.UUID
+    professional_name: str
+    date_from: datetime
+    date_to: datetime
+    revenue: Decimal
+    services_count: int
+    ticket_average: Decimal | None
+    commission_calculated: Decimal | None
+    commission_available: bool
+    top_services: list[ProfessionalTopServiceRow]
+    granularity: str
+    revenue_series: list[SeriesPoint]
+    items: list[DashboardOrderItemRow]
 
 
 class RevenueReconciliation(BaseModel):

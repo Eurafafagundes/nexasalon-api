@@ -6,7 +6,14 @@ from sqlalchemy.orm import Session
 
 from nexasalon_api.api.deps import get_db, require_permission
 from nexasalon_api.core.actor import ActorContext
-from nexasalon_api.schemas.dashboard import DashboardKpiDetailResponse, DashboardOverviewResponse
+from nexasalon_api.schemas.dashboard import (
+    DashboardKpiDetailResponse,
+    DashboardOverviewResponse,
+    DashboardProfessionalDetailResponse,
+    DashboardProfessionalsResponse,
+    DashboardServiceDetailResponse,
+    DashboardServicesResponse,
+)
 from nexasalon_api.services import dashboard as dashboard_service
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -53,4 +60,80 @@ def get_kpi_detail(
     return dashboard_service.get_kpi_detail(
         session, actor, key=key, branch_id=branch_id, date_from=date_from, date_to=date_to,
         compare_from=compare_from, compare_to=compare_to,
+    )
+
+
+@router.get(
+    "/services",
+    response_model=DashboardServicesResponse,
+    summary="Dashboard > Análise de Serviços — 'Ver todos' de Top Serviços",
+)
+def get_services(
+    date_from: datetime = Query(...),
+    date_to: datetime = Query(...),
+    compare_from: datetime | None = Query(None),
+    compare_to: datetime | None = Query(None),
+    branch_id: uuid.UUID | None = Query(None),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> DashboardServicesResponse:
+    return dashboard_service.get_services(
+        session, actor, branch_id=branch_id, date_from=date_from, date_to=date_to,
+        compare_from=compare_from, compare_to=compare_to,
+    )
+
+
+@router.get(
+    "/services/{service_id}",
+    response_model=DashboardServiceDetailResponse,
+    summary="Dashboard > Análise de Serviços — drill-down de um serviço",
+)
+def get_service_detail(
+    service_id: uuid.UUID,
+    date_from: datetime = Query(...),
+    date_to: datetime = Query(...),
+    branch_id: uuid.UUID | None = Query(None),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> DashboardServiceDetailResponse:
+    return dashboard_service.get_service_detail(
+        session, actor, service_id, branch_id=branch_id, date_from=date_from, date_to=date_to,
+    )
+
+
+@router.get(
+    "/professionals",
+    response_model=DashboardProfessionalsResponse,
+    summary="Dashboard > Desempenho dos Profissionais — 'Ver todos' do ranking",
+)
+def get_professionals(
+    date_from: datetime = Query(...),
+    date_to: datetime = Query(...),
+    compare_from: datetime | None = Query(None),
+    compare_to: datetime | None = Query(None),
+    branch_id: uuid.UUID | None = Query(None),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> DashboardProfessionalsResponse:
+    return dashboard_service.get_professionals_detail(
+        session, actor, branch_id=branch_id, date_from=date_from, date_to=date_to,
+        compare_from=compare_from, compare_to=compare_to,
+    )
+
+
+@router.get(
+    "/professionals/{professional_id}",
+    response_model=DashboardProfessionalDetailResponse,
+    summary="Dashboard > Desempenho dos Profissionais — drill-down de um profissional",
+)
+def get_professional_detail(
+    professional_id: uuid.UUID,
+    date_from: datetime = Query(...),
+    date_to: datetime = Query(...),
+    branch_id: uuid.UUID | None = Query(None),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> DashboardProfessionalDetailResponse:
+    return dashboard_service.get_professional_detail(
+        session, actor, professional_id, branch_id=branch_id, date_from=date_from, date_to=date_to,
     )

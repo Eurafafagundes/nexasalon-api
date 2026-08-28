@@ -155,7 +155,7 @@ denominador de capacidade/vagas disponíveis implementado ainda).
 import calendar
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -165,32 +165,50 @@ from sqlalchemy.orm import Session
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.exceptions import NotFoundError, ValidationDomainError
 from nexasalon_api.models.appointment import Appointment
+from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import (
     AppointmentStatus,
+    CashMovementType,
     OrderStatus,
     PaymentFeeStatus,
     PaymentMethod,
 )
 from nexasalon_api.models.order import Order, OrderItem, OrderProductItem, Payment
-from nexasalon_api.repositories import branch_repo, organization_repo
+from nexasalon_api.repositories import (
+    branch_repo,
+    cash_movement_repo,
+    organization_repo,
+    professional_repo,
+    service_repo,
+)
 from nexasalon_api.schemas.dashboard import (
     DashboardKpiDetailResponse,
     DashboardKpis,
+    DashboardOrderItemRow,
     DashboardOverviewResponse,
+    DashboardProfessionalDetailResponse,
+    DashboardProfessionalsResponse,
+    DashboardServiceDetailResponse,
+    DashboardServicesResponse,
+    FinancialSummary,
     HeatmapCell,
     KpiKind,
     KpiValue,
     NewVsRecurringPoint,
     PaymentMethodBucket,
     PaymentMethodRow,
+    ProfessionalPerformanceDetailRow,
     ProfessionalPerformanceRow,
+    ProfessionalTopServiceRow,
     RetentionSummary,
     RevenueFeeSummary,
     RevenueReconciliation,
     SeriesPoint,
+    ServicePerformanceRow,
     StatusDistributionRow,
     TopServiceRow,
 )
+from nexasalon_api.services import commissions as commissions_service
 from nexasalon_api.services import payment_fees as payment_fees_service
 
 _RETENTION_WINDOW_DAYS = 90
@@ -211,12 +229,20 @@ _PAYMENT_METHOD_BUCKET: dict[PaymentMethod, PaymentMethodBucket] = {
 
 _KPI_KEYS = {
     "revenue", "ticket_average", "clients_served", "appointments_count", "no_show_rate", "new_clients",
-    # "received" não é um dos 6 cards da visão geral (mantém o layout
-    # executivo original) — só é acessível via drill-down próprio
-    # (`GET /dashboard/kpi/received`) e embutido no drill-down de
-    # `revenue` via `RevenueReconciliation`.
+    # "received" não é um dos cards da visão geral — só é acessível via
+    # drill-down próprio (`GET /dashboard/kpi/received`) e embutido no
+    # drill-down de `revenue` via `RevenueReconciliation`.
     "received",
+    # Redesign BI — os 3 novos cards principais (ver docstring de
+    # `DashboardKpis` em `schemas/dashboard.py`).
+    "net_revenue", "orders_count", "repeat_rate",
 }
+
+# Os 6 cards da NOVA visão geral (mockup "Visão Geral do Seu Salão"),
+# nesta ORDEM exata — usado só pra montar `DashboardKpis`/sparklines
+# num laço, nunca redefine o que cada chave significa (isso é
+# `_bucket_values_for_key`/`_kpi_totals`).
+_OVERVIEW_KPI_KEYS = ("revenue", "net_revenue", "orders_count", "new_clients", "ticket_average", "repeat_rate")
 
 
 @dataclass(frozen=True)
@@ -490,9 +516,11 @@ def _delta_absolute_percent(current: Decimal, previous: Decimal) -> tuple[Decima
     return absolute, float(absolute / previous * Decimal(100))
 
 
-def _kpi_value(kind: KpiKind, current: Decimal, previous: Decimal | None) -> KpiValue:
+def _kpi_value(
+    kind: KpiKind, current: Decimal, previous: Decimal | None, *, sparkline: list[Decimal] | None = None
+) -> KpiValue:
     if previous is None:
-        return KpiValue(kind=kind, value=current, has_comparison=False)
+        return KpiValue(kind=kind, value=current, has_comparison=False, sparkline=sparkline)
     absolute, percent = _delta_absolute_percent(current, previous)
     points = None
     if kind == KpiKind.RATE:
@@ -509,6 +537,7 @@ def _kpi_value(kind: KpiKind, current: Decimal, previous: Decimal | None) -> Kpi
         delta_percent=percent,
         delta_points=points,
         has_comparison=True,
+        sparkline=sparkline,
     )
 
 
@@ -588,6 +617,119 @@ def _new_clients_count(
     client_ids = {row.client_id for row in data.orders}
     first_visits = _first_visit_by_client(session, organization_id, branch_id, client_ids)
     return sum(1 for fv in first_visits.values() if date_from <= fv < date_to)
+
+
+# ---------------------------------------------------------------------------
+# Redesign BI — Taxa de Retorno (NOVA definição, "olhando pra trás").
+#
+# Conceitualmente DIFERENTE de `RetentionSummary`/`_compute_retention_rate`
+# (que olha PRA FRENTE, a partir da primeira visita, com censura de 90
+# dias): aqui a pergunta é "dos clientes atendidos NESTE período,
+# quantos JÁ eram clientes antes dele começar" — item explícito do
+# pedido, mais intuitivo pra leitura mês-a-mês de um card único, sem
+# censura temporal pra explicar. `RetentionSummary` continua existindo
+# tal como está (não removida), disponível à parte no overview.
+# ---------------------------------------------------------------------------
+
+
+def _repeat_client_count(
+    session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID | None, data: _PeriodData, date_from: datetime
+) -> int:
+    client_ids = {row.client_id for row in data.orders}
+    first_visits = _first_visit_by_client(session, organization_id, branch_id, client_ids)
+    return sum(1 for cid in client_ids if first_visits.get(cid) is not None and first_visits[cid] < date_from)
+
+
+def _repeat_rate(
+    session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID | None, data: _PeriodData, date_from: datetime
+) -> Decimal:
+    served = _clients_served(data)
+    if served == 0:
+        return Decimal("0")
+    repeat = _repeat_client_count(session, organization_id, branch_id, data, date_from)
+    return (Decimal(repeat) / Decimal(served) * Decimal(100)).quantize(Decimal("0.01"))
+
+
+def _repeat_rate_bucket_values(
+    session: Session, filters: DashboardFilters, buckets: list[tuple[datetime, datetime]], data: _PeriodData
+) -> list[Decimal]:
+    """Trilha (sparkline) da Taxa de Retorno — referência de "já era
+    cliente" é o INÍCIO DE CADA BUCKET (não o início do período inteiro,
+    diferente do card principal acima): mostra o crescimento orgânico
+    de clientes recorrentes ao longo do próprio período, não só um
+    número estático repetido. Decorativo (tendência), não recalcula o
+    card principal — o valor oficial de "Taxa de Retorno" continua
+    vindo só de `_repeat_rate`."""
+    client_ids = {row.client_id for row in data.orders}
+    first_visit = _first_visit_by_client(session, filters.organization_id, filters.branch_id, client_ids)
+    served_by_bucket: dict[int, set[uuid.UUID]] = defaultdict(set)
+    repeat_by_bucket: dict[int, set[uuid.UUID]] = defaultdict(set)
+    for row in data.orders:
+        idx = _bucket_index(buckets, row.closed_at)
+        if idx is None:
+            continue
+        served_by_bucket[idx].add(row.client_id)
+        fv = first_visit.get(row.client_id)
+        if fv is not None and fv < buckets[idx][0]:
+            repeat_by_bucket[idx].add(row.client_id)
+    return [
+        (
+            (Decimal(len(repeat_by_bucket.get(i, ()))) / Decimal(len(served_by_bucket[i])) * Decimal(100)).quantize(
+                Decimal("0.01")
+            )
+            if served_by_bucket.get(i)
+            else Decimal("0")
+        )
+        for i in range(len(buckets))
+    ]
+
+
+def _orders_count_series_values(buckets: list[tuple[datetime, datetime]], data: _PeriodData) -> list[Decimal]:
+    """"Atendimentos" por bucket — contagem de comandas FECHADAS (nunca
+    `Appointment`, ver docstring do módulo: "Atendimentos" no redesign
+    BI significa venda efetivamente realizada, não volume de agenda)."""
+    totals = [Decimal("0")] * len(buckets)
+    for row in data.orders:
+        idx = _bucket_index(buckets, row.closed_at)
+        if idx is not None:
+            totals[idx] += 1
+    return totals
+
+
+def _net_revenue_series_values(
+    session: Session, filters: DashboardFilters, buckets: list[tuple[datetime, datetime]], data: _PeriodData
+) -> list[Decimal]:
+    """Trilha do Faturamento Líquido — Bruto por bucket (reaproveita
+    `_revenue_series_values`) menos taxa CONHECIDA por bucket, somada
+    numa ÚNICA passada sobre os `Payment` do intervalo inteiro (mesmo
+    raciocínio de custo de `_revenue_fee_summary`, nunca uma query por
+    bucket). Pagamento com taxa `unconfigured` nunca desconta 0 nem
+    inventa um valor — simplesmente não entra na subtração (mesma
+    semântica do card principal `known_net_revenue`)."""
+    revenue_totals = _revenue_series_values(buckets, data)
+    if not buckets:
+        return revenue_totals
+    stmt = (
+        select(Payment, Order.closed_at)
+        .join(Order, Order.id == Payment.order_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Order.status == OrderStatus.CLOSED,
+            Order.closed_at >= buckets[0][0],
+            Order.closed_at < buckets[-1][1],
+        )
+    )
+    if filters.branch_id is not None:
+        stmt = stmt.where(Order.branch_id == filters.branch_id)
+    fee_totals = [Decimal("0")] * len(buckets)
+    for payment, closed_at in session.execute(stmt).all():
+        idx = _bucket_index(buckets, closed_at)
+        if idx is None:
+            continue
+        breakdown = payment_fees_service.breakdown_for_display(payment)
+        if breakdown.fee_status == PaymentFeeStatus.CALCULATED:
+            fee_totals[idx] += breakdown.fee_amount or Decimal("0")
+    return [revenue_totals[i] - fee_totals[i] for i in range(len(buckets))]
 
 
 # ---------------------------------------------------------------------------
@@ -794,12 +936,17 @@ def _payment_methods(session: Session, filters: DashboardFilters) -> list[Paymen
     return rows
 
 
-def _revenue_fee_summary(session: Session, filters: DashboardFilters, gross_revenue: Decimal) -> RevenueFeeSummary:
+def _revenue_fee_summary(
+    session: Session, filters: DashboardFilters, gross_revenue: Decimal, date_from: datetime, date_to: datetime
+) -> RevenueFeeSummary:
     """Etapa N4 — Bruto/Taxa/Líquido do período. `gross_revenue` é
     SEMPRE recebido de fora (= `_revenue(data)`, o mesmo Faturamento de
     sempre) — esta função nunca soma `Payment.amount` pra formar o
     Bruto, só usa `Payment` pra achar a taxa (item explícito do pedido:
-    "não calcular bruto somando Payments").
+    "não calcular bruto somando Payments"). `date_from`/`date_to`
+    explícitos (mesmo padrão de `_top_services`) — Etapa BI passou a
+    chamar isto também pro período COMPARATIVO (`net_revenue`, o novo
+    card de Faturamento Líquido), nunca só o período atual de `filters`.
 
     Reaproveita `services/payment_fees.py::breakdown_for_display` —
     MESMA função usada pelo Extrato — pra nunca duplicar a
@@ -811,8 +958,8 @@ def _revenue_fee_summary(session: Session, filters: DashboardFilters, gross_reve
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= filters.date_from,
-            Order.closed_at < filters.date_to,
+            Order.closed_at >= date_from,
+            Order.closed_at < date_to,
         )
     )
     if filters.branch_id is not None:
@@ -836,6 +983,44 @@ def _revenue_fee_summary(session: Session, filters: DashboardFilters, gross_reve
         known_net_revenue=gross_revenue - known_fee_total,
         unconfigured_card_amount=unconfigured_card_amount,
         has_unconfigured_fee=has_unconfigured_fee,
+    )
+
+
+def _financial_summary(
+    session: Session, actor: ActorContext, filters: DashboardFilters, *, received: Decimal, known_fee_total: Decimal
+) -> FinancialSummary:
+    """"Resumo Financeiro" (Etapa BI) — ver docstring de `FinancialSummary`
+    (schemas/dashboard.py) pro raciocínio completo de cada linha.
+    `received`/`known_fee_total` são recebidos de fora (já calculados
+    por `get_overview`) — esta função nunca soma `Payment`/`OrderItem`
+    de novo, só resolve as duas linhas que faltam (comissão, despesa).
+
+    `commissions_calculated` fica `None` quando o ator não tem
+    `commissions.view_all`/`commissions.manage` — nunca expõe dado de
+    um módulo pro qual o ator não tem escopo, mesmo enxergando o
+    Dashboard (permissions independentes)."""
+    commissions_calculated = None
+    if "commissions.view_all" in actor.permissions or "commissions.manage" in actor.permissions:
+        commission_overview = commissions_service.get_overview(
+            session, actor, date_from=filters.date_from, date_to=filters.date_to
+        )
+        commissions_calculated = commission_overview.known_commission_total
+
+    # Mesma definição de "Despesa" já usada no Extrato
+    # (`services/extract.py::ExtractSummary.expense_total`) — soma de
+    # `CashMovement` tipo WITHDRAWAL (sangria) no período, nunca uma
+    # segunda interpretação. `cash_movement_repo.list_for_org` não
+    # filtra por unidade (mesma limitação já existente no Extrato hoje
+    # — não é uma limitação nova introduzida aqui).
+    movements = cash_movement_repo.list_for_org(
+        session, filters.organization_id, type=CashMovementType.WITHDRAWAL,
+        date_from=filters.date_from, date_to=filters.date_to,
+    )
+    expenses = sum((m.amount for m in movements), Decimal("0"))
+
+    return FinancialSummary(
+        received=received, known_fee_total=known_fee_total, commissions_calculated=commissions_calculated,
+        expenses=expenses,
     )
 
 
@@ -948,6 +1133,37 @@ def _build_filters(
     )
 
 
+def _bucket_values_for_key(
+    session: Session,
+    filters: DashboardFilters,
+    key: str,
+    period_data: _PeriodData | None,
+    bucket_list: list[tuple[datetime, datetime]] | None,
+) -> list[Decimal] | None:
+    """Dispatcher ÚNICO "chave -> série por bucket", reaproveitado tanto
+    por `get_overview` (sparkline de cada card, só período ATUAL) quanto
+    por `get_kpi_detail` (série completa do drill-down, atual+
+    comparativo) — nunca duas implementações da mesma lógica de bucket
+    por chave."""
+    if period_data is None or bucket_list is None:
+        return None
+    if key == "revenue":
+        return _revenue_series_values(bucket_list, period_data)
+    if key == "received":
+        return _received_series_values(bucket_list, period_data)
+    if key in ("clients_served", "appointments_count", "ticket_average", "no_show_rate"):
+        return _generic_bucket_values(key, bucket_list, period_data)
+    if key == "new_clients":
+        return _new_clients_bucket_values(session, filters, bucket_list, period_data)
+    if key == "orders_count":
+        return _orders_count_series_values(bucket_list, period_data)
+    if key == "net_revenue":
+        return _net_revenue_series_values(session, filters, bucket_list, period_data)
+    if key == "repeat_rate":
+        return _repeat_rate_bucket_values(session, filters, bucket_list, period_data)
+    raise AssertionError(key)  # pragma: no cover — `key` já validado contra `_KPI_KEYS`.
+
+
 def get_overview(
     session: Session,
     actor: ActorContext,
@@ -988,9 +1204,35 @@ def get_overview(
         else None
     )
 
+    # Redesign BI — Faturamento Líquido (`net_revenue`) precisa do
+    # MESMO `RevenueFeeSummary` pro período comparativo também (não só
+    # o atual, que já era calculado antes) — `_revenue_fee_summary`
+    # agora recebe `date_from`/`date_to` explícitos por isso.
+    fee_summary_current = _revenue_fee_summary(session, filters, revenue_current, filters.date_from, filters.date_to)
+    fee_summary_previous = (
+        _revenue_fee_summary(session, filters, revenue_previous, filters.compare_from, filters.compare_to)
+        if comparison is not None and revenue_previous is not None
+        else None
+    )
+
+    orders_count_current = Decimal(_orders_count(current))
+    orders_count_previous = Decimal(_orders_count(comparison)) if comparison is not None else None
+
+    repeat_rate_current = _repeat_rate(session, filters.organization_id, filters.branch_id, current, filters.date_from)
+    repeat_rate_previous = (
+        _repeat_rate(session, filters.organization_id, filters.branch_id, comparison, filters.compare_from)
+        if comparison is not None
+        else None
+    )
+
+    def _sparkline(key: str) -> list[Decimal] | None:
+        return _bucket_values_for_key(session, filters, key, current, buckets)
+
     kpis = DashboardKpis(
-        revenue=_kpi_value(KpiKind.CURRENCY, revenue_current, revenue_previous),
-        ticket_average=_kpi_value(KpiKind.CURRENCY, _ticket_average(current), ticket_previous),
+        revenue=_kpi_value(KpiKind.CURRENCY, revenue_current, revenue_previous, sparkline=_sparkline("revenue")),
+        ticket_average=_kpi_value(
+            KpiKind.CURRENCY, _ticket_average(current), ticket_previous, sparkline=_sparkline("ticket_average")
+        ),
         clients_served=_kpi_value(KpiKind.COUNT, Decimal(_clients_served(current)), clients_previous),
         appointments_count=_kpi_value(KpiKind.COUNT, Decimal(_appointments_count(current)), appts_previous),
         no_show_rate=_kpi_value(KpiKind.RATE, _no_show_rate(current), no_show_previous),
@@ -998,6 +1240,19 @@ def get_overview(
             KpiKind.COUNT,
             Decimal(_new_clients_count(session, filters.organization_id, filters.branch_id, current, filters.date_from, filters.date_to)),
             new_clients_previous,
+            sparkline=_sparkline("new_clients"),
+        ),
+        net_revenue=_kpi_value(
+            KpiKind.CURRENCY,
+            fee_summary_current.known_net_revenue,
+            fee_summary_previous.known_net_revenue if fee_summary_previous is not None else None,
+            sparkline=_sparkline("net_revenue"),
+        ),
+        orders_count=_kpi_value(
+            KpiKind.COUNT, orders_count_current, orders_count_previous, sparkline=_sparkline("orders_count")
+        ),
+        repeat_rate=_kpi_value(
+            KpiKind.RATE, repeat_rate_current, repeat_rate_previous, sparkline=_sparkline("repeat_rate")
         ),
     )
 
@@ -1045,7 +1300,10 @@ def get_overview(
         new_vs_recurring=_new_vs_recurring_series(session, filters, buckets, current),
         retention=_retention_summary(session, filters),
         heatmap=_heatmap(session, filters, org_timezone),
-        revenue_fee_summary=_revenue_fee_summary(session, filters, revenue_current),
+        revenue_fee_summary=fee_summary_current,
+        financial_summary=_financial_summary(
+            session, actor, filters, received=_received(current), known_fee_total=fee_summary_current.known_fee_total
+        ),
     )
 
 
@@ -1075,21 +1333,8 @@ def get_kpi_detail(
     buckets = _generate_buckets(filters.date_from, filters.date_to, granularity)
     comparison_buckets = _generate_buckets(filters.compare_from, filters.compare_to, granularity) if comparison is not None else None
 
-    def _bucket_values(period_data: _PeriodData | None, bucket_list: list[tuple[datetime, datetime]] | None) -> list[Decimal] | None:
-        if period_data is None or bucket_list is None:
-            return None
-        if key == "revenue":
-            return _revenue_series_values(bucket_list, period_data)
-        if key == "received":
-            return _received_series_values(bucket_list, period_data)
-        if key in ("clients_served", "appointments_count", "ticket_average", "no_show_rate"):
-            return _generic_bucket_values(key, bucket_list, period_data)
-        if key == "new_clients":
-            return _new_clients_bucket_values(session, filters, bucket_list, period_data)
-        raise AssertionError(key)  # pragma: no cover — `key` já validado contra `_KPI_KEYS`.
-
-    current_values = _bucket_values(current, buckets) or [Decimal("0")] * len(buckets)
-    comparison_values = _bucket_values(comparison, comparison_buckets)
+    current_values = _bucket_values_for_key(session, filters, key, current, buckets) or [Decimal("0")] * len(buckets)
+    comparison_values = _bucket_values_for_key(session, filters, key, comparison, comparison_buckets)
     series = _align_series(buckets, current_values, comparison_buckets, comparison_values)
 
     kind, current_total, previous_total = _kpi_totals(session, filters, key, current, comparison)
@@ -1211,4 +1456,292 @@ def _kpi_totals(
             else None
         )
         return KpiKind.COUNT, current_total, previous_total
+    if key == "orders_count":
+        return (
+            KpiKind.COUNT,
+            Decimal(_orders_count(current)),
+            Decimal(_orders_count(comparison)) if comparison is not None else None,
+        )
+    if key == "repeat_rate":
+        current_total = _repeat_rate(session, filters.organization_id, filters.branch_id, current, filters.date_from)
+        previous_total = (
+            _repeat_rate(session, filters.organization_id, filters.branch_id, comparison, filters.compare_from)
+            if comparison is not None
+            else None
+        )
+        return KpiKind.RATE, current_total, previous_total
+    if key == "net_revenue":
+        current_summary = _revenue_fee_summary(session, filters, _revenue(current), filters.date_from, filters.date_to)
+        previous_summary = (
+            _revenue_fee_summary(session, filters, _revenue(comparison), filters.compare_from, filters.compare_to)
+            if comparison is not None
+            else None
+        )
+        return (
+            KpiKind.CURRENCY,
+            current_summary.known_net_revenue,
+            previous_summary.known_net_revenue if previous_summary is not None else None,
+        )
     raise AssertionError(key)  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
+# Redesign BI — "Ver todos" (Dashboard > Análise de Serviços / Desempenho
+# dos Profissionais). Reaproveitam as MESMAS agregações do overview
+# (`_top_services`/`_professionals`) — nunca uma segunda fórmula de
+# faturamento/produção — só sem o limite de linhas do card resumido e
+# com a comparação/comissão embutidas por linha.
+# ---------------------------------------------------------------------------
+
+
+def _has_commissions_scope(actor: ActorContext) -> bool:
+    """Dashboard nunca expõe um dado de Comissões pra quem não tem
+    escopo NAQUELE módulo, mesmo enxergando o Dashboard (`dashboard.view`
+    é uma permission independente) — mesmo raciocínio de
+    `_financial_summary`, reaproveitado aqui pros dois drill-downs de
+    profissional."""
+    return "commissions.view_all" in actor.permissions or "commissions.manage" in actor.permissions
+
+
+def get_services(
+    session: Session,
+    actor: ActorContext,
+    *,
+    branch_id: uuid.UUID | None,
+    date_from: datetime,
+    date_to: datetime,
+    compare_from: datetime | None,
+    compare_to: datetime | None,
+) -> DashboardServicesResponse:
+    """Dashboard > Análise de Serviços ("Ver todos" de Top Serviços) —
+    MESMA fonte (`_top_services`) da visão geral, sem o corte de
+    `_TOP_SERVICES_LIMIT` (a visão geral só mostra os 20 principais; aqui
+    é a lista completa do período)."""
+    filters = _build_filters(
+        session, actor, branch_id=branch_id, date_from=date_from, date_to=date_to,
+        compare_from=compare_from, compare_to=compare_to,
+    )
+    current = _top_services(session, filters, filters.date_from, filters.date_to)
+    has_comparison = filters.compare_from is not None and filters.compare_to is not None
+    previous = _top_services(session, filters, filters.compare_from, filters.compare_to) if has_comparison else {}
+
+    rows = sorted(
+        (
+            ServicePerformanceRow(
+                service_id=service_id,
+                service_name=name,
+                quantity=quantity,
+                revenue=_kpi_value(KpiKind.CURRENCY, revenue, previous.get(service_id, (None, None, None))[1]),
+                ticket_average=(revenue / quantity).quantize(Decimal("0.01")) if quantity else Decimal("0"),
+            )
+            for service_id, (name, revenue, quantity) in current.items()
+        ),
+        key=lambda r: r.revenue.value,
+        reverse=True,
+    )
+    return DashboardServicesResponse(
+        date_from=filters.date_from, date_to=filters.date_to,
+        compare_from=filters.compare_from, compare_to=filters.compare_to,
+        rows=rows,
+    )
+
+
+def get_service_detail(
+    session: Session,
+    actor: ActorContext,
+    service_id: uuid.UUID,
+    *,
+    branch_id: uuid.UUID | None,
+    date_from: datetime,
+    date_to: datetime,
+) -> DashboardServiceDetailResponse:
+    """Drill-down de UMA linha de "Análise de Serviços" — os `OrderItem`
+    exatos que compuseram o faturamento daquele serviço no período,
+    mais recentes primeiro. `service_name` do CABEÇALHO usa o snapshot
+    do item mais recente (mesmo nome que a listagem de serviços já
+    mostrou) — nunca o nome ao vivo de `Service`, que poderia divergir
+    se o serviço foi renomeado depois de alguma dessas vendas."""
+    filters = _build_filters(
+        session, actor, branch_id=branch_id, date_from=date_from, date_to=date_to,
+        compare_from=None, compare_to=None,
+    )
+    service = service_repo.get(session, filters.organization_id, service_id)
+    if service is None:
+        raise NotFoundError("Serviço não encontrado.")
+
+    stmt = (
+        select(OrderItem, Order.id, Order.order_number, Order.closed_at, Client.name)
+        .join(Order, Order.id == OrderItem.order_id)
+        .join(Client, Client.id == Order.client_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Order.status == OrderStatus.CLOSED,
+            OrderItem.service_id == service_id,
+            Order.closed_at >= filters.date_from,
+            Order.closed_at < filters.date_to,
+        )
+        .order_by(Order.closed_at.desc())
+    )
+    if filters.branch_id is not None:
+        stmt = stmt.where(Order.branch_id == filters.branch_id)
+    rows = session.execute(stmt).all()
+    items = [
+        DashboardOrderItemRow(
+            order_item_id=item.id, order_id=order_id, order_number=order_number, closed_at=closed_at,
+            client_name=client_name, service_name=item.service_name, professional_name=item.professional_name,
+            price=item.price,
+        )
+        for item, order_id, order_number, closed_at, client_name in rows
+    ]
+    service_name = items[0].service_name if items else service.name
+
+    return DashboardServiceDetailResponse(
+        service_id=service_id, service_name=service_name,
+        date_from=filters.date_from, date_to=filters.date_to, items=items,
+    )
+
+
+def get_professionals_detail(
+    session: Session,
+    actor: ActorContext,
+    *,
+    branch_id: uuid.UUID | None,
+    date_from: datetime,
+    date_to: datetime,
+    compare_from: datetime | None,
+    compare_to: datetime | None,
+) -> DashboardProfessionalsResponse:
+    """Dashboard > Desempenho dos Profissionais ("Ver todos" do
+    ranking) — MESMA fonte (`_professionals`) da visão geral, com
+    comparação por linha e Comissão Calculada (reaproveitando
+    `services/commissions.py::get_overview`, nunca recalculada pela
+    regra atual — ver `_has_commissions_scope`/`FinancialSummary` pro
+    raciocínio de permissão)."""
+    filters = _build_filters(
+        session, actor, branch_id=branch_id, date_from=date_from, date_to=date_to,
+        compare_from=compare_from, compare_to=compare_to,
+    )
+    current_rows = _professionals(session, filters)
+
+    previous_by_id: dict[uuid.UUID, Decimal] = {}
+    if filters.compare_from is not None and filters.compare_to is not None:
+        comparison_filters = replace(filters, date_from=filters.compare_from, date_to=filters.compare_to)
+        previous_by_id = {r.professional_id: r.revenue for r in _professionals(session, comparison_filters)}
+
+    commissions_available = _has_commissions_scope(actor)
+    commission_by_professional: dict[uuid.UUID, Decimal] = {}
+    if commissions_available:
+        commission_overview = commissions_service.get_overview(
+            session, actor, date_from=filters.date_from, date_to=filters.date_to
+        )
+        commission_by_professional = {p.professional_id: p.commission_total for p in commission_overview.professionals}
+
+    rows = [
+        ProfessionalPerformanceDetailRow(
+            professional_id=r.professional_id,
+            professional_name=r.professional_name,
+            services_count=r.services_count,
+            revenue=_kpi_value(KpiKind.CURRENCY, r.revenue, previous_by_id.get(r.professional_id)),
+            ticket_average=r.ticket_average,
+            commission_calculated=commission_by_professional.get(r.professional_id) if commissions_available else None,
+        )
+        for r in current_rows
+    ]
+    return DashboardProfessionalsResponse(
+        date_from=filters.date_from, date_to=filters.date_to,
+        compare_from=filters.compare_from, compare_to=filters.compare_to,
+        commissions_available=commissions_available, rows=rows,
+    )
+
+
+def get_professional_detail(
+    session: Session,
+    actor: ActorContext,
+    professional_id: uuid.UUID,
+    *,
+    branch_id: uuid.UUID | None,
+    date_from: datetime,
+    date_to: datetime,
+) -> DashboardProfessionalDetailResponse:
+    """Drill-down de UM profissional — produção, atendimentos, ticket
+    médio, comissão calculada, principais serviços, evolução no
+    período e os `OrderItem` exatos (item explícito do pedido)."""
+    filters = _build_filters(
+        session, actor, branch_id=branch_id, date_from=date_from, date_to=date_to,
+        compare_from=None, compare_to=None,
+    )
+    professional = professional_repo.get(session, filters.organization_id, professional_id)
+    if professional is None:
+        raise NotFoundError("Profissional não encontrado.")
+
+    stmt = (
+        select(OrderItem, Order.id, Order.order_number, Order.closed_at, Client.name)
+        .join(Order, Order.id == OrderItem.order_id)
+        .join(Client, Client.id == Order.client_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Order.status == OrderStatus.CLOSED,
+            OrderItem.professional_id == professional_id,
+            Order.closed_at >= filters.date_from,
+            Order.closed_at < filters.date_to,
+        )
+        .order_by(Order.closed_at.desc())
+    )
+    if filters.branch_id is not None:
+        stmt = stmt.where(Order.branch_id == filters.branch_id)
+    rows = session.execute(stmt).all()
+
+    items = [
+        DashboardOrderItemRow(
+            order_item_id=item.id, order_id=order_id, order_number=order_number, closed_at=closed_at,
+            client_name=client_name, service_name=item.service_name, professional_name=item.professional_name,
+            price=item.price,
+        )
+        for item, order_id, order_number, closed_at, client_name in rows
+    ]
+
+    revenue = sum((item.price for item, *_rest in rows), Decimal("0"))
+    services_count = len(rows)
+    ticket_average = (revenue / services_count).quantize(Decimal("0.01")) if services_count else None
+
+    # Top serviços deste profissional — agregado a partir dos MESMOS
+    # itens já buscados acima, nunca uma 2ª query.
+    revenue_by_service: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+    quantity_by_service: dict[str, int] = defaultdict(int)
+    for item, *_rest in rows:
+        revenue_by_service[item.service_name] += item.price
+        quantity_by_service[item.service_name] += 1
+    top_services = sorted(
+        (
+            ProfessionalTopServiceRow(service_name=name, revenue=rev, quantity=quantity_by_service[name])
+            for name, rev in revenue_by_service.items()
+        ),
+        key=lambda r: r.revenue,
+        reverse=True,
+    )[:10]
+
+    granularity = _choose_granularity(filters.date_from, filters.date_to)
+    buckets = _generate_buckets(filters.date_from, filters.date_to, granularity)
+    revenue_by_bucket = [Decimal("0")] * len(buckets)
+    for item, _order_id, _order_number, closed_at, _client_name in rows:
+        idx = _bucket_index(buckets, closed_at)
+        if idx is not None:
+            revenue_by_bucket[idx] += item.price
+    revenue_series = _align_series(buckets, revenue_by_bucket, None, None)
+
+    commission_available = _has_commissions_scope(actor)
+    commission_calculated = None
+    if commission_available:
+        commission_overview = commissions_service.get_overview(
+            session, actor, date_from=filters.date_from, date_to=filters.date_to, professional_id=professional_id
+        )
+        matching = [p for p in commission_overview.professionals if p.professional_id == professional_id]
+        commission_calculated = matching[0].commission_total if matching else Decimal("0")
+
+    return DashboardProfessionalDetailResponse(
+        professional_id=professional_id, professional_name=professional.name,
+        date_from=filters.date_from, date_to=filters.date_to,
+        revenue=revenue, services_count=services_count, ticket_average=ticket_average,
+        commission_calculated=commission_calculated, commission_available=commission_available,
+        top_services=top_services, granularity=granularity, revenue_series=revenue_series, items=items,
+    )
