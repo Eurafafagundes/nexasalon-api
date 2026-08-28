@@ -15,7 +15,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
-from nexasalon_api.models.enums import AppointmentStatus
+from nexasalon_api.models.enums import AppointmentStatus, PaymentMethod
 
 
 class KpiKind(str, Enum):
@@ -93,6 +93,25 @@ class ProfessionalPerformanceRow(BaseModel):
     ticket_average: Decimal | None
 
 
+class ClientPerformanceRow(BaseModel):
+    """Uma linha do "Ranking de Clientes" (rodada de interatividade
+    analítica) — MESMA granularidade de `ProfessionalPerformanceRow`
+    (faturamento de `OrderItem`, nunca `OrderProductItem`/produtos —
+    consistente com Top Serviços/Profissionais, que também não incluem
+    produto). `orders_count` é nº de comandas FECHADAS deste cliente no
+    período (mesma definição de "Atendimentos" usada no resto do
+    Dashboard). `last_visit` é o `Order.closed_at` mais recente do
+    cliente DENTRO do período filtrado (não a última visita da vida
+    inteira dele)."""
+
+    client_id: uuid.UUID
+    client_name: str
+    orders_count: int
+    revenue: Decimal
+    ticket_average: Decimal | None
+    last_visit: datetime
+
+
 class StatusDistributionRow(BaseModel):
     """`status` é sempre o CÓDIGO interno oficial (`AppointmentStatus`)
     — o frontend resolve nome/cor exibidos via
@@ -120,6 +139,38 @@ class PaymentMethodRow(BaseModel):
     bucket: PaymentMethodBucket
     amount: Decimal
     percent: float
+
+
+class PaymentMethodPaymentRow(BaseModel):
+    """Um `Payment` individual do drill-down de uma fatia do donut —
+    SNAPSHOT (nome do cliente no momento do fechamento), mesmo
+    raciocínio de `DashboardOrderItemRow`. `method` é o método EXATO
+    (não o bucket) — a fatia "Outros" agrupa vários métodos distintos,
+    então o drill-down precisa distinguir qual foi usado em cada linha."""
+
+    payment_id: uuid.UUID
+    order_id: uuid.UUID
+    order_number: int
+    closed_at: datetime
+    client_name: str
+    method: PaymentMethod
+    amount: Decimal
+
+
+class PaymentMethodDetailResponse(BaseModel):
+    """Drill-down de UMA fatia do donut "Forma de Pagamento" (rodada de
+    interatividade analítica). `percent` é a MESMA base de
+    `PaymentMethodRow.percent` (percentual sobre o total de pagamentos
+    do período, nunca sobre o Faturamento — granularidades diferentes,
+    ver docstring de `services/dashboard.py`)."""
+
+    bucket: PaymentMethodBucket
+    date_from: datetime
+    date_to: datetime
+    total_amount: Decimal
+    payments_count: int
+    percent: float
+    payments: list[PaymentMethodPaymentRow]
 
 
 class NewVsRecurringPoint(BaseModel):
@@ -263,6 +314,10 @@ class DashboardOverviewResponse(BaseModel):
     revenue_series: list[SeriesPoint]
     top_services: list[TopServiceRow]
     professionals: list[ProfessionalPerformanceRow]
+    # Ranking de Clientes (rodada de interatividade analítica) — MESMO
+    # padrão de `professionals` (lista já ordenada por faturamento
+    # desc.; o frontend decide quantos exibir na home).
+    top_clients: list[ClientPerformanceRow]
     # Mantido no contrato (evita breaking change em consumidores
     # futuros) mesmo sem o card correspondente no frontend a partir da
     # Etapa N4 — ver `services/dashboard.py::_status_distribution`.

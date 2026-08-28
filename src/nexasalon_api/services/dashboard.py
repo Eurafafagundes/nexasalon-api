@@ -182,6 +182,7 @@ from nexasalon_api.repositories import (
     service_repo,
 )
 from nexasalon_api.schemas.dashboard import (
+    ClientPerformanceRow,
     DashboardKpiDetailResponse,
     DashboardKpis,
     DashboardOrderItemRow,
@@ -196,6 +197,8 @@ from nexasalon_api.schemas.dashboard import (
     KpiValue,
     NewVsRecurringPoint,
     PaymentMethodBucket,
+    PaymentMethodDetailResponse,
+    PaymentMethodPaymentRow,
     PaymentMethodRow,
     ProfessionalPerformanceDetailRow,
     ProfessionalPerformanceRow,
@@ -214,6 +217,11 @@ from nexasalon_api.services import payment_fees as payment_fees_service
 _RETENTION_WINDOW_DAYS = 90
 _TOP_SERVICES_LIMIT = 20
 _PROFESSIONALS_LIMIT = 50
+# Rodada de interatividade analítica — Ranking de Clientes. A home só
+# mostra os 5 primeiros, mas a query já limita um pouco acima (mesmo
+# raciocínio de `_PROFESSIONALS_LIMIT`: nunca trazer a organização
+# inteira pra depois cortar em memória).
+_CLIENTS_LIMIT = 20
 
 _PAYMENT_METHOD_BUCKET: dict[PaymentMethod, PaymentMethodBucket] = {
     PaymentMethod.CREDIT: PaymentMethodBucket.CREDIT,
@@ -226,6 +234,14 @@ _PAYMENT_METHOD_BUCKET: dict[PaymentMethod, PaymentMethodBucket] = {
     PaymentMethod.TRANSFER: PaymentMethodBucket.OTHER,
     PaymentMethod.BANK_SLIP: PaymentMethodBucket.OTHER,
 }
+
+# Inverso de `_PAYMENT_METHOD_BUCKET` — quais `PaymentMethod` compõem
+# cada fatia do donut (ex.: "other" agrupa 5 métodos distintos). Usado
+# pelo drill-down de uma fatia (`get_payment_method_detail`) pra nunca
+# duplicar esse mapeamento numa segunda lista que poderia divergir.
+_METHODS_BY_BUCKET: dict[PaymentMethodBucket, list[PaymentMethod]] = defaultdict(list)
+for _method, _bucket in _PAYMENT_METHOD_BUCKET.items():
+    _METHODS_BY_BUCKET[_bucket].append(_method)
 
 _KPI_KEYS = {
     "revenue", "ticket_average", "clients_served", "appointments_count", "no_show_rate", "new_clients",
@@ -899,6 +915,52 @@ def _professionals(session: Session, filters: DashboardFilters) -> list[Professi
     return rows
 
 
+def _top_clients(session: Session, filters: DashboardFilters) -> list[ClientPerformanceRow]:
+    """Ranking de Clientes por faturamento — MESMO padrão de
+    `_professionals` (agregação SQL própria, `OrderItem.price` de
+    comandas fechadas, nunca `OrderProductItem`/produto — consistente
+    com Top Serviços/Profissionais). `orders_count` conta comandas
+    DISTINTAS (não itens) — um cliente com 1 comanda de 3 serviços
+    ainda é "1 atendimento", mesma semântica do KPI "Atendimentos"."""
+    stmt = (
+        select(
+            Order.client_id,
+            func.max(Client.name),
+            func.sum(OrderItem.price),
+            func.count(func.distinct(Order.id)),
+            func.max(Order.closed_at),
+        )
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .join(Client, Client.id == Order.client_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Order.status == OrderStatus.CLOSED,
+            Order.closed_at >= filters.date_from,
+            Order.closed_at < filters.date_to,
+        )
+        .group_by(Order.client_id)
+        .order_by(func.sum(OrderItem.price).desc())
+        .limit(_CLIENTS_LIMIT)
+    )
+    if filters.branch_id is not None:
+        stmt = stmt.where(Order.branch_id == filters.branch_id)
+    rows = []
+    for client_id, name, revenue, orders_count, last_visit in session.execute(stmt).all():
+        revenue = Decimal(revenue)
+        ticket = (revenue / orders_count).quantize(Decimal("0.01")) if orders_count else None
+        rows.append(
+            ClientPerformanceRow(
+                client_id=client_id,
+                client_name=name,
+                orders_count=orders_count,
+                revenue=revenue,
+                ticket_average=ticket,
+                last_visit=last_visit,
+            )
+        )
+    return rows
+
+
 def _status_distribution(data: _PeriodData) -> list[StatusDistributionRow]:
     counts: dict[AppointmentStatus, int] = defaultdict(int)
     for appt in data.appointments:
@@ -1295,6 +1357,7 @@ def get_overview(
         revenue_series=revenue_series,
         top_services=top_services,
         professionals=_professionals(session, filters),
+        top_clients=_top_clients(session, filters),
         status_distribution=_status_distribution(current),
         payment_methods=_payment_methods(session, filters),
         new_vs_recurring=_new_vs_recurring_series(session, filters, buckets, current),
@@ -1598,6 +1661,63 @@ def get_service_detail(
     return DashboardServiceDetailResponse(
         service_id=service_id, service_name=service_name,
         date_from=filters.date_from, date_to=filters.date_to, items=items,
+    )
+
+
+def get_payment_method_detail(
+    session: Session,
+    actor: ActorContext,
+    bucket: PaymentMethodBucket,
+    *,
+    branch_id: uuid.UUID | None,
+    date_from: datetime,
+    date_to: datetime,
+) -> PaymentMethodDetailResponse:
+    """Drill-down de UMA fatia do donut "Forma de Pagamento" (rodada de
+    interatividade analítica) — os `Payment` exatos que compuseram
+    aquele bucket no período, mais recentes primeiro. `percent` reusa
+    `_payment_methods` (MESMA base de cálculo do card, nunca uma
+    segunda fórmula)."""
+    filters = _build_filters(
+        session, actor, branch_id=branch_id, date_from=date_from, date_to=date_to,
+        compare_from=None, compare_to=None,
+    )
+    methods = _METHODS_BY_BUCKET.get(bucket, [])
+
+    stmt = (
+        select(Payment, Order.id, Order.order_number, Order.closed_at, Client.name)
+        .join(Order, Order.id == Payment.order_id)
+        .join(Client, Client.id == Order.client_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Order.status == OrderStatus.CLOSED,
+            Payment.method.in_(methods),
+            Order.closed_at >= filters.date_from,
+            Order.closed_at < filters.date_to,
+        )
+        .order_by(Order.closed_at.desc())
+    )
+    if filters.branch_id is not None:
+        stmt = stmt.where(Order.branch_id == filters.branch_id)
+    rows = session.execute(stmt).all()
+
+    payments = [
+        PaymentMethodPaymentRow(
+            payment_id=payment.id, order_id=order_id, order_number=order_number, closed_at=closed_at,
+            client_name=client_name, method=payment.method, amount=payment.amount,
+        )
+        for payment, order_id, order_number, closed_at, client_name in rows
+    ]
+    total_amount = sum((p.amount for p in payments), Decimal("0"))
+
+    all_bucket_rows = _payment_methods(session, filters)
+    grand_total = sum((Decimal(r.amount) for r in all_bucket_rows), Decimal("0"))
+    percent = float(total_amount / grand_total * 100) if grand_total > 0 else 0.0
+
+    return PaymentMethodDetailResponse(
+        bucket=bucket, date_from=filters.date_from, date_to=filters.date_to,
+        total_amount=total_amount, payments_count=len(payments),
+        percent=round(percent, 2), payments=payments,
     )
 
 

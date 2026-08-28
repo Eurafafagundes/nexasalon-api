@@ -13,6 +13,8 @@ from nexasalon_api.schemas.dashboard import (
     DashboardProfessionalsResponse,
     DashboardServiceDetailResponse,
     DashboardServicesResponse,
+    PaymentMethodBucket,
+    PaymentMethodDetailResponse,
 )
 from nexasalon_api.services import dashboard as dashboard_service
 
@@ -98,6 +100,24 @@ def get_service_detail(
 ) -> DashboardServiceDetailResponse:
     return dashboard_service.get_service_detail(
         session, actor, service_id, branch_id=branch_id, date_from=date_from, date_to=date_to,
+    )
+
+
+@router.get(
+    "/payment-methods/{bucket}",
+    response_model=PaymentMethodDetailResponse,
+    summary="Dashboard — drill-down de uma fatia do donut (Forma de Pagamento)",
+)
+def get_payment_method_detail(
+    bucket: PaymentMethodBucket,
+    date_from: datetime = Query(...),
+    date_to: datetime = Query(...),
+    branch_id: uuid.UUID | None = Query(None),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> PaymentMethodDetailResponse:
+    return dashboard_service.get_payment_method_detail(
+        session, actor, bucket, branch_id=branch_id, date_from=date_from, date_to=date_to,
     )
 
 
