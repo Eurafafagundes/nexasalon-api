@@ -42,6 +42,7 @@ from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.product import Product
 from nexasalon_api.models.professional import Professional
 from nexasalon_api.models.service import Service
+from nexasalon_api.schemas.dashboard import PaymentMethodBucket
 from nexasalon_api.services import dashboard as dashboard_service
 
 _TZ = timezone(timedelta(hours=-3))
@@ -1661,6 +1662,318 @@ def test_faturamento_com_produto_taxa_continua_vindo_so_do_payment(org_session):
     assert summary.known_fee_total == Decimal("11.96")  # taxa calculada sobre o Payment (R$400), não sobre item algum.
     assert summary.known_net_revenue == Decimal("388.04")
     assert summary.has_unconfigured_fee is False
+
+
+# ---------------------------------------------------------------------------
+# Rodada de interatividade analítica — auditoria pré-push. Testes ESCRITOS
+# aqui não podem ser EXECUTADOS neste ambiente Windows (mesma limitação
+# de `pgserver` já documentada no topo do arquivo/README) — servem pra
+# rodar em CI/Linux antes do push, cobrindo exatamente os pontos
+# levantados na segunda revisão: isolamento de `top_clients`/
+# `payment-method detail` (org/unidade/status/período) e RBAC de
+# comissão no drill-down de profissional.
+# ---------------------------------------------------------------------------
+
+
+def test_top_clients_isolamento_entre_organizacoes(org_session):
+    session, org_a = org_session
+    actor_a = _actor(session, org_a)
+    branch_a = _branch(session, org_a)
+    client_a = _client(session, org_a, name="Cliente A")
+    prof_a = _professional(session, org_a, branch_a.id)
+    cr_a = _cash_register(session, org_a, branch_a.id, actor_a.user_id)
+    service_a = _service(session, org_a)
+    _sale(
+        session, org_a, branch_a.id, client_a.id, prof_a.id, service_a.id, cr_a.id,
+        closed_at=_dt(2026, 8, 10), price=Decimal("100"),
+    )
+
+    org_b = uuid.uuid4()
+    session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_b)})
+    session.add(Organization(id=org_b, name="Org B top_clients", slug=f"org-b-tc-{org_b.hex[:8]}"))
+    session.flush()
+    actor_b = _actor(session, org_b)
+    branch_b = _branch(session, org_b)
+    client_b = _client(session, org_b, name="Cliente B")
+    prof_b = _professional(session, org_b, branch_b.id)
+    cr_b = _cash_register(session, org_b, branch_b.id, actor_b.user_id)
+    service_b = _service(session, org_b)
+    _sale(
+        session, org_b, branch_b.id, client_b.id, prof_b.id, service_b.id, cr_b.id,
+        closed_at=_dt(2026, 8, 10), price=Decimal("500"),
+    )
+
+    # volta pro contexto de RLS da org A antes de consultar (mesma
+    # mecânica de `test_isolamento_entre_organizacoes` acima).
+    session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_a)})
+
+    overview = dashboard_service.get_overview(
+        session, actor_a, branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+        compare_from=None, compare_to=None,
+    )
+    client_names = {row.client_name for row in overview.top_clients}
+    assert client_names == {"Cliente A"}
+    assert "Cliente B" not in client_names  # org B nunca vaza pro ranking de clientes da org A.
+
+
+def test_top_clients_isolamento_por_unidade(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch1 = _branch(session, org_id, "Unidade 1")
+    branch2 = _branch(session, org_id, "Unidade 2")
+    client1 = _client(session, org_id, name="Cliente Unidade 1")
+    client2 = _client(session, org_id, name="Cliente Unidade 2")
+    prof1 = _professional(session, org_id, branch1.id)
+    prof2 = _professional(session, org_id, branch2.id)
+    cr1 = _cash_register(session, org_id, branch1.id, actor.user_id)
+    cr2 = _cash_register(session, org_id, branch2.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    _sale(session, org_id, branch1.id, client1.id, prof1.id, service_id, cr1.id, closed_at=_dt(2026, 8, 10), price=Decimal("100"))
+    _sale(session, org_id, branch2.id, client2.id, prof2.id, service_id, cr2.id, closed_at=_dt(2026, 8, 10), price=Decimal("250"))
+
+    overview_branch1 = dashboard_service.get_overview(
+        session, actor, branch_id=branch1.id, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+        compare_from=None, compare_to=None,
+    )
+    names = {row.client_name for row in overview_branch1.top_clients}
+    assert names == {"Cliente Unidade 1"}
+    assert "Cliente Unidade 2" not in names  # unidade 2 não vaza pro ranking filtrado pela unidade 1.
+
+
+def test_top_clients_conta_so_comanda_fechada(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id, name="Cliente Comanda Aberta")
+    prof = _professional(session, org_id, branch.id)
+    service_id = _service(session, org_id).id
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    order = Order(
+        organization_id=org_id, order_number=_next_order_number(), appointment_id=appt.id, branch_id=branch.id,
+        client_id=client.id, status=OrderStatus.OPEN,
+    )
+    session.add(order)
+    session.flush()
+    session.add(
+        OrderItem(
+            organization_id=org_id, order_id=order.id, service_id=service_id, professional_id=prof.id,
+            duration_minutes=60, price=Decimal("100"), service_name="Serviço", professional_name="Profissional",
+        )
+    )
+    session.flush()
+
+    overview = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+        compare_from=None, compare_to=None,
+    )
+    assert overview.top_clients == []  # comanda ABERTA nunca conta no ranking de clientes.
+
+
+def test_top_clients_respeita_periodo(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id, name="Cliente Periodo")
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 7, 31, 23), price=Decimal("10"))  # antes
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 8, 15), price=Decimal("100"))  # dentro
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 9, 1), price=Decimal("10"))  # depois (exclusive)
+
+    overview = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+        compare_from=None, compare_to=None,
+    )
+    assert len(overview.top_clients) == 1
+    assert overview.top_clients[0].revenue == Decimal("100")  # só a venda DENTRO do período.
+
+
+def test_payment_method_detail_isolamento_entre_organizacoes(org_session):
+    session, org_a = org_session
+    actor_a = _actor(session, org_a)
+    branch_a = _branch(session, org_a)
+    client_a = _client(session, org_a)
+    prof_a = _professional(session, org_a, branch_a.id)
+    cr_a = _cash_register(session, org_a, branch_a.id, actor_a.user_id)
+    service_a = _service(session, org_a)
+    _sale(
+        session, org_a, branch_a.id, client_a.id, prof_a.id, service_a.id, cr_a.id,
+        closed_at=_dt(2026, 8, 10), price=Decimal("100"), method=PaymentMethod.PIX,
+    )
+
+    org_b = uuid.uuid4()
+    session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_b)})
+    session.add(Organization(id=org_b, name="Org B pagamento", slug=f"org-b-pay-{org_b.hex[:8]}"))
+    session.flush()
+    actor_b = _actor(session, org_b)
+    branch_b = _branch(session, org_b)
+    client_b = _client(session, org_b)
+    prof_b = _professional(session, org_b, branch_b.id)
+    cr_b = _cash_register(session, org_b, branch_b.id, actor_b.user_id)
+    service_b = _service(session, org_b)
+    _sale(
+        session, org_b, branch_b.id, client_b.id, prof_b.id, service_b.id, cr_b.id,
+        closed_at=_dt(2026, 8, 10), price=Decimal("900"), method=PaymentMethod.PIX,
+    )
+
+    session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_a)})
+
+    detail = dashboard_service.get_payment_method_detail(
+        session, actor_a, PaymentMethodBucket.PIX, branch_id=None,
+        date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+    )
+    assert detail.total_amount == Decimal("100")  # nunca 1000 (100+900) — org B não vaza pro drawer.
+    assert detail.payments_count == 1
+
+
+def test_payment_method_detail_isolamento_por_unidade(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch1 = _branch(session, org_id, "Unidade 1")
+    branch2 = _branch(session, org_id, "Unidade 2")
+    client = _client(session, org_id)
+    prof1 = _professional(session, org_id, branch1.id)
+    prof2 = _professional(session, org_id, branch2.id)
+    cr1 = _cash_register(session, org_id, branch1.id, actor.user_id)
+    cr2 = _cash_register(session, org_id, branch2.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    _sale(session, org_id, branch1.id, client.id, prof1.id, service_id, cr1.id, closed_at=_dt(2026, 8, 10), price=Decimal("100"), method=PaymentMethod.PIX)
+    _sale(session, org_id, branch2.id, client.id, prof2.id, service_id, cr2.id, closed_at=_dt(2026, 8, 10), price=Decimal("250"), method=PaymentMethod.PIX)
+
+    detail_branch1 = dashboard_service.get_payment_method_detail(
+        session, actor, PaymentMethodBucket.PIX, branch_id=branch1.id,
+        date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+    )
+    assert detail_branch1.total_amount == Decimal("100")
+    assert detail_branch1.payments_count == 1
+
+
+def test_payment_method_detail_respeita_periodo(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 7, 31, 23), price=Decimal("10"), method=PaymentMethod.PIX)
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 8, 15), price=Decimal("100"), method=PaymentMethod.PIX)
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 9, 1), price=Decimal("10"), method=PaymentMethod.PIX)
+
+    detail = dashboard_service.get_payment_method_detail(
+        session, actor, PaymentMethodBucket.PIX, branch_id=None,
+        date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+    )
+    assert detail.total_amount == Decimal("100")
+    assert detail.payments_count == 1
+
+
+def test_payment_method_detail_soma_bate_com_o_bucket_do_overview(org_session):
+    """soma(transações do drawer) == valor do segmento do donut — mesma
+    base de dados/condições WHERE, prova estrutural pedida na 2ª
+    revisão (não é coincidência, é o mesmo filtro em ambos os lados)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 8, 5), price=Decimal("100"), method=PaymentMethod.PIX)
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 8, 6), price=Decimal("50"), method=PaymentMethod.PIX)
+    _sale(session, org_id, branch.id, client.id, prof.id, service_id, cr.id, closed_at=_dt(2026, 8, 7), price=Decimal("200"), method=PaymentMethod.CREDIT)
+
+    overview = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+        compare_from=None, compare_to=None,
+    )
+    detail = dashboard_service.get_payment_method_detail(
+        session, actor, PaymentMethodBucket.PIX, branch_id=None,
+        date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+    )
+    pix_row = next(r for r in overview.payment_methods if r.bucket == PaymentMethodBucket.PIX)
+    transactions_sum = sum((p.amount for p in detail.payments), Decimal("0"))
+    assert transactions_sum == pix_row.amount == Decimal("150")
+
+
+def test_professional_detail_view_all_ve_comissao_de_qualquer_profissional(org_session):
+    from dataclasses import replace
+
+    session, org_id = org_session
+    branch = _branch(session, org_id)
+    prof1 = _professional(session, org_id, branch.id, name="Ianka")
+    prof2 = _professional(session, org_id, branch.id, name="Duda")
+    base_actor = _actor(session, org_id)
+    admin = replace(base_actor, permissions=frozenset({"dashboard.view", "commissions.view_all"}))
+    cr = _cash_register(session, org_id, branch.id, admin.user_id)
+    client = _client(session, org_id)
+    service_id = _service(session, org_id).id
+    _sale(
+        session, org_id, branch.id, client.id, prof1.id, service_id, cr.id,
+        closed_at=_dt(2026, 8, 10), price=Decimal("100"), professional_name="Ianka",
+    )
+
+    detail = dashboard_service.get_professional_detail(
+        session, admin, prof1.id, branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+    )
+    assert detail.commission_available is True
+
+    detail_outro = dashboard_service.get_professional_detail(
+        session, admin, prof2.id, branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+    )
+    assert detail_outro.commission_available is True  # view_all vê qualquer profissional da org.
+
+
+def test_professional_detail_view_own_ve_a_propria_comissao(org_session):
+    from dataclasses import replace
+
+    session, org_id = org_session
+    branch = _branch(session, org_id)
+    prof = _professional(session, org_id, branch.id, name="Ianka")
+    base_actor = _actor(session, org_id)
+    actor = replace(
+        base_actor, permissions=frozenset({"dashboard.view", "commissions.view_own"}), professional_id=prof.id,
+    )
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    client = _client(session, org_id)
+    service_id = _service(session, org_id).id
+    _sale(
+        session, org_id, branch.id, client.id, prof.id, service_id, cr.id,
+        closed_at=_dt(2026, 8, 10), price=Decimal("100"), professional_name="Ianka",
+    )
+
+    detail = dashboard_service.get_professional_detail(
+        session, actor, prof.id, branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+    )
+    assert detail.commission_available is True  # professional_id do drill-down == professional_id do próprio ator.
+
+
+def test_professional_detail_view_own_nunca_ve_comissao_de_outro_profissional(org_session):
+    from dataclasses import replace
+
+    session, org_id = org_session
+    branch = _branch(session, org_id)
+    prof_mine = _professional(session, org_id, branch.id, name="Ianka")
+    prof_other = _professional(session, org_id, branch.id, name="Duda")
+    base_actor = _actor(session, org_id)
+    actor = replace(
+        base_actor, permissions=frozenset({"dashboard.view", "commissions.view_own"}), professional_id=prof_mine.id,
+    )
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    client = _client(session, org_id)
+    service_id = _service(session, org_id).id
+    _sale(
+        session, org_id, branch.id, client.id, prof_other.id, service_id, cr.id,
+        closed_at=_dt(2026, 8, 10), price=Decimal("100"), professional_name="Duda",
+    )
+
+    detail = dashboard_service.get_professional_detail(
+        session, actor, prof_other.id, branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+    )
+    assert detail.commission_available is False
+    assert detail.commission_calculated is None  # nunca R$0 fingido — "sem acesso" de verdade, campo fica None.
 
 
 # ---------------------------------------------------------------------------

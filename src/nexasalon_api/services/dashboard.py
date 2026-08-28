@@ -1849,7 +1849,15 @@ def get_professional_detail(
             revenue_by_bucket[idx] += item.price
     revenue_series = _align_series(buckets, revenue_by_bucket, None, None)
 
-    commission_available = _has_commissions_scope(actor)
+    # Correção de auditoria: `_has_commissions_scope` (só view_all/manage)
+    # negava a comissão até pra um profissional com `commissions.view_own`
+    # vendo A PRÓPRIA produção — regra mais restritiva que o módulo de
+    # Comissões, que já reconhece view_own. Aqui reaproveitamos a MESMA
+    # identidade de autorização de `services/commissions.py::
+    # can_view_professional_commissions` (view_all/manage veem qualquer
+    # profissional da org; view_own só autoriza o PRÓPRIO
+    # `actor.professional_id`, nunca outro) — nunca uma segunda regra.
+    commission_available = commissions_service.can_view_professional_commissions(actor, professional_id)
     commission_calculated = None
     if commission_available:
         commission_overview = commissions_service.get_overview(
