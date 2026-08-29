@@ -4,14 +4,16 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import (
     CardBrand,
+    OrderProductItemKind,
     OrderStatus,
     PaymentFeeStatus,
     PaymentMethod,
+    ProductUnit,
 )
 from nexasalon_api.models.order import Order
 from nexasalon_api.models.organization import Organization
@@ -22,6 +24,25 @@ _CARD_METHODS = frozenset({PaymentMethod.DEBIT, PaymentMethod.CREDIT})
 
 class OrderCreate(BaseModel):
     appointment_id: uuid.UUID
+
+
+class OrderObservationUpdate(BaseModel):
+    """`PATCH /orders/{id}/observation` — único endpoint deste módulo que
+    NÃO exige `status == OPEN` (ver docstring de
+    `services/orders.py::update_observation`): a observação é conteúdo
+    operacional, não financeiro, e continua editável com a comanda
+    fechada.
+
+    `expected_observation_updated_at` é OPCIONAL — quando enviado (o
+    frontend sempre manda o timestamp que tinha carregado), protege
+    contra sobrescrita silenciosa: se não bater com o valor atual em
+    banco, o service recusa com 409 em vez de sobrescrever uma edição
+    concorrente de outro usuário. Sem coluna de versão nova — este é o
+    único mecanismo de concorrência para este campo (ver docstring da
+    migration 0039)."""
+
+    observation: str = Field(max_length=4000)
+    expected_observation_updated_at: datetime | None = None
 
 
 class OrderCancel(BaseModel):
@@ -101,15 +122,58 @@ class PaymentCreate(BaseModel):
 
 
 class OrderProductItemCreate(BaseModel):
-    """`unit_price` NUNCA vem do payload — é sempre resolvido a partir
-    de `Product.sale_price` no momento da criação (ver
-    `services/orders.py::add_product_item`), exatamente como
+    """`unit_price` NUNCA vem do payload pra `item_type=SALE` — é sempre
+    resolvido a partir de `Product.sale_price` no momento da criação
+    (ver `services/orders.py::add_product_item`), exatamente como
     `OrderItem.price` nasce igual ao `AppointmentItem.price`. Editar o
     valor depois é uma ação separada e auditada
-    (`OrderProductItemUpdate`)."""
+    (`OrderProductItemUpdate`).
+
+    `item_type=CONSUMPTION` (migration 0039, "Comanda → Consumo de
+    estoque") aceita `unit_price` opcional no payload — consumo sem
+    cobrança separada (o caso comum, ex.: cabelo usado no serviço) fica
+    `0`; um valor explícito é aceito quando o consumo É cobrado à parte
+    da cliente. Nunca aceito para `item_type=SALE` (preço de venda
+    continua vindo só do catálogo)."""
 
     product_id: uuid.UUID
     quantity: Decimal = Field(gt=0, max_digits=12, decimal_places=3)
+    # Mesmo raciocínio de `StockMovementCreate.input_unit` — unidade em
+    # que `quantity` foi DIGITADA (seletor g/kg da seção "Produtos /
+    # Consumo de Estoque" da comanda); `None` preserva compatibilidade
+    # total, conversão sempre no backend (`services/orders.py::
+    # add_product_item`).
+    input_unit: ProductUnit | None = None
+    item_type: OrderProductItemKind = OrderProductItemKind.SALE
+    unit_price: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+
+    @model_validator(mode="after")
+    def _check_unit_price_only_for_consumption(self) -> "OrderProductItemCreate":
+        if self.item_type == OrderProductItemKind.SALE and self.unit_price is not None:
+            raise ValueError("unit_price só é aceito para item_type=consumption — venda usa o preço do catálogo.")
+        return self
+
+
+class OrderConsumptionCorrection(BaseModel):
+    """`POST /orders/{id}/product-items/{item_id}/correct-consumption` —
+    corrige um consumo (`item_type=CONSUMPTION`) já registrado numa
+    comanda FECHADA, SEM editar/deletar o `OrderProductItem` congelado
+    nem o `StockMovement` original (ledger append-only — ver docstring
+    de `services/stock.py::record_consumption_correction`).
+
+    `quantity_delta` positivo = consumo real foi MAIOR que o registrado
+    (gera uma saída adicional); negativo = foi MENOR (devolve ao
+    estoque). Nunca zero — não existe "correção" que não corrige nada."""
+
+    quantity_delta: Decimal = Field(max_digits=12, decimal_places=3)
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("quantity_delta")
+    @classmethod
+    def _check_not_zero(cls, value: Decimal) -> Decimal:
+        if value == 0:
+            raise ValueError("quantity_delta não pode ser zero.")
+        return value
 
 
 class OrderProductItemUpdate(BaseModel):
@@ -135,6 +199,7 @@ class OrderProductItemRead(BaseModel):
     product_name: str
     quantity: Decimal
     unit_price: Decimal
+    item_type: OrderProductItemKind
     # Preenchido só depois do fechamento — ver docstring de
     # `models/order.py::OrderProductItem`. Nunca inclui custo (o custo
     # do produto mora só em `Product.cost_price`/`StockMovement.unit_cost`,
@@ -239,6 +304,10 @@ class OrderRead(BaseModel):
     items: list[OrderItemRead]
     product_items: list[OrderProductItemRead]
     payments: list[PaymentRead]
+    observation: str | None
+    observation_updated_at: datetime | None
+    observation_updated_by: uuid.UUID | None
+    observation_updated_by_name: str | None
     created_at: datetime
     updated_at: datetime
     closed_at: datetime | None
@@ -261,6 +330,10 @@ class OrderRead(BaseModel):
             items=[OrderItemRead.model_validate(item) for item in order.items],
             product_items=[OrderProductItemRead.model_validate(item) for item in order.product_items],
             payments=[PaymentRead.model_validate(payment) for payment in order.payments],
+            observation=order.observation,
+            observation_updated_at=order.observation_updated_at,
+            observation_updated_by=order.observation_updated_by,
+            observation_updated_by_name=order.observation_updated_by_name,
             created_at=order.created_at,
             updated_at=order.updated_at,
             closed_at=order.closed_at,
@@ -298,6 +371,9 @@ class ClientOrderSummary(BaseModel):
     product_names: list[str]
     total: Decimal | None
     payments: list[ClientOrderPaymentSummary]
+    observation: str | None
+    observation_updated_at: datetime | None
+    observation_updated_by_name: str | None
     created_at: datetime
     closed_at: datetime | None
 
@@ -327,6 +403,9 @@ class ClientOrderSummary(BaseModel):
             product_names=product_names,
             total=total,
             payments=payments,
+            observation=order.observation,
+            observation_updated_at=order.observation_updated_at,
+            observation_updated_by_name=order.observation_updated_by_name,
             created_at=order.created_at,
             closed_at=order.closed_at,
         )
@@ -440,6 +519,12 @@ class OrderReceiptRead(BaseModel):
             )
             for item in order.items
         ]
+        # Consumo interno sem cobrança (`item_type=CONSUMPTION`,
+        # `unit_price=0`) nunca aparece no comprovante — não é algo que a
+        # cliente comprou, é detalhe operacional do serviço (mesmo
+        # raciocínio de nunca incluir observação interna aqui). Consumo
+        # COBRADO (`unit_price > 0`) aparece normalmente, como qualquer
+        # produto vendido.
         product_items = [
             ReceiptItem(
                 kind="product",
@@ -450,6 +535,7 @@ class OrderReceiptRead(BaseModel):
                 total=item.quantity * item.unit_price,
             )
             for item in order.product_items
+            if item.item_type == OrderProductItemKind.SALE or item.unit_price > 0
         ]
         items = service_items + product_items
         subtotal = sum((i.total for i in items), Decimal("0"))

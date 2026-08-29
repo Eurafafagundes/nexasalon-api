@@ -44,6 +44,7 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.actor import ActorContext
@@ -52,7 +53,7 @@ from nexasalon_api.core.exceptions import (
     NotFoundError,
     ValidationDomainError,
 )
-from nexasalon_api.models.enums import AuditAction, OrderStatus
+from nexasalon_api.models.enums import AuditAction, OrderProductItemKind, OrderStatus, StockMovementDirection
 from nexasalon_api.models.order import Order
 from nexasalon_api.repositories import (
     appointment_repo,
@@ -72,7 +73,9 @@ from nexasalon_api.schemas.order import (
     ConsolidatedOrderClose,
     OrderCancel,
     OrderClose,
+    OrderConsumptionCorrection,
     OrderItemUpdate,
+    OrderObservationUpdate,
     OrderProductItemCreate,
     OrderProductItemUpdate,
     OrderReceiptRead,
@@ -122,37 +125,54 @@ def create_order(session: Session, actor: ActorContext, appointment_id: uuid.UUI
     # ambos aplicados no backend, nunca só desabilitando botão.
     cash_register_service.assert_operational_prerequisites(session, actor, appointment.branch_id, purpose="order")
 
-    order = order_repo.create(
-        session,
-        organization_id,
-        appointment_id=appointment.id,
-        branch_id=appointment.branch_id,
-        client_id=appointment.client_id,
-        created_by=actor.user_id,
-    )
-    for item in appointment.items:
-        # Copia o snapshot do AppointmentItem 1:1 na abertura — a partir
-        # daqui os dois vivem independentes (editar o preço da comanda
-        # não altera o item original do agendamento, nem vice-versa).
-        # `service_name`/`professional_name` são capturados AGORA
-        # (item "snapshot histórico") — nem `AppointmentItem` nem
-        # `Service`/`Professional` guardam esse nome já congelado, e
-        # ler o catálogo atual depois mudaria como uma venda antiga
-        # aparece se o serviço for renomeado ou o profissional sair.
-        service = service_repo.get(session, organization_id, item.service_id)
-        professional = professional_repo.get(session, organization_id, item.professional_id)
-        order_item_repo.create(
-            session,
-            organization_id,
-            order_id=order.id,
-            appointment_item_id=item.id,
-            service_id=item.service_id,
-            professional_id=item.professional_id,
-            duration_minutes=item.duration_minutes,
-            price=item.price,
-            service_name=service.name if service is not None else "Serviço removido",
-            professional_name=professional.name if professional is not None else "Profissional removido",
-        )
+    # Corrida (item "Abrir Comanda — eliminar duplicidade"): dois cliques
+    # rápidos podem passar os dois pelo check `get_by_appointment` acima
+    # antes de qualquer um commitar. `begin_nested()` abre um SAVEPOINT —
+    # se o INSERT abaixo violar a unique parcial `uq_orders_appointment_
+    # id_active` (o "perdedor" da corrida), só este savepoint reverte
+    # (nunca a transação inteira/os GUCs de RLS já setados por
+    # `api/deps.py::get_db`); devolvemos a comanda que "venceu" em vez de
+    # propagar erro — POST /orders fica genuinamente idempotente sob
+    # concorrência real, não só no caminho feliz check-then-create.
+    try:
+        with session.begin_nested():
+            order = order_repo.create(
+                session,
+                organization_id,
+                appointment_id=appointment.id,
+                branch_id=appointment.branch_id,
+                client_id=appointment.client_id,
+                created_by=actor.user_id,
+            )
+            for item in appointment.items:
+                # Copia o snapshot do AppointmentItem 1:1 na abertura — a
+                # partir daqui os dois vivem independentes (editar o preço
+                # da comanda não altera o item original do agendamento,
+                # nem vice-versa). `service_name`/`professional_name` são
+                # capturados AGORA (item "snapshot histórico") — nem
+                # `AppointmentItem` nem `Service`/`Professional` guardam
+                # esse nome já congelado, e ler o catálogo atual depois
+                # mudaria como uma venda antiga aparece se o serviço for
+                # renomeado ou o profissional sair.
+                service = service_repo.get(session, organization_id, item.service_id)
+                professional = professional_repo.get(session, organization_id, item.professional_id)
+                order_item_repo.create(
+                    session,
+                    organization_id,
+                    order_id=order.id,
+                    appointment_item_id=item.id,
+                    service_id=item.service_id,
+                    professional_id=item.professional_id,
+                    duration_minutes=item.duration_minutes,
+                    price=item.price,
+                    service_name=service.name if service is not None else "Serviço removido",
+                    professional_name=professional.name if professional is not None else "Profissional removido",
+                )
+    except IntegrityError:
+        existing = order_repo.get_by_appointment(session, organization_id, appointment_id)
+        if existing is None:
+            raise
+        return existing
     session.flush()
 
     audit_log_repo.create(
@@ -304,6 +324,69 @@ def update_order_item(
 update_item_price = update_order_item
 
 
+def update_observation(
+    session: Session, actor: ActorContext, order_id: uuid.UUID, data: OrderObservationUpdate
+) -> Order:
+    """Edita a observação da comanda — item "Comanda — Observação +
+    Auditoria". DELIBERADAMENTE não guarda `order.status != OPEN` (única
+    exceção a essa regra neste módulo): a observação é conteúdo
+    operacional, não financeiro, e continua editável com a comanda
+    FECHADA sem reabrir nem tocar em nenhum estado de pagamento/estoque.
+
+    Auditoria DEDICADA (nunca `order.updated_at`, que também muda por
+    pagamento/produto/status): `observation_updated_at`/`_by`/`_by_name`
+    guardam só a ÚLTIMA edição (sem histórico de versões — item
+    explícito "não precisamos de histórico de todas as versões nesta
+    rodada"). Também emite um `AuditLog` (mesmo idioma do resto deste
+    módulo), que preserva o histórico completo de edições pra quem
+    precisar investigar depois, mesmo sem expor isso na UI desta rodada.
+
+    Concorrência: `expected_observation_updated_at` opcional — quando
+    informado e diferente do valor atual em banco, recusa com
+    `ConflictError` (409) em vez de sobrescrever silenciosamente uma
+    edição concorrente de outro usuário."""
+    organization_id = actor.organization_id
+    order = _get_order_for_update_or_404(session, organization_id, order_id)
+
+    if (
+        data.expected_observation_updated_at is not None
+        and order.observation_updated_at is not None
+        and data.expected_observation_updated_at != order.observation_updated_at
+    ):
+        raise ConflictError("Observação foi alterada por outro usuário. Recarregue e tente novamente.")
+
+    old_observation = order.observation
+    # String vazia (ou só espaços) vira `None` — "Nenhuma observação
+    # registrada" precisa de um estado limpo, não uma string vazia
+    # persistida (mesmo raciocínio de nunca inventar dado — aqui o
+    # inverso: nunca fingir que existe observação quando o usuário só
+    # apagou o texto).
+    new_observation = data.observation.strip() or None
+    if new_observation == old_observation:
+        return _reload(session, organization_id, order_id)
+
+    actor_user = user_repo.get(session, actor.user_id)
+    now = datetime.now(timezone.utc)
+
+    order.observation = new_observation
+    order.observation_updated_at = now
+    order.observation_updated_by = actor.user_id
+    order.observation_updated_by_name = actor_user.name if actor_user is not None else None
+    session.flush()
+
+    audit_log_repo.create(
+        session,
+        organization_id=organization_id,
+        user_id=actor.user_id,
+        entity_type="order",
+        entity_id=order.id,
+        action=AuditAction.UPDATE,
+        old_values={"observation": old_observation},
+        new_values={"observation": new_observation, "change_type": "observation_edit"},
+    )
+    return _reload(session, organization_id, order_id)
+
+
 def cancel_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data: OrderCancel) -> Order:
     """Cancela uma comanda `OPEN` criada por engano (Etapa F, item
     "Cancelar/Excluir Comanda") — NUNCA apaga a linha; ela sai das
@@ -353,12 +436,25 @@ def cancel_order(session: Session, actor: ActorContext, order_id: uuid.UUID, dat
 def add_product_item(
     session: Session, actor: ActorContext, order_id: uuid.UUID, data: OrderProductItemCreate
 ) -> Order:
-    """Adiciona um produto à comanda ABERTA. `unit_price` nasce sempre
-    do catálogo (`Product.sale_price`), nunca do payload — mesma
-    filosofia de `OrderItem.price` nascer de `AppointmentItem.price`.
-    A baixa de estoque NÃO acontece aqui — só no fechamento (ver
-    `close_order`); adicionar/remover um produto numa comanda aberta
-    nunca move uma unidade sequer de `StockLevel`.
+    """Adiciona um produto à comanda ABERTA — dois sentidos possíveis
+    (`data.item_type`, migration 0039, item "Comanda → Consumo de
+    estoque"):
+
+      - `SALE` (default, comportamento original, inalterado): `unit_price`
+        nasce sempre do catálogo (`Product.sale_price`), nunca do
+        payload — mesma filosofia de `OrderItem.price` nascer de
+        `AppointmentItem.price`. Exige `product.for_sale=True`.
+      - `CONSUMPTION`: produto consumido internamente durante o serviço
+        (ex.: cabelo usado numa progressiva) — NÃO exige
+        `product.for_sale` (um produto de uso interno é, por definição,
+        o caso comum aqui, mas nada impede consumir internamente um
+        produto que também é vendido). `unit_price` vem do payload,
+        `0` por padrão (consumo sem cobrança separada) ou um valor
+        explícito quando a cliente paga pelo consumo à parte.
+
+    A baixa de estoque NÃO acontece aqui pra nenhum dos dois — só no
+    fechamento (ver `close_order`); adicionar/remover um produto numa
+    comanda aberta nunca move uma unidade sequer de `StockLevel`.
 
     Item "produto precisa pertencer/estar disponível na unidade da
     comanda": `Product` é catálogo de ORGANIZAÇÃO (não tem `branch_id`
@@ -382,11 +478,20 @@ def add_product_item(
     if product is None:
         raise NotFoundError("Produto não encontrado.")
     if not product.is_active:
-        raise ValidationDomainError("Produto inativo não pode ser vendido.")
-    if not product.for_sale:
-        raise ValidationDomainError("Este produto é de uso interno e não pode ser vendido em comanda.")
-    if product.sale_price is None:
-        raise ValidationDomainError("Produto sem preço de venda definido — defina um preço antes de vender.")
+        raise ValidationDomainError("Produto inativo não pode ser adicionado à comanda.")
+
+    if data.item_type == OrderProductItemKind.CONSUMPTION:
+        unit_price = data.unit_price if data.unit_price is not None else Decimal("0")
+    else:
+        if not product.for_sale:
+            raise ValidationDomainError("Este produto é de uso interno e não pode ser vendido em comanda.")
+        if product.sale_price is None:
+            raise ValidationDomainError("Produto sem preço de venda definido — defina um preço antes de vender.")
+        unit_price = product.sale_price
+
+    quantity = stock_service.resolve_quantity_in_product_unit(
+        session, organization_id, product.id, data.quantity, data.input_unit
+    )
 
     item = order_product_item_repo.create(
         session,
@@ -394,8 +499,9 @@ def add_product_item(
         order_id=order.id,
         product_id=product.id,
         product_name=product.name,
-        quantity=data.quantity,
-        unit_price=product.sale_price,
+        quantity=quantity,
+        unit_price=unit_price,
+        item_type=data.item_type,
     )
     session.flush()
 
@@ -408,7 +514,7 @@ def add_product_item(
         action=AuditAction.CREATE,
         new_values={
             "order_id": str(order_id), "product_id": str(product.id),
-            "quantity": str(data.quantity), "unit_price": str(product.sale_price),
+            "quantity": str(quantity), "unit_price": str(unit_price), "item_type": data.item_type.value,
         },
     )
     return _reload(session, organization_id, order_id)
@@ -550,8 +656,17 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
             # pra qualquer retry), mas se acontecer, nunca baixa de novo.
             continue
         product = product_repo.get(session, organization_id, product_item.product_id)
+        # `item_type` decide só o MOTIVO da baixa (venda vs consumo
+        # interno) — a baixa em si, o lock, a checagem de saldo e a
+        # idempotência (`stock_movement_id`) são idênticos pros dois
+        # (ver docstring de `models/order.py::OrderProductItem`).
+        record_movement = (
+            stock_service.record_sale_movement
+            if product_item.item_type == OrderProductItemKind.SALE
+            else stock_service.record_internal_use_movement
+        )
         try:
-            movement = stock_service.record_sale_movement(
+            movement = record_movement(
                 session,
                 actor,
                 product_id=product_item.product_id,
@@ -725,8 +840,13 @@ def close_orders_consolidated(
             if product_item.stock_movement_id is not None:
                 continue
             product = product_repo.get(session, organization_id, product_item.product_id)
+            record_movement = (
+                stock_service.record_sale_movement
+                if product_item.item_type == OrderProductItemKind.SALE
+                else stock_service.record_internal_use_movement
+            )
             try:
-                movement = stock_service.record_sale_movement(
+                movement = record_movement(
                     session, actor, product_id=product_item.product_id, branch_id=order.branch_id,
                     quantity=product_item.quantity, order_id=order.id,
                     unit_cost=product.cost_price if product is not None else None,
@@ -837,3 +957,60 @@ def close_orders_consolidated(
         )
 
     return [_reload(session, organization_id, o.id) for o in orders_by_number]
+
+
+def correct_consumption(
+    session: Session,
+    actor: ActorContext,
+    order_id: uuid.UUID,
+    item_id: uuid.UUID,
+    data: OrderConsumptionCorrection,
+) -> Order:
+    """Corrige um consumo (`item_type=CONSUMPTION`) já registrado numa
+    comanda FECHADA — item "Não duplicar baixa" / "correção
+    pós-fechamento". NUNCA edita `item.quantity` nem o `StockMovement`
+    original (os dois continuam congelados exatamente como ficaram no
+    fechamento — ver docstring de `models/order.py::OrderProductItem`):
+    gera um movimento COMPENSATÓRIO novo (`reason=ADJUSTMENT`,
+    `order_id` vinculado), preservando o ledger append-only."""
+    organization_id = actor.organization_id
+    order = _get_order_or_404(session, organization_id, order_id)
+    if order.status != OrderStatus.CLOSED:
+        raise ValidationDomainError("Correção de consumo só se aplica a uma comanda já fechada.")
+    item = next((i for i in order.product_items if i.id == item_id), None)
+    if item is None:
+        raise NotFoundError("Produto da comanda não encontrado.")
+    if item.item_type != OrderProductItemKind.CONSUMPTION:
+        raise ValidationDomainError("Só é possível corrigir consumo de itens do tipo 'consumo interno'.")
+    if item.stock_movement_id is None:
+        raise ValidationDomainError("Este item ainda não gerou baixa de estoque — nada para corrigir.")
+
+    direction = StockMovementDirection.OUT if data.quantity_delta > 0 else StockMovementDirection.IN
+    quantity = abs(data.quantity_delta)
+    observation = (
+        f"Correção de consumo — Comanda #{order.order_number}, produto '{item.product_name}': {data.reason}"
+    )
+    try:
+        movement = stock_service.record_consumption_correction(
+            session, actor, product_id=item.product_id, branch_id=order.branch_id, order_id=order.id,
+            quantity=quantity, direction=direction, observation=observation,
+        )
+    except ValidationDomainError as exc:
+        raise ValidationDomainError(f"Não foi possível corrigir o consumo: {exc.message}") from exc
+
+    audit_log_repo.create(
+        session,
+        organization_id=organization_id,
+        user_id=actor.user_id,
+        entity_type="order_product_item",
+        entity_id=item.id,
+        action=AuditAction.UPDATE,
+        old_values={"quantity": str(item.quantity)},
+        new_values={
+            "change_type": "consumption_correction",
+            "quantity_delta": str(data.quantity_delta),
+            "reason": data.reason,
+            "compensating_stock_movement_id": str(movement.id),
+        },
+    )
+    return _reload(session, organization_id, order_id)

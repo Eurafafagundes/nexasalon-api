@@ -11,8 +11,10 @@ from nexasalon_api.schemas.order import (
     ConsolidatedOrderClose,
     OrderCancel,
     OrderClose,
+    OrderConsumptionCorrection,
     OrderCreate,
     OrderItemUpdate,
+    OrderObservationUpdate,
     OrderProductItemCreate,
     OrderProductItemUpdate,
     OrderRead,
@@ -142,6 +144,21 @@ def update_order_item(
     return OrderRead.from_order(order)
 
 
+@router.patch(
+    "/{order_id}/observation",
+    response_model=OrderRead,
+    summary="Editar a observação da comanda (funciona com a comanda aberta OU fechada)",
+)
+def update_order_observation(
+    order_id: uuid.UUID,
+    payload: OrderObservationUpdate,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_manage),
+) -> OrderRead:
+    order = orders_service.update_observation(session, actor, order_id, payload)
+    return OrderRead.from_order(order)
+
+
 @router.post(
     "/{order_id}/products",
     response_model=OrderRead,
@@ -186,6 +203,22 @@ def remove_product_item(
     actor: ActorContext = Depends(_manage),
 ) -> OrderRead:
     order = orders_service.remove_product_item(session, actor, order_id, item_id)
+    return OrderRead.from_order(order)
+
+
+@router.post(
+    "/{order_id}/products/{item_id}/correct-consumption",
+    response_model=OrderRead,
+    summary="Corrigir um consumo interno já registrado numa comanda fechada (movimento compensatório)",
+)
+def correct_consumption(
+    order_id: uuid.UUID,
+    item_id: uuid.UUID,
+    payload: OrderConsumptionCorrection,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_manage),
+) -> OrderRead:
+    order = orders_service.correct_consumption(session, actor, order_id, item_id, payload)
     return OrderRead.from_order(order)
 
 
