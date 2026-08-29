@@ -89,6 +89,21 @@ class AppointmentStatus(str, Enum):
     NO_SHOW = "no_show"
 
 
+class OrderProductItemKind(str, Enum):
+    """Distingue produto VENDIDO à cliente (`SALE`, comportamento
+    original, entra no valor da comanda como venda) de produto
+    CONSUMIDO internamente durante o serviço (`CONSUMPTION` — ex.:
+    cabelo usado numa progressiva; `unit_price` pode ser `0` quando não
+    há cobrança separada, ou um valor explícito quando há — ver
+    docstring de `models/order.py::OrderProductItem`). Nunca muda a
+    baixa de estoque em si (sempre passa por `stock_movements`, ledger
+    append-only) — só o `StockMovementReason` usado no fechamento
+    (`SALE` vs `INTERNAL_USE`, ver `services/orders.py::close_order`)."""
+
+    SALE = "sale"
+    CONSUMPTION = "consumption"
+
+
 class OrderStatus(str, Enum):
     """Status da Comanda (`Order`). Fluxo Atendimento -> Comanda ->
     Pagamento -> Pago (Etapa "primeira versão funcional da Comanda"):

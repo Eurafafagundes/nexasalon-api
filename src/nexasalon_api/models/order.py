@@ -43,6 +43,7 @@ from sqlalchemy import (
     Numeric,
     SmallInteger,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
@@ -53,6 +54,7 @@ from .enums import (
     CardBrand,
     CommissionStatus,
     CommissionType,
+    OrderProductItemKind,
     OrderStatus,
     PaymentFeeStatus,
     PaymentMethod,
@@ -118,6 +120,22 @@ class Order(Base, UUIDPKMixin, TimestampMixin):
     closed_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
+    # Observação operacional da comanda (item "Comanda — Observação +
+    # Auditoria") — NUNCA reaproveita `updated_at` (mexe com pagamento/
+    # produto/status, não serve pra "quando a observação foi editada por
+    # último"). Auditoria DEDICADA, mesmo padrão de snapshot de
+    # `OrderProductItem.product_name`: `observation_updated_by_name` é
+    # capturado no momento da edição, não um join a `users` (usuário
+    # removido depois continua aparecendo com o nome que tinha). Editável
+    # com a comanda OPEN ou CLOSED (única exceção à regra "só edita
+    # aberta" deste módulo — ver `services/orders.py::update_observation`),
+    # nunca reabre nem afeta o estado financeiro.
+    observation: Mapped[str | None] = mapped_column(Text)
+    observation_updated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    observation_updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    observation_updated_by_name: Mapped[str | None] = mapped_column(String(160))
 
     items: Mapped[list["OrderItem"]] = relationship(
         back_populates="order", cascade="all, delete-orphan", order_by="OrderItem.created_at"
@@ -216,7 +234,21 @@ class OrderProductItem(Base, UUIDPKMixin, TimestampMixin):
     pro raciocínio de por que isto é uma tabela separada de `OrderItem`.
     `quantity`/`unit_price` são editáveis (auditado, ver
     `services/orders.py::update_product_item`) enquanto a comanda
-    estiver `OPEN`; congelados dali em diante."""
+    estiver `OPEN`; congelados dali em diante.
+
+    `item_type` (migration 0039, item "Comanda → Consumo de estoque")
+    distingue produto VENDIDO à cliente (`SALE`, default — comportamento
+    original desta tabela, inalterado) de produto CONSUMIDO
+    internamente durante o serviço (`CONSUMPTION` — ex.: cabelo usado
+    numa progressiva). `unit_price` continua NOT NULL nos dois casos:
+    consumo sem cobrança separada usa `0`, consumo cobrado usa um valor
+    explícito — o total da comanda (`services/order_totals.py`) soma
+    `quantity * unit_price` de TODAS as linhas sem nenhum branch por
+    tipo. O que muda por tipo é só o `StockMovementReason` usado no
+    fechamento (`SALE` vs `INTERNAL_USE` — ver
+    `services/orders.py::close_order`); a baixa em si, a idempotência
+    (`stock_movement_id`) e o congelamento pós-fechamento são
+    IDÊNTICOS para os dois tipos."""
 
     __tablename__ = "order_product_items"
     __table_args__ = (
@@ -238,6 +270,11 @@ class OrderProductItem(Base, UUIDPKMixin, TimestampMixin):
     )
     quantity: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False)
     unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    item_type: Mapped[OrderProductItemKind] = mapped_column(
+        pg_enum(OrderProductItemKind, "order_product_item_kind"),
+        nullable=False,
+        server_default=OrderProductItemKind.SALE.value,
+    )
     # Snapshot de NOME — mesmo padrão de `OrderItem.service_name`.
     product_name: Mapped[str] = mapped_column(String(160), nullable=False)
     # NULL = ainda não baixou estoque (comanda aberta, ou item removido

@@ -103,6 +103,16 @@ class Appointment(Base, UUIDPKMixin, TimestampMixin):
     recurrence_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("recurrences.id", ondelete="SET NULL")
     )
+    # Etiqueta OPCIONAL por organização (migration 0039, item "Status
+    # Personalizado de Agendamento") — ORTOGONAL ao `status` operacional
+    # acima: nunca lido por `appointment_state_machine.py`, nunca afeta
+    # transição nenhuma. Mesmo isolamento estrutural de
+    # `AppointmentStatusStyle` (ver docstring do model), só que aqui é
+    # uma FK de verdade porque o catálogo é criado pelo usuário (não os
+    # 8 valores fixos do enum) — ver `models/appointment_custom_status.py`.
+    custom_status_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("appointment_custom_statuses.id", ondelete="SET NULL")
+    )
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
