@@ -135,6 +135,17 @@ def create_order(session: Session, actor: ActorContext, appointment_id: uuid.UUI
     # `api/deps.py::get_db`); devolvemos a comanda que "venceu" em vez de
     # propagar erro — POST /orders fica genuinamente idempotente sob
     # concorrência real, não só no caminho feliz check-then-create.
+    # Rodada "Comanda, Auditoria, Status Personalizado e Estoque por Peso"
+    # (drawer unificado): a Order ainda não existe no momento em que o
+    # atendente digita a observação da visita no drawer de criação do
+    # agendamento — esse texto fica temporariamente em `Appointment.
+    # notes` só até aqui. É uma cópia ÚNICA, feita uma vez, no instante
+    # em que a Order nasce; a partir deste ponto `Order.observation` é a
+    # ÚNICA fonte de verdade (editada via `update_observation`,
+    # concorrência otimista por `observation_version`) — nunca voltamos a
+    # ler/sincronizar de `Appointment.notes` depois disso, evitando a
+    # duplicação perigosa de duas fontes de verdade divergentes.
+    order_observation = appointment.notes.strip() if appointment.notes and appointment.notes.strip() else None
     try:
         with session.begin_nested():
             order = order_repo.create(
@@ -144,6 +155,7 @@ def create_order(session: Session, actor: ActorContext, appointment_id: uuid.UUI
                 branch_id=appointment.branch_id,
                 client_id=appointment.client_id,
                 created_by=actor.user_id,
+                observation=order_observation,
             )
             for item in appointment.items:
                 # Copia o snapshot do AppointmentItem 1:1 na abertura — a

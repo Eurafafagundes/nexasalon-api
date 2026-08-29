@@ -117,6 +117,7 @@ def create(
     branch_id: uuid.UUID,
     client_id: uuid.UUID,
     created_by: uuid.UUID | None,
+    observation: str | None = None,
 ) -> Order:
     order = Order(
         organization_id=organization_id,
@@ -125,6 +126,7 @@ def create(
         branch_id=branch_id,
         client_id=client_id,
         created_by=created_by,
+        observation=observation,
     )
     session.add(order)
     session.flush()

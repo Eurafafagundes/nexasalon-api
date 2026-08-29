@@ -199,6 +199,52 @@ def test_criar_comanda_copia_itens_do_agendamento_com_total_correto(org_session)
     assert prices == [Decimal("100.00"), Decimal("280.00")]
 
 
+def test_criar_comanda_copia_appointment_notes_pra_order_observation_uma_unica_vez(org_session):
+    """Redesenho do drawer da Agenda: no momento da criação do
+    agendamento ainda não existe Order, então o texto digitado em
+    "Observação da comanda" fica temporariamente em `Appointment.notes`.
+    Ao abrir a comanda, essa cópia acontece EXATAMENTE UMA VEZ — a
+    Order nasce já com `observation` preenchida (sem incrementar
+    `observation_version`, sem preencher `observation_updated_at/_by`,
+    já que ninguém "editou" a observação da comanda via o fluxo de
+    edição, ela só nasceu com esse conteúdo). A partir daqui
+    `Order.observation` é a única fonte de verdade — editar depois
+    passa a exigir `update_observation` normalmente."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    prof = _professional(session, org_id, branch.id)
+    corte = _service(session, org_id, name="Corte", duration=60, price=Decimal("100.00"))
+    _link(session, prof.id, corte.id)
+    _working_hours(session, org_id, prof.id, _THURSDAY, time(9, 0), time(20, 0))
+    client = _client(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        notes="Cliente pediu para utilizar apenas 180g de cabelo nesta manutenção.",
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=corte.id, start_at=_dt(9, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+
+    order = orders.create_order(session, actor, appt.id)
+
+    assert order.observation == "Cliente pediu para utilizar apenas 180g de cabelo nesta manutenção."
+    assert order.observation_version == 0
+    assert order.observation_updated_at is None
+    assert order.observation_updated_by is None
+
+
+def test_criar_comanda_sem_appointment_notes_nao_inventa_observation(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _scheduled_appointment_with_one_service(session, org_id, actor)
+
+    order = orders.create_order(session, actor, appt.id)
+
+    assert order.observation is None
+
+
 def test_total_da_comanda_e_a_soma_dos_itens(org_session):
     from nexasalon_api.schemas.order import OrderRead
 
