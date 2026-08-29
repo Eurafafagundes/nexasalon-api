@@ -111,9 +111,8 @@ def test_criar_listar_editar_desativar_status_personalizado(org_session):
     assert len(custom_statuses.list_custom_statuses(session, org_id, include_inactive=True)) == 1  # continua existindo
 
 
-def test_cor_invalida_e_rejeitada_pelo_schema():
-    with pytest.raises(ValueError):
-        AppointmentCustomStatusCreate(name="Retorno", color_hex="roxo")
+# (`test_cor_invalida_e_rejeitada_pelo_schema` — pura, sem sessão —
+# movida pra `tests_unit/test_schemas_pure.py`.)
 
 
 def test_status_inexistente_404(org_session):

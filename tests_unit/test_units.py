@@ -1,7 +1,17 @@
 """Testes de `core/units.py` — utilitário único de conversão de
 unidade (item "Não quero `* 1000`/`/ 1000` espalhado... Criar
 utilitário único de conversão. Não espalhar. Aceitar apenas unidades
-compatíveis."). Puramente unitário, sem banco."""
+compatíveis."). Puramente unitário, sem banco.
+
+MOVIDO de `tests/test_units.py` pra cá (auditoria "testes sem banco")
+— `tests/conftest.py` importa `pgserver` em nível de MÓDULO (fora de
+qualquer fixture), então qualquer teste dentro de `tests/` falha na
+COLETA (nem chega a rodar) se `pgserver` não estiver instalado, mesmo
+que o teste em si não use nenhuma fixture de banco. `tests_unit/` é um
+diretório IRMÃO de `tests/` (não descendente), então o
+`tests/conftest.py` nunca é aplicado aqui — roda com
+`pytest tests_unit/` sem exigir Postgres/pgserver/Docker.
+"""
 from decimal import Decimal
 
 import pytest
@@ -60,3 +70,16 @@ def test_sem_float_drift_em_conversoes_encadeadas():
     kg = units.convert_quantity(grams, ProductUnit.GRAM, ProductUnit.KG)
     back_to_grams = units.convert_quantity(kg, ProductUnit.KG, ProductUnit.GRAM)
     assert back_to_grams == grams
+
+
+def test_decimal_1_5_permanece_1_5_no_lado_api_nunca_reinterpretado_como_agrupamento():
+    """Auditoria (item 1, parser): a API usa `Decimal` puro — nunca
+    depende de formatação brasileira. `Decimal("1.5")` é SEMPRE 1,5 do
+    lado do backend, em qualquer conversão de unidade — o "." aqui é o
+    separador decimal PADRÃO do Python/Postgres, nunca ruído de
+    agrupamento (essa ambiguidade só existe na STRING DIGITADA pelo
+    usuário no frontend, tratada em `lib/quantity.ts::parseQuantityInput`,
+    nunca no lado do backend)."""
+    value = Decimal("1.5")
+    assert value == Decimal("1.5")
+    assert units.convert_quantity(value, ProductUnit.KG, ProductUnit.GRAM) == Decimal("1500.0")

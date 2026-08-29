@@ -196,12 +196,9 @@ def test_venda_continua_exigindo_for_sale_true(org_session):
         )
 
 
-def test_unit_price_no_payload_e_rejeitado_para_item_type_sale():
-    with pytest.raises(ValueError):
-        OrderProductItemCreate(
-            product_id=uuid.uuid4(), quantity=Decimal("1"),
-            item_type=OrderProductItemKind.SALE, unit_price=Decimal("10.00"),
-        )
+# (`test_unit_price_no_payload_e_rejeitado_para_item_type_sale` — pura,
+# sem sessão — movida pra `tests_unit/test_schemas_pure.py`, ver
+# docstring de lá.)
 
 
 # ---------------------------------------------------------------------
@@ -387,6 +384,5 @@ def test_correcao_so_permitida_para_item_type_consumption(org_session):
         )
 
 
-def test_quantity_delta_zero_e_rejeitado_pelo_schema():
-    with pytest.raises(ValueError):
-        OrderConsumptionCorrection(quantity_delta=Decimal("0"), reason="Motivo qualquer")
+# (`test_quantity_delta_zero_e_rejeitado_pelo_schema` — pura, sem
+# sessão — movida pra `tests_unit/test_schemas_pure.py`.)
