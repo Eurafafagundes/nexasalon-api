@@ -145,7 +145,7 @@ def create_order(session: Session, actor: ActorContext, appointment_id: uuid.UUI
     # concorrência otimista por `observation_version`) — nunca voltamos a
     # ler/sincronizar de `Appointment.notes` depois disso, evitando a
     # duplicação perigosa de duas fontes de verdade divergentes.
-    order_observation = appointment.notes.strip() if appointment.notes and appointment.notes.strip() else None
+    order_observation = (appointment.notes or "").strip() or None
     try:
         with session.begin_nested():
             order = order_repo.create(

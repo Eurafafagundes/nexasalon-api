@@ -35,6 +35,7 @@ from nexasalon_api.schemas.order import (
     OrderCancel,
     OrderClose,
     OrderItemPriceUpdate,
+    OrderObservationUpdate,
     PaymentCreate,
 )
 from nexasalon_api.services import appointments, cash_register, orders
@@ -243,6 +244,56 @@ def test_criar_comanda_sem_appointment_notes_nao_inventa_observation(org_session
     order = orders.create_order(session, actor, appt.id)
 
     assert order.observation is None
+
+
+def test_appointment_notes_nunca_sobrescreve_order_observation_ja_existente(org_session):
+    """Auditoria UX/funcional (item 6, "Antes da Order existir"): depois
+    que a Order já existe, `Appointment.notes` NUNCA volta a escrever em
+    `Order.observation` — nem mesmo se alguém tentar "reabrir" a comanda
+    do mesmo agendamento. A tentativa de recriação é recusada com
+    `ConflictError` ANTES de qualquer leitura de `appointment.notes`
+    (a checagem de duplicidade em `create_order` vem antes do cálculo do
+    seed) — então a observação já editada pelo atendente permanece
+    intacta. A corrida genuína (dois `INSERT` concorrentes colidindo na
+    unique parcial `uq_orders_appointment_id_active`) é protegida pelo
+    mesmo SAVEPOINT já usado pra idempotência de `create_order`: o
+    "perdedor" nunca persiste nada (rollback do savepoint), então o
+    `order_observation` que ELE calculou localmente nunca chega a ser
+    escrito — `return existing` devolve exatamente o que o "vencedor"
+    gravou, nunca misturado com o seed do perdedor."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    prof = _professional(session, org_id, branch.id)
+    corte = _service(session, org_id, name="Corte", duration=60, price=Decimal("100.00"))
+    _link(session, prof.id, corte.id)
+    _working_hours(session, org_id, prof.id, _THURSDAY, time(9, 0), time(20, 0))
+    client = _client(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        notes="Observação original digitada na criação do agendamento.",
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=corte.id, start_at=_dt(9, 0))],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    order = orders.create_order(session, actor, appt.id)
+    assert order.observation == "Observação original digitada na criação do agendamento."
+
+    # Atendente edita a observação da comanda DEPOIS da Order existir —
+    # `Appointment.notes` continua com o texto antigo (nunca é
+    # resincronizado de volta), só `Order.observation` muda.
+    orders.update_observation(
+        session, actor, order.id,
+        OrderObservationUpdate(observation="Editado pelo atendente depois de aberta.", expected_observation_version=0),
+    )
+
+    with pytest.raises(ConflictError):
+        orders.create_order(session, actor, appt.id)
+
+    reloaded = orders.get_order(session, actor, order.id)
+    assert reloaded.observation == "Editado pelo atendente depois de aberta."
+    assert appt.notes == "Observação original digitada na criação do agendamento."
 
 
 def test_total_da_comanda_e_a_soma_dos_itens(org_session):
