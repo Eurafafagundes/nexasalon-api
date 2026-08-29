@@ -861,7 +861,20 @@ def set_custom_status(
     ORTOGONAL a `update_status`: nunca toca `appointment.status`, então
     reaproveita a mesma permissão `agenda.edit` (mesma fronteira de
     autorização de qualquer outra edição de agendamento), nunca uma
-    permission nova. `custom_status_id=None` remove a etiqueta."""
+    permission nova. `custom_status_id=None` remove a etiqueta — SEMPRE
+    permitido, mesmo quando o status atual está desativado (item
+    "trocar/remover continua permitido").
+
+    Enforcement de `is_active` no BACKEND (auditoria "última correção
+    pré-push", item 3) — antes só a UI escondia status inativos da
+    lista de seleção; uma chamada direta à API ainda conseguia atribuir
+    um `custom_status_id` desativado. Agora qualquer ATRIBUIÇÃO nova
+    (`custom_status_id is not None`) exige `is_active=True`. Isto NUNCA
+    invalida um agendamento que já tinha a etiqueta ANTES dela ser
+    desativada — este código só roda quando alguém tenta ATRIBUIR de
+    novo, nunca ao simplesmente carregar/exibir o agendamento (que
+    continua lendo `appointment.custom_status_id` direto, sem passar
+    por aqui)."""
     appointment = get_appointment(session, actor, appointment_id)
     _assert_can_edit(actor, {item.professional_id for item in appointment.items})
 
@@ -869,6 +882,10 @@ def set_custom_status(
         custom_status = appointment_custom_status_repo.get(session, actor.organization_id, custom_status_id)
         if custom_status is None:
             raise NotFoundError("Status personalizado não encontrado.")
+        if not custom_status.is_active:
+            raise ValidationDomainError(
+                "Este status personalizado está desativado e não pode ser atribuído a um agendamento."
+            )
 
     old_custom_status_id = appointment.custom_status_id
     appointment.custom_status_id = custom_status_id

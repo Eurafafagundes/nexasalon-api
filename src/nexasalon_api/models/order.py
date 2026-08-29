@@ -136,6 +136,15 @@ class Order(Base, UUIDPKMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     observation_updated_by_name: Mapped[str | None] = mapped_column(String(160))
+    # Concorrência otimista da observação — contador explícito (nasce em
+    # 0, "nunca editada" é um valor real e comparável, nunca NULL). Um
+    # timestamp NULL inicial não distinguia "nunca editada" de "sem
+    # controle de versão", deixando passar duas primeiras edições
+    # concorrentes sem 409 (auditoria "última correção pré-push", item
+    # 2) — ver `services/orders.py::update_observation`. Incrementado em
+    # 1 a cada edição bem-sucedida; nunca usado pra nada além disso
+    # (não é histórico, não é ordenação de exibição).
+    observation_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
     items: Mapped[list["OrderItem"]] = relationship(
         back_populates="order", cascade="all, delete-orphan", order_by="OrderItem.created_at"

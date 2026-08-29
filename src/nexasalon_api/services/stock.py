@@ -92,12 +92,17 @@ def _create_movement(
     order_id: uuid.UUID | None = None,
     transfer_id: uuid.UUID | None = None,
     inventory_count_id: uuid.UUID | None = None,
+    idempotency_key: uuid.UUID | None = None,
 ) -> StockMovement:
     """Núcleo interno — usado tanto pela criação manual (`record_movement`,
     depois de validar que o motivo é permitido nesse caminho) quanto
     pelos fluxos de sistema (transferência, fechamento de inventário),
     que passam motivos reservados (`TRANSFER_IN`/`TRANSFER_OUT`/
-    `INVENTORY_COUNT`) diretamente."""
+    `INVENTORY_COUNT`) diretamente. `idempotency_key`: ver docstring de
+    `models/stock.py::StockMovement.idempotency_key` — só
+    `record_consumption_correction` usa hoje; violar o índice único
+    parcial levanta `IntegrityError`, que quem chama trata como "já
+    existe" (nunca uma segunda compensação)."""
     _get_product_or_404(session, actor.organization_id, product_id)
     _get_branch_or_404(session, actor.organization_id, branch_id)
 
@@ -119,6 +124,7 @@ def _create_movement(
         order_id=order_id,
         transfer_id=transfer_id,
         inventory_count_id=inventory_count_id,
+        idempotency_key=idempotency_key,
     )
 
     audit_log_repo.create(
@@ -312,6 +318,7 @@ def record_consumption_correction(
     quantity: Decimal,
     direction: StockMovementDirection,
     observation: str,
+    idempotency_key: uuid.UUID,
 ) -> StockMovement:
     """Movimento COMPENSATÓRIO pra corrigir um consumo já registrado
     numa comanda FECHADA (item "Não duplicar baixa" / "correção
@@ -322,7 +329,12 @@ def record_consumption_correction(
     saldo (consumo real foi MENOR). `reason=ADJUSTMENT` — mesmo motivo
     já usado por correções manuais avulsas, aqui com `order_id`
     preenchido pra rastreabilidade (aparece no histórico de
-    movimentações vinculado à comanda que originou o consumo)."""
+    movimentações vinculado à comanda que originou o consumo).
+
+    `idempotency_key` OBRIGATÓRIO — quem chama (`services/orders.py::
+    correct_consumption`) é responsável por gerar/reaproveitar a chave e
+    tratar o `IntegrityError` de uma segunda tentativa com a mesma
+    chave como "já corrigido", nunca como erro genérico."""
     return _create_movement(
         session,
         actor,
@@ -333,6 +345,7 @@ def record_consumption_correction(
         quantity=quantity,
         observation=observation,
         order_id=order_id,
+        idempotency_key=idempotency_key,
     )
 
 

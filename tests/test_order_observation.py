@@ -1,6 +1,15 @@
 """Testes de `services/orders.py::update_observation` (migration 0039,
 item "Comanda — Observação + Auditoria"). Reaproveita os fixtures de
-`tests/test_order_products.py` (comanda de serviço + registro/caixa)."""
+`tests/test_order_products.py` (comanda de serviço + registro/caixa).
+
+Concorrência via CONTADOR INTEIRO explícito (`observation_version`,
+nasce em `0`) — corrigido na auditoria "última correção pré-push" (item
+2): o mecanismo anterior, baseado em timestamp opcional, não detectava
+duas edições concorrentes quando AMBAS partiam de uma observação nunca
+editada (`observation_updated_at IS NULL` não distinguia "nunca
+editada" de "sem controle de versão"). `0` é um valor real e
+comparável desde o início, então essa corrida específica agora também
+gera 409 (ver `test_duas_edicoes_concorrentes_partindo_de_version_zero`)."""
 import uuid
 from datetime import time, timedelta, timezone
 from decimal import Decimal
@@ -89,29 +98,44 @@ def _open_order(session, org_id, actor):
     return order, branch
 
 
-def test_editar_observacao_registra_quem_e_quando(org_session):
+def test_comanda_nova_nasce_com_observation_version_zero(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    order, _branch = _open_order(session, org_id, actor)
+    assert order.observation_version == 0
+    assert order.observation is None
+
+
+def test_editar_observacao_registra_quem_e_quando_e_incrementa_a_versao(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id, name="Rafael")
     order, _branch = _open_order(session, org_id, actor)
     assert order.observation is None
 
     updated = orders.update_observation(
-        session, actor, order.id, OrderObservationUpdate(observation="Cliente pediu para não usar produto X.")
+        session, actor, order.id,
+        OrderObservationUpdate(observation="Cliente pediu para não usar produto X.", expected_observation_version=0),
     )
 
     assert updated.observation == "Cliente pediu para não usar produto X."
     assert updated.observation_updated_by == actor.user_id
     assert updated.observation_updated_by_name == "Rafael"
     assert updated.observation_updated_at is not None
+    assert updated.observation_version == 1
 
 
 def test_string_vazia_limpa_a_observacao(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)
     order, _branch = _open_order(session, org_id, actor)
-    orders.update_observation(session, actor, order.id, OrderObservationUpdate(observation="Algo"))
+    first = orders.update_observation(
+        session, actor, order.id, OrderObservationUpdate(observation="Algo", expected_observation_version=0)
+    )
 
-    cleared = orders.update_observation(session, actor, order.id, OrderObservationUpdate(observation="   "))
+    cleared = orders.update_observation(
+        session, actor, order.id,
+        OrderObservationUpdate(observation="   ", expected_observation_version=first.observation_version),
+    )
     assert cleared.observation is None
 
 
@@ -127,51 +151,92 @@ def test_editar_observacao_de_comanda_fechada_nao_altera_status_nem_pagamentos(o
     assert closed.status.value == "closed"
 
     updated = orders.update_observation(
-        session, actor, order.id, OrderObservationUpdate(observation="Observação pós-fechamento")
+        session, actor, order.id,
+        OrderObservationUpdate(observation="Observação pós-fechamento", expected_observation_version=0),
     )
     assert updated.observation == "Observação pós-fechamento"
     assert updated.status.value == "closed"  # nunca reabre
     assert len(updated.payments) == 1  # financeiro intocado
 
 
-def test_edicao_concorrente_com_timestamp_desatualizado_e_recusada(org_session):
+def test_edicao_concorrente_com_versao_desatualizada_e_recusada(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)
     order, _branch = _open_order(session, org_id, actor)
-    first = orders.update_observation(session, actor, order.id, OrderObservationUpdate(observation="Primeira versão"))
-    stale_timestamp = first.observation_updated_at
+    first = orders.update_observation(
+        session, actor, order.id, OrderObservationUpdate(observation="Primeira versão", expected_observation_version=0)
+    )
+    stale_version = first.observation_version  # 1 — mas uma segunda edição vai avançar pra 2
 
-    # Segunda edição "de verdade" acontece — timestamp em banco avança.
-    orders.update_observation(session, actor, order.id, OrderObservationUpdate(observation="Segunda versão"))
+    # Segunda edição "de verdade" acontece — versão em banco avança.
+    orders.update_observation(
+        session, actor, order.id,
+        OrderObservationUpdate(observation="Segunda versão", expected_observation_version=stale_version),
+    )
 
     with pytest.raises(ConflictError):
         orders.update_observation(
             session, actor, order.id,
-            OrderObservationUpdate(observation="Terceira versão (baseada na primeira, desatualizada)", expected_observation_updated_at=stale_timestamp),
+            OrderObservationUpdate(
+                observation="Terceira versão (baseada na primeira, desatualizada)",
+                expected_observation_version=stale_version,  # já defasada, banco está em 2
+            ),
         )
 
     reloaded = orders.get_order(session, actor, order.id)
     assert reloaded.observation == "Segunda versão"  # não foi sobrescrita silenciosamente
 
 
-def test_edicao_com_timestamp_atualizado_e_aceita(org_session):
+def test_duas_edicoes_concorrentes_partindo_de_version_zero(org_session):
+    """AUDITORIA (item 2, gap encontrado na rodada anterior): A e B abrem
+    a MESMA comanda, nenhum nunca editou a observação antes
+    (`observation_version=0` pros dois). A salva primeiro (OK, versão
+    vira 1). B tenta salvar baseado na versão que tinha carregado (0) —
+    precisa ser recusado com 409, NUNCA sobrescrever silenciosamente."""
     session, org_id = org_session
     actor = _actor(session, org_id)
     order, _branch = _open_order(session, org_id, actor)
-    first = orders.update_observation(session, actor, order.id, OrderObservationUpdate(observation="Primeira versão"))
+    assert order.observation_version == 0  # nem A nem B nunca editaram
+
+    # A salva.
+    orders.update_observation(
+        session, actor, order.id, OrderObservationUpdate(observation="Observação de A", expected_observation_version=0)
+    )
+
+    # B ainda acredita que a versão é 0 (carregou antes de A salvar).
+    with pytest.raises(ConflictError):
+        orders.update_observation(
+            session, actor, order.id, OrderObservationUpdate(observation="Observação de B", expected_observation_version=0)
+        )
+
+    reloaded = orders.get_order(session, actor, order.id)
+    assert reloaded.observation == "Observação de A"  # B nunca sobrescreveu
+    assert reloaded.observation_version == 1
+
+
+def test_edicao_com_versao_atualizada_e_aceita(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    order, _branch = _open_order(session, org_id, actor)
+    first = orders.update_observation(
+        session, actor, order.id, OrderObservationUpdate(observation="Primeira versão", expected_observation_version=0)
+    )
 
     updated = orders.update_observation(
         session, actor, order.id,
-        OrderObservationUpdate(observation="Segunda versão", expected_observation_updated_at=first.observation_updated_at),
+        OrderObservationUpdate(observation="Segunda versão", expected_observation_version=first.observation_version),
     )
     assert updated.observation == "Segunda versão"
+    assert updated.observation_version == 2
 
 
 def test_comanda_inexistente_404(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)
     with pytest.raises(NotFoundError):
-        orders.update_observation(session, actor, uuid.uuid4(), OrderObservationUpdate(observation="x"))
+        orders.update_observation(
+            session, actor, uuid.uuid4(), OrderObservationUpdate(observation="x", expected_observation_version=0)
+        )
 
 
 def test_isolamento_multiempresa_comanda_de_outra_org(org_session):
@@ -188,4 +253,6 @@ def test_isolamento_multiempresa_comanda_de_outra_org(org_session):
         other_session.commit()
 
     with pytest.raises(NotFoundError):
-        orders.update_observation(session, other_actor, order.id, OrderObservationUpdate(observation="invasão"))
+        orders.update_observation(
+            session, other_actor, order.id, OrderObservationUpdate(observation="invasão", expected_observation_version=0)
+        )

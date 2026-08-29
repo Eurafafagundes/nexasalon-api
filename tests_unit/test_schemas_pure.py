@@ -42,14 +42,21 @@ def test_quantity_delta_zero_e_rejeitado_pelo_schema():
     """Correção de consumo nunca aceita delta zero — não existe
     "correção" que não corrige nada."""
     with pytest.raises(ValueError):
-        OrderConsumptionCorrection(quantity_delta=Decimal("0"), reason="Motivo qualquer")
+        OrderConsumptionCorrection(quantity_delta=Decimal("0"), reason="Motivo qualquer", idempotency_key=uuid.uuid4())
 
 
 def test_quantity_delta_positivo_e_negativo_sao_aceitos():
-    positive = OrderConsumptionCorrection(quantity_delta=Decimal("20"), reason="Consumiu mais")
-    negative = OrderConsumptionCorrection(quantity_delta=Decimal("-20"), reason="Consumiu menos")
+    positive = OrderConsumptionCorrection(quantity_delta=Decimal("20"), reason="Consumiu mais", idempotency_key=uuid.uuid4())
+    negative = OrderConsumptionCorrection(quantity_delta=Decimal("-20"), reason="Consumiu menos", idempotency_key=uuid.uuid4())
     assert positive.quantity_delta == Decimal("20")
     assert negative.quantity_delta == Decimal("-20")
+
+
+def test_idempotency_key_e_obrigatoria():
+    """Auditoria "última correção pré-push" (item 1) — sem chave de
+    idempotência, o schema recusa antes de qualquer acesso ao banco."""
+    with pytest.raises(ValueError):
+        OrderConsumptionCorrection(quantity_delta=Decimal("20"), reason="Motivo qualquer")
 
 
 def test_cor_invalida_e_rejeitada_pelo_schema():

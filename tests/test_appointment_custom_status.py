@@ -12,7 +12,7 @@ from sqlalchemy import text
 
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.db import SessionLocal
-from nexasalon_api.core.exceptions import NotFoundError
+from nexasalon_api.core.exceptions import NotFoundError, ValidationDomainError
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import AppointmentStatus
 from nexasalon_api.models.identity import User
@@ -210,3 +210,117 @@ def test_desativar_status_nao_remove_de_agendamento_ja_atribuido(org_session):
     reloaded = appointments.get_appointment(session, actor, appt.id)
     assert reloaded.custom_status_id == custom_status.id  # continua atribuído
     assert custom_statuses.list_custom_statuses(session, org_id) == []  # mas some da lista de seleção
+
+
+# ---------------------------------------------------------------------
+# AUDITORIA "última correção pré-push" (item 3) — enforcement de
+# is_active no BACKEND. Antes só a UI escondia status inativos da
+# lista; uma chamada direta à API ainda conseguia atribuir um
+# `custom_status_id` desativado.
+# ---------------------------------------------------------------------
+
+
+def test_selecionar_status_ativo_e_permitido(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt = _appointment(session, org_id, actor)
+    active_status = custom_statuses.create_custom_status(
+        session, org_id, AppointmentCustomStatusCreate(name="VIP", color_hex="#8B5CF6")
+    )
+
+    updated = appointments.set_custom_status(session, actor, appt.id, active_status.id)
+    assert updated.custom_status_id == active_status.id
+
+
+def test_selecionar_status_inativo_e_recusado(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt = _appointment(session, org_id, actor)
+    inactive_status = custom_statuses.create_custom_status(
+        session, org_id, AppointmentCustomStatusCreate(name="Descontinuado", color_hex="#8B5CF6")
+    )
+    custom_statuses.set_custom_status_active(session, org_id, inactive_status.id, False)
+
+    with pytest.raises(ValidationDomainError):
+        appointments.set_custom_status(session, actor, appt.id, inactive_status.id)
+
+    reloaded = appointments.get_appointment(session, actor, appt.id)
+    assert reloaded.custom_status_id is None  # nunca foi atribuído
+
+
+def test_agendamento_com_status_desativado_depois_continua_legivel(org_session):
+    """"agendamento que JÁ possui status depois desativado continua
+    válido e exibível" — desativar não invalida a atribuição já feita,
+    só bloqueia NOVAS atribuições."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt = _appointment(session, org_id, actor)
+    status = custom_statuses.create_custom_status(
+        session, org_id, AppointmentCustomStatusCreate(name="Retorno", color_hex="#8B5CF6")
+    )
+    appointments.set_custom_status(session, actor, appt.id, status.id)
+
+    custom_statuses.set_custom_status_active(session, org_id, status.id, False)
+
+    reloaded = appointments.get_appointment(session, actor, appt.id)
+    assert reloaded.custom_status_id == status.id  # continua válido e exibível
+
+
+def test_remover_status_inativo_existente_e_permitido(org_session):
+    """"trocar/remover continua permitido" — mesmo com o status
+    ATUALMENTE atribuído já desativado, `custom_status_id=None`
+    (remoção) precisa continuar funcionando sem erro."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt = _appointment(session, org_id, actor)
+    status = custom_statuses.create_custom_status(
+        session, org_id, AppointmentCustomStatusCreate(name="Retorno", color_hex="#8B5CF6")
+    )
+    appointments.set_custom_status(session, actor, appt.id, status.id)
+    custom_statuses.set_custom_status_active(session, org_id, status.id, False)
+
+    updated = appointments.set_custom_status(session, actor, appt.id, None)
+    assert updated.custom_status_id is None
+
+
+def test_trocar_de_status_inativo_para_status_ativo_e_permitido(org_session):
+    """"trocar... continua permitido" — sair de um status já
+    desativado em direção a um status ATIVO diferente precisa
+    funcionar normalmente (só ATRIBUIR um inativo é bloqueado)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt = _appointment(session, org_id, actor)
+    old_status = custom_statuses.create_custom_status(
+        session, org_id, AppointmentCustomStatusCreate(name="Antigo", color_hex="#8B5CF6")
+    )
+    new_status = custom_statuses.create_custom_status(
+        session, org_id, AppointmentCustomStatusCreate(name="Novo", color_hex="#22C55E")
+    )
+    appointments.set_custom_status(session, actor, appt.id, old_status.id)
+    custom_statuses.set_custom_status_active(session, org_id, old_status.id, False)
+
+    updated = appointments.set_custom_status(session, actor, appt.id, new_status.id)
+    assert updated.custom_status_id == new_status.id
+
+
+def test_isolamento_entre_organizacoes_preservado_com_enforcement_de_inativo(org_session):
+    """Isolamento entre organizações continua 404, independente de
+    `is_active` — nunca vaza se um status inativo de outra org existe."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt = _appointment(session, org_id, actor)
+
+    other_org_id = uuid.uuid4()
+    with SessionLocal() as other_session:
+        other_session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(other_org_id)})
+        other_session.add(Organization(id=other_org_id, name="Outra org", slug=f"outra-status3-{other_org_id.hex[:8]}"))
+        other_session.flush()
+        other_status = custom_statuses.create_custom_status(
+            other_session, other_org_id, AppointmentCustomStatusCreate(name="Alheio", color_hex="#000000")
+        )
+        custom_statuses.set_custom_status_active(other_session, other_org_id, other_status.id, False)
+        other_status_id = other_status.id
+        other_session.commit()
+
+    with pytest.raises(NotFoundError):
+        appointments.set_custom_status(session, actor, appt.id, other_status_id)

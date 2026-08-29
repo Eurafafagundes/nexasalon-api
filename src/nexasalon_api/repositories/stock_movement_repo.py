@@ -16,6 +16,20 @@ def get(session: Session, organization_id: uuid.UUID, movement_id: uuid.UUID) ->
     return session.scalars(stmt).first()
 
 
+def get_by_idempotency_key(
+    session: Session, organization_id: uuid.UUID, idempotency_key: uuid.UUID
+) -> StockMovement | None:
+    """Idempotência de correção pós-fechamento (ver docstring de
+    `models/stock.py::StockMovement.idempotency_key`) — devolve a
+    movimentação JÁ criada por uma tentativa anterior com a mesma
+    chave, se existir, pra `services/orders.py::correct_consumption`
+    nunca criar uma segunda compensação."""
+    stmt = select(StockMovement).where(
+        StockMovement.organization_id == organization_id, StockMovement.idempotency_key == idempotency_key
+    )
+    return session.scalars(stmt).first()
+
+
 def list_for_org(
     session: Session,
     organization_id: uuid.UUID,
@@ -77,6 +91,7 @@ def create(
     order_id: uuid.UUID | None = None,
     transfer_id: uuid.UUID | None = None,
     inventory_count_id: uuid.UUID | None = None,
+    idempotency_key: uuid.UUID | None = None,
 ) -> StockMovement:
     movement = StockMovement(
         organization_id=organization_id,
@@ -92,6 +107,7 @@ def create(
         order_id=order_id,
         transfer_id=transfer_id,
         inventory_count_id=inventory_count_id,
+        idempotency_key=idempotency_key,
     )
     session.add(movement)
     session.flush()

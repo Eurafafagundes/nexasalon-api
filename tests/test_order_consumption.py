@@ -307,7 +307,9 @@ def test_correcao_de_consumo_gera_movimento_compensatorio_sem_editar_original(or
     # Consumo real foi 20g A MAIS do que o registrado.
     corrected = orders.correct_consumption(
         session, actor, order.id, item_id,
-        OrderConsumptionCorrection(quantity_delta=Decimal("20"), reason="Sobrou menos cabelo do que o esperado"),
+        OrderConsumptionCorrection(
+            quantity_delta=Decimal("20"), reason="Sobrou menos cabelo do que o esperado", idempotency_key=uuid.uuid4()
+        ),
     )
 
     # Item/linha original CONGELADOS — quantidade nunca muda.
@@ -340,7 +342,9 @@ def test_correcao_negativa_devolve_estoque(org_session):
 
     orders.correct_consumption(
         session, actor, order.id, item_id,
-        OrderConsumptionCorrection(quantity_delta=Decimal("-30"), reason="Consumiu menos do que o registrado"),
+        OrderConsumptionCorrection(
+            quantity_delta=Decimal("-30"), reason="Consumiu menos do que o registrado", idempotency_key=uuid.uuid4()
+        ),
     )
     level = stock_level_repo.get(session, org_id, product.id, branch.id)
     assert level.quantity_on_hand == Decimal("850")  # 820 + 30 devolvidos
@@ -361,7 +365,7 @@ def test_correcao_so_permitida_em_comanda_fechada(org_session):
     with pytest.raises(ValidationDomainError):
         orders.correct_consumption(
             session, actor, order.id, item_id,
-            OrderConsumptionCorrection(quantity_delta=Decimal("10"), reason="Comanda ainda aberta"),
+            OrderConsumptionCorrection(quantity_delta=Decimal("10"), reason="Comanda ainda aberta", idempotency_key=uuid.uuid4()),
         )
 
 
@@ -380,9 +384,80 @@ def test_correcao_so_permitida_para_item_type_consumption(org_session):
     with pytest.raises(ValidationDomainError):
         orders.correct_consumption(
             session, actor, order.id, item_id,
-            OrderConsumptionCorrection(quantity_delta=Decimal("1"), reason="Item é venda, não consumo"),
+            OrderConsumptionCorrection(quantity_delta=Decimal("1"), reason="Item é venda, não consumo", idempotency_key=uuid.uuid4()),
         )
 
 
 # (`test_quantity_delta_zero_e_rejeitado_pelo_schema` — pura, sem
 # sessão — movida pra `tests_unit/test_schemas_pure.py`.)
+
+
+# ---------------------------------------------------------------------
+# AUDITORIA "última correção pré-push" (item 1) — idempotência de
+# correct_consumption. Double-click/retry de rede nunca pode duplicar a
+# compensação; duas correções REALMENTE diferentes continuam permitidas.
+# ---------------------------------------------------------------------
+
+
+def test_mesma_correcao_enviada_duas_vezes_gera_apenas_uma_compensacao_efetiva(org_session):
+    """Double-click/retry de rede: MESMA `idempotency_key` reenviada —
+    a segunda chamada nunca cria um segundo movimento compensatório."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    order, branch = _open_order(session, org_id, actor)
+    product = _internal_product(session, actor)
+    _stock_in(session, actor, product.id, branch.id, Decimal("1000"))
+    orders.add_product_item(
+        session, actor, order.id,
+        OrderProductItemCreate(product_id=product.id, quantity=Decimal("180"), item_type=OrderProductItemKind.CONSUMPTION),
+    )
+    closed = _close(session, actor, order)
+    item_id = closed.product_items[0].id
+    level_after_close = stock_level_repo.get(session, org_id, product.id, branch.id).quantity_on_hand
+    assert level_after_close == Decimal("820")
+
+    key = uuid.uuid4()
+    payload = OrderConsumptionCorrection(quantity_delta=Decimal("20"), reason="Sobrou menos cabelo", idempotency_key=key)
+
+    first = orders.correct_consumption(session, actor, order.id, item_id, payload)
+    second = orders.correct_consumption(session, actor, order.id, item_id, payload)  # mesma chave, reenviada
+
+    level_after = stock_level_repo.get(session, org_id, product.id, branch.id).quantity_on_hand
+    assert level_after == Decimal("800")  # 820 - 20, uma única vez (não 780)
+    assert first.total == second.total
+
+    movements = stock.list_movements(session, actor, product_id=product.id, branch_id=branch.id)
+    correction_movements = [m for m in movements if m.reason == StockMovementReason.ADJUSTMENT]
+    assert len(correction_movements) == 1  # nunca duas compensações pra mesma chave
+
+
+def test_duas_correcoes_diferentes_sao_ambas_permitidas(org_session):
+    """Duas correções com `idempotency_key` DIFERENTES (motivos/deltas
+    genuinamente distintos) continuam sendo duas operações válidas."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    order, branch = _open_order(session, org_id, actor)
+    product = _internal_product(session, actor)
+    _stock_in(session, actor, product.id, branch.id, Decimal("1000"))
+    orders.add_product_item(
+        session, actor, order.id,
+        OrderProductItemCreate(product_id=product.id, quantity=Decimal("180"), item_type=OrderProductItemKind.CONSUMPTION),
+    )
+    closed = _close(session, actor, order)
+    item_id = closed.product_items[0].id
+
+    orders.correct_consumption(
+        session, actor, order.id, item_id,
+        OrderConsumptionCorrection(quantity_delta=Decimal("20"), reason="Primeira correção", idempotency_key=uuid.uuid4()),
+    )
+    orders.correct_consumption(
+        session, actor, order.id, item_id,
+        OrderConsumptionCorrection(quantity_delta=Decimal("-5"), reason="Segunda correção, motivo diferente", idempotency_key=uuid.uuid4()),
+    )
+
+    level_after = stock_level_repo.get(session, org_id, product.id, branch.id).quantity_on_hand
+    assert level_after == Decimal("805")  # 820 - 20 + 5
+
+    movements = stock.list_movements(session, actor, product_id=product.id, branch_id=branch.id)
+    correction_movements = [m for m in movements if m.reason == StockMovementReason.ADJUSTMENT]
+    assert len(correction_movements) == 2  # as duas foram efetivadas, chaves diferentes

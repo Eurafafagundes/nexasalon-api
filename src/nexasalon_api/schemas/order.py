@@ -33,16 +33,19 @@ class OrderObservationUpdate(BaseModel):
     operacional, não financeiro, e continua editável com a comanda
     fechada.
 
-    `expected_observation_updated_at` é OPCIONAL — quando enviado (o
-    frontend sempre manda o timestamp que tinha carregado), protege
-    contra sobrescrita silenciosa: se não bater com o valor atual em
-    banco, o service recusa com 409 em vez de sobrescrever uma edição
-    concorrente de outro usuário. Sem coluna de versão nova — este é o
-    único mecanismo de concorrência para este campo (ver docstring da
+    `expected_observation_version` é OBRIGATÓRIO — o frontend sempre
+    manda a versão que tinha carregado (`0` pra uma comanda cuja
+    observação nunca foi editada). Contador inteiro explícito, nunca
+    timestamp: um timestamp `NULL` inicial não distingue "nunca editada"
+    de "sem controle de versão", o que deixava passar duas primeiras
+    edições concorrentes sem 409 (auditoria "última correção pré-push",
+    item 2) — `0` é um valor real e comparável desde o início. O
+    service recusa com 409 se não bater com o valor atual em banco, e
+    incrementa em 1 a cada edição bem-sucedida (ver docstring da
     migration 0039)."""
 
     observation: str = Field(max_length=4000)
-    expected_observation_updated_at: datetime | None = None
+    expected_observation_version: int = Field(ge=0)
 
 
 class OrderCancel(BaseModel):
@@ -163,10 +166,20 @@ class OrderConsumptionCorrection(BaseModel):
 
     `quantity_delta` positivo = consumo real foi MAIOR que o registrado
     (gera uma saída adicional); negativo = foi MENOR (devolve ao
-    estoque). Nunca zero — não existe "correção" que não corrige nada."""
+    estoque). Nunca zero — não existe "correção" que não corrige nada.
+
+    `idempotency_key` OBRIGATÓRIO (auditoria "última correção
+    pré-push", item 1) — o frontend gera um UUID novo uma vez por
+    TENTATIVA de correção (quando o formulário é aberto, nunca a cada
+    clique) e reenvia a MESMA chave em qualquer retry/double-click; o
+    backend nunca cria uma segunda movimentação compensatória pra uma
+    chave já usada (proteção TRANSACIONAL — índice único parcial em
+    `stock_movements.idempotency_key`, nunca dependente só de um botão
+    desabilitado no frontend)."""
 
     quantity_delta: Decimal = Field(max_digits=12, decimal_places=3)
     reason: str = Field(min_length=3, max_length=500)
+    idempotency_key: uuid.UUID
 
     @field_validator("quantity_delta")
     @classmethod
@@ -308,6 +321,7 @@ class OrderRead(BaseModel):
     observation_updated_at: datetime | None
     observation_updated_by: uuid.UUID | None
     observation_updated_by_name: str | None
+    observation_version: int
     created_at: datetime
     updated_at: datetime
     closed_at: datetime | None
@@ -334,6 +348,7 @@ class OrderRead(BaseModel):
             observation_updated_at=order.observation_updated_at,
             observation_updated_by=order.observation_updated_by,
             observation_updated_by_name=order.observation_updated_by_name,
+            observation_version=order.observation_version,
             created_at=order.created_at,
             updated_at=order.updated_at,
             closed_at=order.closed_at,
@@ -374,6 +389,7 @@ class ClientOrderSummary(BaseModel):
     observation: str | None
     observation_updated_at: datetime | None
     observation_updated_by_name: str | None
+    observation_version: int
     created_at: datetime
     closed_at: datetime | None
 
@@ -406,6 +422,7 @@ class ClientOrderSummary(BaseModel):
             observation=order.observation,
             observation_updated_at=order.observation_updated_at,
             observation_updated_by_name=order.observation_updated_by_name,
+            observation_version=order.observation_version,
             created_at=order.created_at,
             closed_at=order.closed_at,
         )

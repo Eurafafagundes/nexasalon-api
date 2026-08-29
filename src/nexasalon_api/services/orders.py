@@ -67,6 +67,7 @@ from nexasalon_api.repositories import (
     product_repo,
     professional_repo,
     service_repo,
+    stock_movement_repo,
     user_repo,
 )
 from nexasalon_api.schemas.order import (
@@ -341,19 +342,24 @@ def update_observation(
     módulo), que preserva o histórico completo de edições pra quem
     precisar investigar depois, mesmo sem expor isso na UI desta rodada.
 
-    Concorrência: `expected_observation_updated_at` opcional — quando
-    informado e diferente do valor atual em banco, recusa com
-    `ConflictError` (409) em vez de sobrescrever silenciosamente uma
-    edição concorrente de outro usuário."""
+    Concorrência: `expected_observation_version` OBRIGATÓRIO — contador
+    inteiro explícito (nasce em `0`, "nunca editada" é um valor real,
+    nunca `NULL`). Recusa com `ConflictError` (409) sempre que não
+    bater com `order.observation_version` atual, ANTES de qualquer
+    outra decisão (inclusive antes do atalho "nada mudou" logo abaixo)
+    — mesmo quando o texto enviado coincide por acaso com o valor
+    atual, um chamador com versão desatualizada precisa recarregar
+    primeiro. Isto cobre também o caso antes descoberto na auditoria
+    "última correção pré-push": duas edições concorrentes partindo
+    AMBAS de uma observação nunca editada (`version=0`) — a primeira
+    grava e vira `version=1`; a segunda, ainda com `expected=0`, recusa
+    com 409 em vez de sobrescrever silenciosamente (um timestamp `NULL`
+    inicial não distinguia essas duas situações)."""
     organization_id = actor.organization_id
     order = _get_order_for_update_or_404(session, organization_id, order_id)
 
-    if (
-        data.expected_observation_updated_at is not None
-        and order.observation_updated_at is not None
-        and data.expected_observation_updated_at != order.observation_updated_at
-    ):
-        raise ConflictError("Observação foi alterada por outro usuário. Recarregue e tente novamente.")
+    if data.expected_observation_version != order.observation_version:
+        raise ConflictError("Esta observação foi alterada por outra pessoa. Atualize os dados antes de salvar novamente.")
 
     old_observation = order.observation
     # String vazia (ou só espaços) vira `None` — "Nenhuma observação
@@ -372,6 +378,7 @@ def update_observation(
     order.observation_updated_at = now
     order.observation_updated_by = actor.user_id
     order.observation_updated_by_name = actor_user.name if actor_user is not None else None
+    order.observation_version = order.observation_version + 1
     session.flush()
 
     audit_log_repo.create(
@@ -972,9 +979,31 @@ def correct_consumption(
     original (os dois continuam congelados exatamente como ficaram no
     fechamento — ver docstring de `models/order.py::OrderProductItem`):
     gera um movimento COMPENSATÓRIO novo (`reason=ADJUSTMENT`,
-    `order_id` vinculado), preservando o ledger append-only."""
+    `order_id` vinculado), preservando o ledger append-only.
+
+    Idempotência (auditoria "última correção pré-push", item 1) —
+    TRANSACIONAL, nunca só um `disabled` de botão no frontend:
+    `data.idempotency_key` é única por TENTATIVA de correção (o
+    frontend gera uma chave nova ao abrir o formulário, reenvia a MESMA
+    em qualquer retry/double-click). Duas camadas:
+
+      1. Checagem otimista ANTES de tentar criar — se já existe uma
+         `StockMovement` com esta chave, a correção já foi efetivada;
+         devolve o estado atual sem criar nada novo nem duplicar o
+         `AuditLog`.
+      2. `SAVEPOINT` (`session.begin_nested()`) em volta da criação —
+         cobre a corrida REAL entre duas transações concorrentes que
+         passam as duas pela checagem otimista antes de qualquer uma
+         commitar: a que perder a corrida do índice único parcial
+         (`uq_stock_movements_idempotency_key`) recebe `IntegrityError`,
+         tratado aqui como "a outra já corrigiu" — nunca como erro
+         genérico, nunca cria uma segunda compensação.
+
+    A trava de linha da comanda (`_get_order_for_update_or_404`) reforça
+    a mesma garantia transacional já usada em `close_order`/
+    `cancel_order` pra qualquer mutação de comanda."""
     organization_id = actor.organization_id
-    order = _get_order_or_404(session, organization_id, order_id)
+    order = _get_order_for_update_or_404(session, organization_id, order_id)
     if order.status != OrderStatus.CLOSED:
         raise ValidationDomainError("Correção de consumo só se aplica a uma comanda já fechada.")
     item = next((i for i in order.product_items if i.id == item_id), None)
@@ -985,18 +1014,31 @@ def correct_consumption(
     if item.stock_movement_id is None:
         raise ValidationDomainError("Este item ainda não gerou baixa de estoque — nada para corrigir.")
 
+    # Camada 1 — checagem otimista (caminho feliz: nenhuma corrida real).
+    if stock_movement_repo.get_by_idempotency_key(session, organization_id, data.idempotency_key) is not None:
+        return _reload(session, organization_id, order_id)
+
     direction = StockMovementDirection.OUT if data.quantity_delta > 0 else StockMovementDirection.IN
     quantity = abs(data.quantity_delta)
     observation = (
         f"Correção de consumo — Comanda #{order.order_number}, produto '{item.product_name}': {data.reason}"
     )
     try:
-        movement = stock_service.record_consumption_correction(
-            session, actor, product_id=item.product_id, branch_id=order.branch_id, order_id=order.id,
-            quantity=quantity, direction=direction, observation=observation,
-        )
+        with session.begin_nested():
+            movement = stock_service.record_consumption_correction(
+                session, actor, product_id=item.product_id, branch_id=order.branch_id, order_id=order.id,
+                quantity=quantity, direction=direction, observation=observation,
+                idempotency_key=data.idempotency_key,
+            )
     except ValidationDomainError as exc:
         raise ValidationDomainError(f"Não foi possível corrigir o consumo: {exc.message}") from exc
+    except IntegrityError:
+        # Camada 2 — corrida real: outra transação com a MESMA chave
+        # commitou primeiro. Nunca cria uma segunda compensação.
+        existing = stock_movement_repo.get_by_idempotency_key(session, organization_id, data.idempotency_key)
+        if existing is None:
+            raise
+        return _reload(session, organization_id, order_id)
 
     audit_log_repo.create(
         session,
@@ -1011,6 +1053,7 @@ def correct_consumption(
             "quantity_delta": str(data.quantity_delta),
             "reason": data.reason,
             "compensating_stock_movement_id": str(movement.id),
+            "idempotency_key": str(data.idempotency_key),
         },
     )
     return _reload(session, organization_id, order_id)

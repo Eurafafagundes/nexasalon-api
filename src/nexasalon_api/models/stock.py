@@ -64,6 +64,17 @@ class StockMovement(Base, UUIDPKMixin, TimestampMixin):
     inventory_count_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("inventory_counts.id", ondelete="SET NULL")
     )
+    # Idempotência de "correção pós-fechamento" (auditoria "última
+    # correção pré-push", item 1) — nullable, único só quando preenchido
+    # (índice parcial `uq_stock_movements_idempotency_key`, migration
+    # 0039). Só `services/orders.py::correct_consumption` grava aqui
+    # hoje; todo outro fluxo de movimentação continua com `NULL` (que
+    # nunca colide com outro `NULL` num índice único parcial Postgres).
+    # O CLIENTE gera a chave uma vez por TENTATIVA de correção (não por
+    # clique) — um double-click ou retry de rede reenvia a MESMA chave,
+    # e a segunda tentativa de INSERT bate no índice único e nunca cria
+    # uma segunda movimentação compensatória.
+    idempotency_key: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
 
 
 class StockTransfer(Base, UUIDPKMixin, TimestampMixin):
