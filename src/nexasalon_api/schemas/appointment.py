@@ -60,6 +60,21 @@ class AppointmentCustomStatusAssign(BaseModel):
     custom_status_id: uuid.UUID | None = None
 
 
+class AppointmentNotesUpdate(BaseModel):
+    """`PATCH /appointments/{id}/notes` — edição PONTUAL da observação
+    da visita, criada especificamente pra permitir registrar essa
+    observação ANTES da Comanda existir (quando ela existe,
+    `Order.observation` já tem seu próprio endpoint dedicado,
+    `PATCH /orders/{id}/observation`, nunca este). Deliberadamente NÃO
+    reaproveita `AppointmentReplace` (PUT completo, que exige
+    revalidar branch/cliente/TODOS os itens/disponibilidade — desenhado
+    pro fluxo de Reagendar, não pra uma edição pontual de texto livre).
+    `notes=""` (ou só espaços) limpa a observação — mesmo tratamento
+    dado a `Order.observation`."""
+
+    notes: str = Field(default="", max_length=255)
+
+
 class AppointmentStatusUpdate(BaseModel):
     status: AppointmentStatus
     # Etapa I, item "Alteração de status" — quando existem outros

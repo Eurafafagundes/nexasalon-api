@@ -1137,3 +1137,179 @@ def test_editar_preco_com_comanda_fechada_e_bloqueado(org_session):
         session, actor, appt.id, appt.items[0].id, AppointmentItemUpdate(duration_override=90),
     )
     assert moved.items[0].duration_minutes == 90
+
+
+# ---------------------------------------------------------------------
+# PATCH /appointments/{id}/notes — edição pontual, autorizada
+# especificamente pra permitir registrar a observação da visita ANTES
+# da Comanda existir (rodada "Observação da comanda antes da Order").
+# ---------------------------------------------------------------------
+
+
+def test_update_notes_salva_a_observacao(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    assert appt.notes is None
+
+    updated = appointments.update_notes(session, actor, appt.id, "Cliente pediu para usar só 180g de cabelo.")
+
+    assert updated.notes == "Cliente pediu para usar só 180g de cabelo."
+
+
+def test_update_notes_aceita_string_vazia_e_limpa(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id, notes="Observação original.",
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    assert appt.notes == "Observação original."
+
+    updated = appointments.update_notes(session, actor, appt.id, "")
+
+    assert updated.notes is None
+
+
+def test_update_notes_nao_altera_itens_data_status_nem_outros_campos(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    appt.status = AppointmentStatus.CONFIRMED
+    session.flush()
+    original_item_id = appt.items[0].id
+    original_start_at = appt.items[0].start_at
+    original_price = appt.items[0].price
+    original_fit_in = appt.fit_in
+    original_branch_id = appt.branch_id
+    original_client_id = appt.client_id
+
+    updated = appointments.update_notes(session, actor, appt.id, "Só a observação muda.")
+
+    assert len(updated.items) == 1
+    assert updated.items[0].id == original_item_id
+    assert updated.items[0].start_at == original_start_at
+    assert updated.items[0].price == original_price
+    assert updated.status == AppointmentStatus.CONFIRMED
+    assert updated.fit_in == original_fit_in
+    assert updated.branch_id == original_branch_id
+    assert updated.client_id == original_client_id
+
+
+def test_update_notes_registra_auditoria(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+
+    appointments.update_notes(session, actor, appt.id, "Nova observação.")
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == appt.id
+    ).all()
+    notes_logs = [log for log in logs if log.new_values and log.new_values.get("change_type") == "notes_edit"]
+    assert len(notes_logs) == 1
+    assert notes_logs[0].old_values == {"notes": None}
+    assert notes_logs[0].new_values["notes"] == "Nova observação."
+
+
+def test_update_notes_de_outra_organizacao_gera_404(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+
+    other_org_id = uuid.uuid4()
+    session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(other_org_id)})
+    session.add(Organization(id=other_org_id, name="Outra org", slug=f"outra-org-{other_org_id.hex[:8]}"))
+    session.flush()
+    other_actor = _actor(session, other_org_id)
+
+    with pytest.raises(NotFoundError):
+        appointments.update_notes(session, other_actor, appt.id, "Tentativa de outra organização.")
+
+
+def test_update_notes_recusado_para_ator_sem_permissao_de_editar_este_profissional(org_session):
+    """RBAC granular (escopo `agenda_editable_professional_ids`) — o
+    mesmo portão de edição já usado por `update_status`/`set_custom_
+    status`/`update_appointment_item`, reaproveitado aqui sem duplicar
+    lógica (`_assert_can_edit`)."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+
+    other_prof = _professional(session, org_id, branch.id, name="Outro Profissional")
+    restricted = dataclasses.replace(
+        _actor(session, org_id, permissions=frozenset({"agenda.view_own", "agenda.view_all", "agenda.edit"})),
+        agenda_viewable_professional_ids=frozenset({prof.id, other_prof.id}),
+        agenda_editable_professional_ids=frozenset({other_prof.id}),
+    )
+
+    with pytest.raises(ForbiddenError):
+        appointments.update_notes(session, restricted, appt.id, "Tentativa sem permissão de edição.")
+
+
+def test_update_notes_nao_afeta_order_observation_ja_existente(org_session):
+    """Invariante crítica da transição Appointment.notes -> Order.
+    observation: depois que a Order já existe, editar `Appointment.
+    notes` por este endpoint NUNCA deve alterar `Order.observation` —
+    são fontes independentes a partir daquele ponto (nunca sincronizado
+    de volta)."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(
+        session, org_id,
+        permissions=_ALL_AGENDA_PERMS | frozenset({"orders.manage", "orders.view"}),
+    )
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id, notes="Observação original da visita.",
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+    order = orders.create_order(session, actor, appt.id)
+    assert order.observation == "Observação original da visita."
+
+    appointments.update_notes(session, actor, appt.id, "Editado depois que a Order já existia.")
+
+    session.refresh(order)
+    assert order.observation == "Observação original da visita."

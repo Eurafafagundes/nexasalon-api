@@ -10,6 +10,7 @@ from nexasalon_api.schemas.appointment import (
     AppointmentCreate,
     AppointmentCustomStatusAssign,
     AppointmentItemUpdate,
+    AppointmentNotesUpdate,
     AppointmentRead,
     AppointmentRelatedRead,
     AppointmentReplace,
@@ -89,6 +90,21 @@ def get_related_appointments(
         client_name=client.name if client is not None else "Cliente",
         related=[AppointmentRead.model_validate(a) for a in related],
     )
+
+
+@router.patch(
+    "/{appointment_id}/notes",
+    response_model=AppointmentRead,
+    summary="Editar pontualmente a observação da visita (Appointment.notes) — antes da Comanda existir",
+)
+def update_appointment_notes(
+    appointment_id: uuid.UUID,
+    payload: AppointmentNotesUpdate,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_edit),
+) -> AppointmentRead:
+    appointment = appointments_service.update_notes(session, actor, appointment_id, payload.notes)
+    return AppointmentRead.model_validate(appointment)
 
 
 @router.patch(

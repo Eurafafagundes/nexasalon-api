@@ -824,6 +824,38 @@ def _apply_status_change(
         _auto_cancel_order_for_no_show(session, actor, appointment_id)
 
 
+def update_notes(session: Session, actor: ActorContext, appointment_id: uuid.UUID, notes: str) -> Appointment:
+    """PATCH pontual — altera EXCLUSIVAMENTE `Appointment.notes`, sem
+    revalidar serviços/disponibilidade/profissional/data/horário (item
+    explícito do pedido: nunca reaproveitar o PUT completo de
+    `replace_appointment` só pra isto). Existe especificamente pra
+    permitir editar a observação da visita ANTES da Comanda existir —
+    depois que a Order existe, o frontend para de chamar isto e passa a
+    usar exclusivamente `orders.update_observation`/`Order.observation`
+    (este endpoint continua tecnicamente utilizável depois disso, mas
+    deixa de ser a fonte exibida em qualquer lugar — nunca sincronizado
+    de volta pra `Order.observation`, nem o inverso)."""
+    appointment = get_appointment(session, actor, appointment_id)
+    _assert_can_edit(actor, {item.professional_id for item in appointment.items})
+
+    old_notes = appointment.notes
+    new_notes = notes.strip() or None
+    if new_notes == old_notes:
+        return appointment
+
+    appointment.notes = new_notes
+    appointment.updated_by = actor.user_id
+    session.flush()
+
+    audit_log_repo.create(
+        session, organization_id=actor.organization_id, user_id=actor.user_id, entity_type="appointment",
+        entity_id=appointment_id, action=AuditAction.UPDATE,
+        old_values={"notes": old_notes},
+        new_values={"notes": new_notes, "change_type": "notes_edit"},
+    )
+    return _reload(session, actor.organization_id, appointment_id)
+
+
 def update_status(
     session: Session,
     actor: ActorContext,

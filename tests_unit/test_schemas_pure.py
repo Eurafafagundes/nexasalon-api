@@ -10,6 +10,7 @@ from decimal import Decimal
 import pytest
 
 from nexasalon_api.models.enums import OrderProductItemKind
+from nexasalon_api.schemas.appointment import AppointmentNotesUpdate
 from nexasalon_api.schemas.appointment_custom_status import AppointmentCustomStatusCreate
 from nexasalon_api.schemas.order import OrderConsumptionCorrection, OrderProductItemCreate
 
@@ -74,3 +75,25 @@ def test_cor_valida_e_aceita():
 def test_nome_vazio_e_rejeitado():
     with pytest.raises(ValueError):
         AppointmentCustomStatusCreate(name="", color_hex="#8B5CF6")
+
+
+def test_appointment_notes_update_aceita_ate_255_caracteres():
+    """`PATCH /appointments/{id}/notes` — mesmo limite já usado em
+    `AppointmentCreate.notes`, pra continuar compatível com o textarea
+    atual do frontend (contador 0/255)."""
+    data = AppointmentNotesUpdate(notes="x" * 255)
+    assert len(data.notes) == 255
+
+
+def test_appointment_notes_update_rejeita_mais_de_255_caracteres():
+    with pytest.raises(ValueError):
+        AppointmentNotesUpdate(notes="x" * 256)
+
+
+def test_appointment_notes_update_aceita_string_vazia_para_limpar():
+    data = AppointmentNotesUpdate(notes="")
+    assert data.notes == ""
+
+
+def test_appointment_notes_update_default_e_string_vazia():
+    assert AppointmentNotesUpdate().notes == ""
