@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from nexasalon_api.models.enums import StockMovementDirection, StockMovementReason
+from nexasalon_api.models.enums import ProductUnit, StockMovementDirection, StockMovementReason
 
 
 class StockLevelRead(BaseModel):
@@ -50,6 +50,17 @@ class StockMovementCreate(BaseModel):
     direction: StockMovementDirection
     reason: StockMovementReason
     quantity: Decimal = Field(gt=0, max_digits=12, decimal_places=3)
+    # Unidade em que `quantity` foi DIGITADA (item "Estoque — KG/Gramas",
+    # seletor g/kg da tela de Movimentação) — `None` (default) preserva
+    # 100% de compatibilidade com qualquer chamador existente: significa
+    # "quantity já está na unidade cadastrada do produto", nenhuma
+    # conversão acontece. Quando informado e DIFERENTE da unidade do
+    # produto, o backend converte (`core/units.py::convert_quantity`)
+    # ANTES de persistir — autoridade de conversão é sempre o backend,
+    # nunca só o frontend (ver `services/stock.py::record_movement`).
+    # Só aceita unidades do MESMO grupo da unidade do produto (peso↔peso,
+    # volume↔volume); combinação incompatível vira erro de validação.
+    input_unit: ProductUnit | None = None
     unit_cost: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     observation: str | None = Field(default=None, max_length=1000)
 

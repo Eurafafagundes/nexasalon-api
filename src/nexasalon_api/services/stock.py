@@ -15,9 +15,10 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from nexasalon_api.core import units
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.exceptions import NotFoundError, ValidationDomainError
-from nexasalon_api.models.enums import AuditAction, StockMovementDirection, StockMovementReason
+from nexasalon_api.models.enums import AuditAction, ProductUnit, StockMovementDirection, StockMovementReason
 from nexasalon_api.models.product import StockLevel
 from nexasalon_api.models.stock import StockMovement, StockTransfer
 from nexasalon_api.repositories import (
@@ -138,6 +139,27 @@ def _create_movement(
     return movement
 
 
+def resolve_quantity_in_product_unit(
+    session: Session, organization_id: uuid.UUID, product_id: uuid.UUID, quantity: Decimal, input_unit: ProductUnit | None
+) -> Decimal:
+    """Converte `quantity` de `input_unit` pra unidade CADASTRADA do
+    produto (item "Estoque — KG/Gramas") — autoridade de conversão é
+    sempre o backend, nunca só o frontend. `input_unit=None` ou igual à
+    unidade do produto: devolve `quantity` sem tocar (compatibilidade
+    total com qualquer chamador que nunca informou unidade de entrada).
+    Combinação incompatível (ex.: produto em `unit`, `input_unit=gram`)
+    vira `ValidationDomainError` — nunca silenciosamente ignorada."""
+    if input_unit is None:
+        return quantity
+    product = _get_product_or_404(session, organization_id, product_id)
+    if input_unit == product.unit:
+        return quantity
+    try:
+        return units.convert_quantity(quantity, input_unit, product.unit)
+    except ValueError as exc:
+        raise ValidationDomainError(str(exc)) from exc
+
+
 def record_movement(
     session: Session,
     actor: ActorContext,
@@ -147,6 +169,7 @@ def record_movement(
     direction: StockMovementDirection,
     reason: StockMovementReason,
     quantity: Decimal,
+    input_unit: ProductUnit | None = None,
     unit_cost: Decimal | None = None,
     observation: str | None = None,
 ) -> StockMovement:
@@ -161,6 +184,7 @@ def record_movement(
         raise ValidationDomainError(
             f"Motivo '{reason.value}' não pode ser registrado manualmente para esta direção."
         )
+    quantity = resolve_quantity_in_product_unit(session, actor.organization_id, product_id, quantity, input_unit)
     return _create_movement(
         session,
         actor,
@@ -238,6 +262,75 @@ def record_sale_movement(
         reason=StockMovementReason.SALE,
         quantity=quantity,
         unit_cost=unit_cost,
+        observation=observation,
+        order_id=order_id,
+    )
+
+
+def record_internal_use_movement(
+    session: Session,
+    actor: ActorContext,
+    *,
+    product_id: uuid.UUID,
+    branch_id: uuid.UUID,
+    quantity: Decimal,
+    order_id: uuid.UUID,
+    unit_cost: Decimal | None = None,
+    observation: str | None = None,
+) -> StockMovement:
+    """Baixa de estoque gerada pelo FECHAMENTO de uma Comanda pra
+    produto CONSUMIDO internamente durante o serviço (`OrderProductItem.
+    item_type=CONSUMPTION` — migration 0039, item "Comanda → Consumo de
+    estoque"), ex.: cabelo usado numa progressiva. Mesmo mecanismo
+    exato de `record_sale_movement` (mesma idempotência via
+    `stock_movement_id`, mesmo lock, mesma checagem de saldo) — SÓ o
+    `reason` muda (`INTERNAL_USE` em vez de `SALE`), pra o histórico de
+    estoque nunca confundir "vendido à cliente" com "consumido pelo
+    salão" (item explícito "não misturar semântica financeira e de
+    estoque")."""
+    return _create_movement(
+        session,
+        actor,
+        product_id=product_id,
+        branch_id=branch_id,
+        direction=StockMovementDirection.OUT,
+        reason=StockMovementReason.INTERNAL_USE,
+        quantity=quantity,
+        unit_cost=unit_cost,
+        observation=observation,
+        order_id=order_id,
+    )
+
+
+def record_consumption_correction(
+    session: Session,
+    actor: ActorContext,
+    *,
+    product_id: uuid.UUID,
+    branch_id: uuid.UUID,
+    order_id: uuid.UUID,
+    quantity: Decimal,
+    direction: StockMovementDirection,
+    observation: str,
+) -> StockMovement:
+    """Movimento COMPENSATÓRIO pra corrigir um consumo já registrado
+    numa comanda FECHADA (item "Não duplicar baixa" / "correção
+    pós-fechamento") — NUNCA edita/deleta o `StockMovement` original nem
+    o `OrderProductItem` congelado (ledger append-only, mesmo raciocínio
+    de todo o resto deste módulo). `direction=OUT` reduz o saldo mais
+    (consumo real foi MAIOR que o registrado); `direction=IN` devolve
+    saldo (consumo real foi MENOR). `reason=ADJUSTMENT` — mesmo motivo
+    já usado por correções manuais avulsas, aqui com `order_id`
+    preenchido pra rastreabilidade (aparece no histórico de
+    movimentações vinculado à comanda que originou o consumo)."""
+    return _create_movement(
+        session,
+        actor,
+        product_id=product_id,
+        branch_id=branch_id,
+        direction=direction,
+        reason=StockMovementReason.ADJUSTMENT,
+        quantity=quantity,
         observation=observation,
         order_id=order_id,
     )

@@ -59,6 +59,7 @@ def create_stock_movement(
         direction=payload.direction,
         reason=payload.reason,
         quantity=payload.quantity,
+        input_unit=payload.input_unit,
         unit_cost=payload.unit_cost,
         observation=payload.observation,
     )

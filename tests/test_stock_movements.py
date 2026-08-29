@@ -323,3 +323,109 @@ def test_duas_saidas_concorrentes_nunca_deixam_saldo_negativo():
         check.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_id)})
         level = stock_level_repo.get(check, org_id, product_id, branch_id)
         assert level.quantity_on_hand == Decimal("4")  # 10 - 6, nunca negativo
+
+
+# ---------------------------------------------------------------------
+# Estoque por peso — `input_unit` (item "Estoque — KG/Gramas", causa raiz
+# do bug de grama era ambiguidade de separador de milhar no FRONTEND;
+# esta é a contraparte de conversão AUTORITATIVA no backend)
+# ---------------------------------------------------------------------
+
+
+def _weighted_product(session, actor, unit) -> uuid.UUID:
+    from nexasalon_api.models.enums import ProductUnit as _PU
+
+    return products.create_product(
+        session, actor, ProductCreate(name="Cabelo Humano Castanho 65cm", cost_price=Decimal("40.00"), unit=unit)
+    ).id
+
+
+def test_entrada_em_kg_digitada_em_gramas_e_convertida(org_session):
+    from nexasalon_api.models.enums import ProductUnit
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch_id = _branch(session, org_id)
+    product_id = _weighted_product(session, actor, ProductUnit.KG)
+
+    stock.record_movement(
+        session, actor, product_id=product_id, branch_id=branch_id,
+        direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE,
+        quantity=Decimal("1000"), input_unit=ProductUnit.GRAM,
+    )
+
+    level = stock_level_repo.get(session, org_id, product_id, branch_id)
+    assert level.quantity_on_hand == Decimal("1")  # 1000 g digitados = 1 kg persistido (unidade do produto)
+
+
+def test_saida_em_gramas_digitada_em_kg_e_convertida(org_session):
+    from nexasalon_api.models.enums import ProductUnit
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch_id = _branch(session, org_id)
+    product_id = _weighted_product(session, actor, ProductUnit.GRAM)
+    stock.record_movement(
+        session, actor, product_id=product_id, branch_id=branch_id,
+        direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE, quantity=Decimal("1000"),
+    )
+
+    stock.record_movement(
+        session, actor, product_id=product_id, branch_id=branch_id,
+        direction=StockMovementDirection.OUT, reason=StockMovementReason.INTERNAL_USE,
+        quantity=Decimal("0.075"), input_unit=ProductUnit.KG,
+    )
+
+    level = stock_level_repo.get(session, org_id, product_id, branch_id)
+    assert level.quantity_on_hand == Decimal("925")  # 1000 g - 75 g (0,075 kg digitados)
+
+
+def test_input_unit_igual_a_unidade_do_produto_nao_altera_valor(org_session):
+    from nexasalon_api.models.enums import ProductUnit
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch_id = _branch(session, org_id)
+    product_id = _weighted_product(session, actor, ProductUnit.GRAM)
+
+    stock.record_movement(
+        session, actor, product_id=product_id, branch_id=branch_id,
+        direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE,
+        quantity=Decimal("75"), input_unit=ProductUnit.GRAM,
+    )
+    level = stock_level_repo.get(session, org_id, product_id, branch_id)
+    assert level.quantity_on_hand == Decimal("75")
+
+
+def test_input_unit_incompativel_e_rejeitada(org_session):
+    from nexasalon_api.models.enums import ProductUnit
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch_id = _branch(session, org_id)
+    product_id = _weighted_product(session, actor, ProductUnit.KG)
+
+    with pytest.raises(ValidationDomainError):
+        stock.record_movement(
+            session, actor, product_id=product_id, branch_id=branch_id,
+            direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE,
+            quantity=Decimal("1"), input_unit=ProductUnit.ML,  # peso vs volume — incompatível
+        )
+
+
+def test_input_unit_none_preserva_comportamento_original_sem_conversao(org_session):
+    """Compatibilidade — qualquer chamador que nunca soube de
+    `input_unit` continua funcionando exatamente como antes."""
+    from nexasalon_api.models.enums import ProductUnit
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch_id = _branch(session, org_id)
+    product_id = _weighted_product(session, actor, ProductUnit.KG)
+
+    stock.record_movement(
+        session, actor, product_id=product_id, branch_id=branch_id,
+        direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE, quantity=Decimal("2.5"),
+    )
+    level = stock_level_repo.get(session, org_id, product_id, branch_id)
+    assert level.quantity_on_hand == Decimal("2.5")
