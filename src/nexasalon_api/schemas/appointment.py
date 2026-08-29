@@ -51,6 +51,15 @@ class AppointmentReplace(AppointmentCreate):
     os itens). Semântica idempotente, igual a `WorkingHoursReplaceRequest`."""
 
 
+class AppointmentCustomStatusAssign(BaseModel):
+    """`PATCH /appointments/{id}/custom-status` — `None` remove a
+    etiqueta do agendamento (nunca é o mesmo que "sem etiqueta nenhuma
+    ainda existir", só desassocia). Ortogonal a `AppointmentStatusUpdate`
+    — nunca muda `Appointment.status`."""
+
+    custom_status_id: uuid.UUID | None = None
+
+
 class AppointmentStatusUpdate(BaseModel):
     status: AppointmentStatus
     # Etapa I, item "Alteração de status" — quando existem outros
@@ -135,6 +144,7 @@ class AppointmentRead(BaseModel):
     fit_in: bool
     starts_at: datetime | None
     ends_at: datetime | None
+    custom_status_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
     items: list[AppointmentItemRead]

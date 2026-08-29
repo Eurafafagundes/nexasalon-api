@@ -8,6 +8,7 @@ from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.repositories import client_repo
 from nexasalon_api.schemas.appointment import (
     AppointmentCreate,
+    AppointmentCustomStatusAssign,
     AppointmentItemUpdate,
     AppointmentRead,
     AppointmentRelatedRead,
@@ -101,6 +102,22 @@ def update_status(
 ) -> AppointmentRead:
     appointment = appointments_service.update_status(
         session, actor, appointment_id, payload.status, scope=payload.scope
+    )
+    return AppointmentRead.model_validate(appointment)
+
+
+@router.patch(
+    "/{appointment_id}/custom-status", response_model=AppointmentRead,
+    summary="Atribuir/trocar/remover status personalizado do agendamento",
+)
+def set_appointment_custom_status(
+    appointment_id: uuid.UUID,
+    payload: AppointmentCustomStatusAssign,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_edit),
+) -> AppointmentRead:
+    appointment = appointments_service.set_custom_status(
+        session, actor, appointment_id, payload.custom_status_id
     )
     return AppointmentRead.model_validate(appointment)
 

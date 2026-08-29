@@ -29,6 +29,7 @@ from nexasalon_api.models.enums import (
 )
 from nexasalon_api.models.organization import Organization
 from nexasalon_api.repositories import (
+    appointment_custom_status_repo,
     appointment_item_repo,
     appointment_repo,
     audit_log_repo,
@@ -850,6 +851,39 @@ def update_status(
         for related in get_related_appointments(session, actor, appointment_id):
             if related.status in OPERATIONAL_STATUSES and related.status != target_status:
                 _apply_status_change(session, actor, related.id, target_status)
+    return _reload(session, actor.organization_id, appointment_id)
+
+
+def set_custom_status(
+    session: Session, actor: ActorContext, appointment_id: uuid.UUID, custom_status_id: uuid.UUID | None
+) -> Appointment:
+    """Atribui/troca/remove a etiqueta personalizada (migration 0039) —
+    ORTOGONAL a `update_status`: nunca toca `appointment.status`, então
+    reaproveita a mesma permissão `agenda.edit` (mesma fronteira de
+    autorização de qualquer outra edição de agendamento), nunca uma
+    permission nova. `custom_status_id=None` remove a etiqueta."""
+    appointment = get_appointment(session, actor, appointment_id)
+    _assert_can_edit(actor, {item.professional_id for item in appointment.items})
+
+    if custom_status_id is not None:
+        custom_status = appointment_custom_status_repo.get(session, actor.organization_id, custom_status_id)
+        if custom_status is None:
+            raise NotFoundError("Status personalizado não encontrado.")
+
+    old_custom_status_id = appointment.custom_status_id
+    appointment.custom_status_id = custom_status_id
+    appointment.updated_by = actor.user_id
+    session.flush()
+
+    audit_log_repo.create(
+        session, organization_id=actor.organization_id, user_id=actor.user_id, entity_type="appointment",
+        entity_id=appointment_id, action=AuditAction.UPDATE,
+        old_values={"custom_status_id": str(old_custom_status_id) if old_custom_status_id else None},
+        new_values={
+            "custom_status_id": str(custom_status_id) if custom_status_id else None,
+            "change_type": "custom_status_change",
+        },
+    )
     return _reload(session, actor.organization_id, appointment_id)
 
 

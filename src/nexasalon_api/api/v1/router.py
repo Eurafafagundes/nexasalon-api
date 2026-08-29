@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from . import (
     agenda,
+    appointment_custom_statuses,
     appointment_status_styles,
     appointments,
     auth,
@@ -41,6 +42,7 @@ api_v1_router.include_router(roles.router)
 api_v1_router.include_router(agenda.router)
 api_v1_router.include_router(appointments.router)
 api_v1_router.include_router(appointment_status_styles.router)
+api_v1_router.include_router(appointment_custom_statuses.router)
 api_v1_router.include_router(schedule_blocks.router)
 api_v1_router.include_router(orders.router)
 api_v1_router.include_router(cash_registers.router)
