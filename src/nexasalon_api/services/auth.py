@@ -19,6 +19,7 @@ transação):
   - `app.current_org_id`: organização atual (igual ao já usado em
     `api/deps.get_db`).
 """
+
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -46,7 +47,12 @@ from nexasalon_api.core.security import (
 from nexasalon_api.models.enums import MembershipStatus
 from nexasalon_api.models.identity import OrganizationMembership
 from nexasalon_api.models.organization import Organization
-from nexasalon_api.repositories import membership_repo, rbac_repo, refresh_token_repo, user_repo
+from nexasalon_api.repositories import (
+    membership_repo,
+    rbac_repo,
+    refresh_token_repo,
+    user_repo,
+)
 
 
 @contextmanager
@@ -54,7 +60,8 @@ def _session_scoped_to_user(user_id: uuid.UUID) -> Generator[Session, None, None
     session = SessionLocal()
     try:
         session.execute(
-            text("SELECT set_config('app.current_user_id', :uid, true)"), {"uid": str(user_id)}
+            text("SELECT set_config('app.current_user_id', :uid, true)"),
+            {"uid": str(user_id)},
         )
         yield session
         session.commit()
@@ -129,38 +136,37 @@ def _resolve_organization_choices(
     return choices
 
 
-def _issue_session_tokens(
-    *, user_id: uuid.UUID, organization_id: uuid.UUID, membership_id: uuid.UUID
+def issue_session_tokens(
+    session: Session,
+    *,
+    user_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    membership_id: uuid.UUID,
 ) -> SessionTokens:
+    """Persist session tokens in the caller's transaction, without committing."""
     access_token = create_access_token(
         user_id=user_id, organization_id=organization_id, membership_id=membership_id
     )
     raw_refresh = generate_opaque_token()
     now = datetime.now(timezone.utc)
 
-    session = SessionLocal()
-    try:
-        session.execute(
-            text("SELECT set_config('app.current_user_id', :uid, true)"), {"uid": str(user_id)}
-        )
-        session.execute(
-            text("SELECT set_config('app.current_org_id', :oid, true)"), {"oid": str(organization_id)}
-        )
-        refresh_token_repo.create(
-            session,
-            user_id=user_id,
-            organization_id=organization_id,
-            membership_id=membership_id,
-            token_hash=hash_opaque_token(raw_refresh),
-            issued_at=now,
-            expires_at=now + timedelta(days=settings.refresh_token_ttl_days),
-        )
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+    session.execute(
+        text("SELECT set_config('app.current_user_id', :uid, true)"),
+        {"uid": str(user_id)},
+    )
+    session.execute(
+        text("SELECT set_config('app.current_org_id', :oid, true)"),
+        {"oid": str(organization_id)},
+    )
+    refresh_token_repo.create(
+        session,
+        user_id=user_id,
+        organization_id=organization_id,
+        membership_id=membership_id,
+        token_hash=hash_opaque_token(raw_refresh),
+        issued_at=now,
+        expires_at=now + timedelta(days=settings.refresh_token_ttl_days),
+    )
 
     return SessionTokens(
         access_token=access_token,
@@ -170,6 +176,18 @@ def _issue_session_tokens(
     )
 
 
+def _issue_session_tokens(
+    *, user_id: uuid.UUID, organization_id: uuid.UUID, membership_id: uuid.UUID
+) -> SessionTokens:
+    with SessionLocal.begin() as session:
+        return issue_session_tokens(
+            session,
+            user_id=user_id,
+            organization_id=organization_id,
+            membership_id=membership_id,
+        )
+
+
 def login(email: str, password: str) -> LoginResult:
     """Falha de usuário inexistente e falha de senha incorreta retornam a
     MESMA mensagem/erro (`UnauthorizedError` genérico) — não dá pra um
@@ -177,7 +195,11 @@ def login(email: str, password: str) -> LoginResult:
     with SessionLocal() as probe:
         user = user_repo.get_by_email(probe, email)
 
-    if user is None or user.password_hash is None or not verify_password(password, user.password_hash):
+    if (
+        user is None
+        or user.password_hash is None
+        or not verify_password(password, user.password_hash)
+    ):
         raise UnauthorizedError("E-mail ou senha inválidos.")
     if not user.is_active:
         raise UnauthorizedError("E-mail ou senha inválidos.")
@@ -211,11 +233,15 @@ def login(email: str, password: str) -> LoginResult:
     )
 
 
-def select_organization(org_selection_token: str, organization_id: uuid.UUID) -> SessionTokens:
+def select_organization(
+    org_selection_token: str, organization_id: uuid.UUID
+) -> SessionTokens:
     try:
         payload = decode_token(org_selection_token)
     except InvalidTokenError as exc:
-        raise UnauthorizedError("Token de seleção de organização inválido ou expirado.") from exc
+        raise UnauthorizedError(
+            "Token de seleção de organização inválido ou expirado."
+        ) from exc
 
     if payload.get("type") != TokenType.ORG_SELECTION.value:
         raise UnauthorizedError("Token inválido para esta operação.")
@@ -223,7 +249,9 @@ def select_organization(org_selection_token: str, organization_id: uuid.UUID) ->
     user_id = uuid.UUID(payload["sub"])
 
     with _session_scoped_to_user(user_id) as session:
-        membership = membership_repo.get_by_user_and_org(session, user_id, organization_id)
+        membership = membership_repo.get_by_user_and_org(
+            session, user_id, organization_id
+        )
         if membership is None or membership.status != MembershipStatus.ACTIVE:
             raise ForbiddenError("Usuário sem membership ativa nesta organização.")
         membership_id = membership.id
@@ -251,7 +279,9 @@ def refresh(raw_refresh_token: str) -> SessionTokens:
             raise UnauthorizedError("Refresh token inválido.")
 
         if token.revoked_at is not None:
-            revoked_count = refresh_token_repo.revoke_all_for_user(session, token.user_id, now)
+            revoked_count = refresh_token_repo.revoke_all_for_user(
+                session, token.user_id, now
+            )
             session.commit()
             raise UnauthorizedError(
                 f"Refresh token já utilizado. {revoked_count} sessão(ões) revogada(s) por segurança."
@@ -268,10 +298,12 @@ def refresh(raw_refresh_token: str) -> SessionTokens:
         # banco confiável (não de input do cliente) — seguro escopar a
         # sessão com eles para reverificar a membership via RLS normal.
         session.execute(
-            text("SELECT set_config('app.current_user_id', :uid, true)"), {"uid": str(user_id)}
+            text("SELECT set_config('app.current_user_id', :uid, true)"),
+            {"uid": str(user_id)},
         )
         session.execute(
-            text("SELECT set_config('app.current_org_id', :oid, true)"), {"oid": str(organization_id)}
+            text("SELECT set_config('app.current_org_id', :oid, true)"),
+            {"oid": str(organization_id)},
         )
 
         membership = membership_repo.get(session, token.membership_id)
@@ -305,7 +337,9 @@ def refresh(raw_refresh_token: str) -> SessionTokens:
         refresh_token_repo.mark_rotated(session, token, new_token, now)
 
         access_token = create_access_token(
-            user_id=user_id, organization_id=organization_id, membership_id=membership_id
+            user_id=user_id,
+            organization_id=organization_id,
+            membership_id=membership_id,
         )
         session.commit()
     except Exception:
@@ -342,7 +376,9 @@ def logout(raw_refresh_token: str) -> None:
         session.close()
 
 
-def compute_effective_permissions(session: Session, membership: OrganizationMembership) -> frozenset[str]:
+def compute_effective_permissions(
+    session: Session, membership: OrganizationMembership
+) -> frozenset[str]:
     """(permissões do Role) ∪ (overrides GRANT) − (overrides DENY),
     recalculado do zero a cada chamada — nunca cacheado no token, para
     que mudanças de role/override tenham efeito imediato na próxima
@@ -383,7 +419,9 @@ def accept_invite(invite_token: str, password: str) -> SessionTokens:
         if membership is None or membership.user_id != user_id:
             raise UnauthorizedError("Convite inválido.")
         if membership.status != MembershipStatus.INVITED:
-            raise ForbiddenError("Este convite já foi utilizado ou não está mais pendente.")
+            raise ForbiddenError(
+                "Este convite já foi utilizado ou não está mais pendente."
+            )
 
         user = user_repo.get(session, user_id)
         if user is None:
@@ -397,7 +435,9 @@ def accept_invite(invite_token: str, password: str) -> SessionTokens:
 
         organization_id = membership.organization_id
 
-    return _issue_session_tokens(user_id=user_id, organization_id=organization_id, membership_id=membership_id)
+    return _issue_session_tokens(
+        user_id=user_id, organization_id=organization_id, membership_id=membership_id
+    )
 
 
 def reset_password(reset_token: str, password: str) -> SessionTokens:
@@ -425,8 +465,13 @@ def reset_password(reset_token: str, password: str) -> SessionTokens:
         membership = membership_repo.get(session, membership_id)
         if membership is None or membership.user_id != user_id:
             raise UnauthorizedError("Link de redefinição inválido.")
-        if membership.status not in (MembershipStatus.ACTIVE, MembershipStatus.SUSPENDED):
-            raise ForbiddenError("Esta membership não está mais disponível para redefinição de senha.")
+        if membership.status not in (
+            MembershipStatus.ACTIVE,
+            MembershipStatus.SUSPENDED,
+        ):
+            raise ForbiddenError(
+                "Esta membership não está mais disponível para redefinição de senha."
+            )
 
         user = user_repo.get(session, user_id)
         if user is None:
@@ -443,9 +488,13 @@ def reset_password(reset_token: str, password: str) -> SessionTokens:
     # `_get_real_current_actor`) — não faz sentido devolver uma sessão
     # que o próximo request derrubaria de qualquer forma.
     if membership_status != MembershipStatus.ACTIVE:
-        raise ForbiddenError("Senha redefinida, mas o acesso desta membership está suspenso.")
+        raise ForbiddenError(
+            "Senha redefinida, mas o acesso desta membership está suspenso."
+        )
 
-    return _issue_session_tokens(user_id=user_id, organization_id=organization_id, membership_id=membership_id)
+    return _issue_session_tokens(
+        user_id=user_id, organization_id=organization_id, membership_id=membership_id
+    )
 
 
 def list_my_organizations(user_id: uuid.UUID) -> list[OrganizationChoice]:

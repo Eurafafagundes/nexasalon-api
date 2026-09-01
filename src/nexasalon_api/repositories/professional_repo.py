@@ -1,14 +1,17 @@
 import uuid
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from nexasalon_api.models.professional import Professional
 
 
-def get(session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID) -> Professional | None:
+def get(
+    session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID
+) -> Professional | None:
     stmt = select(Professional).where(
-        Professional.id == professional_id, Professional.organization_id == organization_id
+        Professional.id == professional_id,
+        Professional.organization_id == organization_id,
     )
     return session.scalars(stmt).first()
 
@@ -16,10 +19,26 @@ def get(session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID
 def list_all(
     session: Session, organization_id: uuid.UUID, include_inactive: bool = False
 ) -> list[Professional]:
-    stmt = select(Professional).where(Professional.organization_id == organization_id).order_by(Professional.name)
+    stmt = (
+        select(Professional)
+        .where(Professional.organization_id == organization_id)
+        .order_by(Professional.name)
+    )
     if not include_inactive:
         stmt = stmt.where(Professional.is_active.is_(True))
     return list(session.scalars(stmt).all())
+
+
+def count_all(session: Session, organization_id: uuid.UUID) -> int:
+    """Conta todos os profissionais, inclusive inativos.
+
+    Desativar um cadastro não libera uma vaga do trial silenciosamente;
+    o limite representa profissionais cadastrados no tenant.
+    """
+    stmt = select(func.count(Professional.id)).where(
+        Professional.organization_id == organization_id
+    )
+    return int(session.scalar(stmt) or 0)
 
 
 def list_by_ids(
@@ -33,7 +52,8 @@ def list_by_ids(
     if not professional_ids:
         return []
     stmt = select(Professional).where(
-        Professional.organization_id == organization_id, Professional.id.in_(professional_ids)
+        Professional.organization_id == organization_id,
+        Professional.id.in_(professional_ids),
     )
     return list(session.scalars(stmt).all())
 
@@ -50,7 +70,9 @@ def save(session: Session, professional: Professional) -> Professional:
     return professional
 
 
-def get_by_user(session: Session, organization_id: uuid.UUID, user_id: uuid.UUID) -> Professional | None:
+def get_by_user(
+    session: Session, organization_id: uuid.UUID, user_id: uuid.UUID
+) -> Professional | None:
     stmt = select(Professional).where(
         Professional.organization_id == organization_id, Professional.user_id == user_id
     )
@@ -71,16 +93,15 @@ def list_schedule_columns(
     unidade quanto quem atende em qualquer unidade (`branch_id IS NULL`
     no Professional — mesma convenção usada na validação de
     agendamento, ver `services/appointments.py`)."""
-    stmt = (
-        select(Professional)
-        .where(
-            Professional.organization_id == organization_id,
-            Professional.is_active.is_(True),
-            Professional.has_schedule.is_(True),
-            Professional.show_on_main_schedule.is_(True),
-        )
+    stmt = select(Professional).where(
+        Professional.organization_id == organization_id,
+        Professional.is_active.is_(True),
+        Professional.has_schedule.is_(True),
+        Professional.show_on_main_schedule.is_(True),
     )
     if branch_id is not None:
-        stmt = stmt.where(or_(Professional.branch_id.is_(None), Professional.branch_id == branch_id))
+        stmt = stmt.where(
+            or_(Professional.branch_id.is_(None), Professional.branch_id == branch_id)
+        )
     stmt = stmt.order_by(Professional.display_order, Professional.name)
     return list(session.scalars(stmt).all())

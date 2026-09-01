@@ -25,12 +25,14 @@ from . import (
     schedule_blocks,
     service_categories,
     services,
+    signup,
     stock,
     users,
 )
 
 api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(auth.router)
+api_v1_router.include_router(signup.router)
 api_v1_router.include_router(organizations.router)
 api_v1_router.include_router(branches.router)
 api_v1_router.include_router(professionals.router)

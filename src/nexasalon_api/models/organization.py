@@ -1,9 +1,10 @@
 import uuid
-from datetime import time
+from datetime import datetime, time
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
+    DateTime,
     ForeignKey,
     Integer,
     SmallInteger,
@@ -77,6 +78,12 @@ class Organization(Base, UUIDPKMixin, TimestampMixin):
         nullable=False,
         server_default=OrganizationStatus.TRIAL.value,
     )
+    # Signup público: datas explícitas permitem evoluir para assinatura
+    # sem inferir trial por created_at. NULL preserva organizações antigas;
+    # professional_limit NULL significa sem limite configurado.
+    trial_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    professional_limit: Mapped[int | None] = mapped_column(Integer)
 
     # --- Etapa D: campos novos ---
     legal_name: Mapped[str | None] = mapped_column(String(255))

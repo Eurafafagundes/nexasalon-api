@@ -341,6 +341,16 @@ def rate_limit_login(request: Request) -> None:
     )
 
 
+def rate_limit_signup(request: Request) -> None:
+    if not settings.rate_limit_enabled:
+        return
+    rate_limiter.hit(
+        f"signup:{_client_ip(request)}",
+        max_attempts=settings.rate_limit_signup_max_attempts,
+        window_seconds=settings.rate_limit_signup_window_seconds,
+    )
+
+
 def rate_limit_refresh(request: Request) -> None:
     if not settings.rate_limit_enabled:
         return

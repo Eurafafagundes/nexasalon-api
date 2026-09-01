@@ -177,6 +177,8 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
     rate_limit_login_max_attempts: int = 10
     rate_limit_login_window_seconds: int = 300
+    rate_limit_signup_max_attempts: int = 5
+    rate_limit_signup_window_seconds: int = 3600
     rate_limit_refresh_max_attempts: int = 30
     rate_limit_refresh_window_seconds: int = 300
     rate_limit_select_organization_max_attempts: int = 20

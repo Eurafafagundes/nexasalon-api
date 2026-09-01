@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -9,7 +10,8 @@ from nexasalon_api.core.storage import (
     require_storage_backend,
     validate_professional_photo_upload,
 )
-from nexasalon_api.models.enums import AuditAction
+from nexasalon_api.models.enums import AuditAction, OrganizationStatus
+from nexasalon_api.models.organization import Organization
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.service import ProfessionalService
 from nexasalon_api.repositories import (
@@ -28,7 +30,9 @@ from nexasalon_api.schemas.professional import (
 )
 
 
-def _assert_branch_in_org(session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID | None) -> None:
+def _assert_branch_in_org(
+    session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID | None
+) -> None:
     """Branch deve pertencer à mesma organização do profissional."""
     if branch_id is None:
         return
@@ -42,7 +46,9 @@ def list_professionals(
     return professional_repo.list_all(session, organization_id, include_inactive)
 
 
-def get_professional(session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID) -> Professional:
+def get_professional(
+    session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID
+) -> Professional:
     professional = professional_repo.get(session, organization_id, professional_id)
     if professional is None:
         raise NotFoundError("Profissional não encontrado.")
@@ -52,12 +58,32 @@ def get_professional(session: Session, organization_id: uuid.UUID, professional_
 def create_professional(
     session: Session, organization_id: uuid.UUID, data: ProfessionalCreate
 ) -> Professional:
+    # Serializa criações concorrentes do mesmo tenant. Sem o lock, duas
+    # requisições simultâneas poderiam observar count=2 e ambas criar a
+    # quarta vaga, furando o limite garantido pelo backend.
+    organization = session.get(Organization, organization_id, with_for_update=True)
+    if organization is None:
+        raise NotFoundError("Organização não encontrada.")
+    trial_is_active = (
+        organization.status == OrganizationStatus.TRIAL
+        and organization.trial_ends_at is not None
+        and organization.trial_ends_at > datetime.now(timezone.utc)
+    )
+    if trial_is_active and organization.professional_limit is not None:
+        current_count = professional_repo.count_all(session, organization_id)
+        if current_count >= organization.professional_limit:
+            raise ValidationDomainError(
+                f"O período de teste permite no máximo {organization.professional_limit} profissionais."
+            )
     _assert_branch_in_org(session, organization_id, data.branch_id)
     return professional_repo.create(session, organization_id, **data.model_dump())
 
 
 def update_professional(
-    session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID, data: ProfessionalUpdate
+    session: Session,
+    organization_id: uuid.UUID,
+    professional_id: uuid.UUID,
+    data: ProfessionalUpdate,
 ) -> Professional:
     professional = get_professional(session, organization_id, professional_id)
     _assert_branch_in_org(session, organization_id, data.branch_id)
@@ -84,7 +110,9 @@ def upload_professional_photo(
     antigo no bucket não é apagado — ver docstring de
     `build_professional_photo_key`)."""
     professional = get_professional(session, organization_id, professional_id)
-    validate_professional_photo_upload(content_type=content_type, size_bytes=len(content))
+    validate_professional_photo_upload(
+        content_type=content_type, size_bytes=len(content)
+    )
     backend = require_storage_backend(storage)
     key = build_professional_photo_key(professional_id, content_type)  # type: ignore[arg-type]
     photo_url = backend.upload(key=key, content=content, content_type=content_type)  # type: ignore[arg-type]
@@ -93,7 +121,10 @@ def upload_professional_photo(
 
 
 def set_professional_active(
-    session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID, is_active: bool
+    session: Session,
+    organization_id: uuid.UUID,
+    professional_id: uuid.UUID,
+    is_active: bool,
 ) -> Professional:
     """Desativar não apaga o profissional nem seu histórico de
     atendimentos/comissões (FK é RESTRICT, não CASCADE)."""
@@ -105,23 +136,34 @@ def set_professional_active(
 def list_working_hours(
     session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID
 ) -> list[WorkingHours]:
-    get_professional(session, organization_id, professional_id)  # 404 se não existir/for de outra org
-    return working_hours_repo.list_for_professional(session, organization_id, professional_id)
+    get_professional(
+        session, organization_id, professional_id
+    )  # 404 se não existir/for de outra org
+    return working_hours_repo.list_for_professional(
+        session, organization_id, professional_id
+    )
 
 
 def replace_working_hours(
-    session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID, items: list[WorkingHourItem]
+    session: Session,
+    organization_id: uuid.UUID,
+    professional_id: uuid.UUID,
+    items: list[WorkingHourItem],
 ) -> list[WorkingHours]:
     get_professional(session, organization_id, professional_id)
     payload = [item.model_dump() for item in items]
-    return working_hours_repo.replace_all(session, organization_id, professional_id, payload)
+    return working_hours_repo.replace_all(
+        session, organization_id, professional_id, payload
+    )
 
 
 def list_professional_services(
     session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID
 ) -> list[ProfessionalService]:
     get_professional(session, organization_id, professional_id)
-    return professional_service_repo.list_for_professional(session, organization_id, professional_id)
+    return professional_service_repo.list_for_professional(
+        session, organization_id, professional_id
+    )
 
 
 def replace_professional_services(
@@ -142,7 +184,9 @@ def replace_professional_services(
     # comissão), por serviço — nunca um log genérico "algo mudou".
     before_by_service = {
         row.service_id: row
-        for row in professional_service_repo.list_for_professional(session, organization_id, professional_id)
+        for row in professional_service_repo.list_for_professional(
+            session, organization_id, professional_id
+        )
     }
 
     payload = []
@@ -156,7 +200,9 @@ def replace_professional_services(
             )
         payload.append(item.model_dump())
 
-    result = professional_service_repo.replace_all(session, organization_id, professional_id, payload)
+    result = professional_service_repo.replace_all(
+        session, organization_id, professional_id, payload
+    )
 
     for row in result:
         prior = before_by_service.get(row.service_id)
@@ -172,14 +218,20 @@ def replace_professional_services(
             entity_id=row.id,
             action=AuditAction.CREATE if prior is None else AuditAction.UPDATE,
             old_values={
-                "professional_id": str(professional_id), "service_id": str(row.service_id),
+                "professional_id": str(professional_id),
+                "service_id": str(row.service_id),
                 "commission_type": old_type.value if old_type is not None else None,
                 "commission_value": str(old_value) if old_value is not None else None,
             },
             new_values={
-                "professional_id": str(professional_id), "service_id": str(row.service_id),
-                "commission_type": row.commission_type.value if row.commission_type is not None else None,
-                "commission_value": str(row.commission_value) if row.commission_value is not None else None,
+                "professional_id": str(professional_id),
+                "service_id": str(row.service_id),
+                "commission_type": row.commission_type.value
+                if row.commission_type is not None
+                else None,
+                "commission_value": str(row.commission_value)
+                if row.commission_value is not None
+                else None,
             },
         )
 
