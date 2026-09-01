@@ -16,15 +16,27 @@ def get_by_email(session: Session, email: str) -> User | None:
     return session.scalars(stmt).first()
 
 
+def get_by_cpf(session: Session, cpf: str) -> User | None:
+    stmt = select(User).where(User.cpf == cpf)
+    return session.scalars(stmt).first()
+
+
 def create(
     session: Session,
     *,
     email: str,
     name: str,
+    cpf: str | None = None,
     password_hash: str | None = None,
     phone: str | None = None,
 ) -> User:
-    user = User(email=email.lower(), name=name, password_hash=password_hash, phone=phone)
+    user = User(
+        email=email.lower(),
+        name=name,
+        cpf=cpf,
+        password_hash=password_hash,
+        phone=phone,
+    )
     session.add(user)
     session.flush()
     return user

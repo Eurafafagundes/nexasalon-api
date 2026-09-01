@@ -1,7 +1,15 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -15,8 +23,17 @@ class User(Base, UUIDPKMixin, TimestampMixin):
     """
 
     __tablename__ = "users"
+    __table_args__ = (
+        Index(
+            "uq_users_cpf_not_null",
+            "cpf",
+            unique=True,
+            postgresql_where=text("cpf IS NOT NULL"),
+        ),
+    )
 
     email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    cpf: Mapped[str | None] = mapped_column(String(11))
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     phone: Mapped[str | None] = mapped_column(String(32))
     avatar_url: Mapped[str | None] = mapped_column(String(500))
@@ -24,9 +41,13 @@ class User(Base, UUIDPKMixin, TimestampMixin):
     password_hash: Mapped[str | None] = mapped_column(String(255))
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
 
-    memberships: Mapped[list["OrganizationMembership"]] = relationship(back_populates="user")
+    memberships: Mapped[list["OrganizationMembership"]] = relationship(
+        back_populates="user"
+    )
 
 
 class OrganizationMembership(Base, UUIDPKMixin, TimestampMixin):
@@ -47,7 +68,9 @@ class OrganizationMembership(Base, UUIDPKMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
     organization_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="RESTRICT"), nullable=False
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="RESTRICT"),
+        nullable=False,
     )
     role_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("roles.id", ondelete="RESTRICT"), nullable=False
@@ -121,4 +144,6 @@ class MembershipPermissionOverride(Base):
         nullable=False,
     )
 
-    membership: Mapped["OrganizationMembership"] = relationship(back_populates="permission_overrides")
+    membership: Mapped["OrganizationMembership"] = relationship(
+        back_populates="permission_overrides"
+    )

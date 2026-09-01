@@ -22,6 +22,8 @@ from nexasalon_api.services import auth as auth_service
 
 TRIAL_DAYS = 14
 TRIAL_PROFESSIONAL_LIMIT = 3
+EMAIL_CONFLICT_MESSAGE = "Já existe uma conta com este e-mail."
+CPF_CONFLICT_MESSAGE = "Este CPF já possui uma conta no NexaSalon."
 
 
 @dataclass(frozen=True)
@@ -50,7 +52,9 @@ def create_account(payload: SignupRequest) -> SignupResult:
                 {"oid": str(organization_id)},
             )
             if user_repo.get_by_email(session, str(payload.email)) is not None:
-                raise ConflictError("Este e-mail já está cadastrado.")
+                raise ConflictError(EMAIL_CONFLICT_MESSAGE)
+            if user_repo.get_by_cpf(session, payload.cpf) is not None:
+                raise ConflictError(CPF_CONFLICT_MESSAGE)
 
             owner_role = rbac_repo.get_system_role_by_name(session, "OWNER")
             if owner_role is None:
@@ -84,6 +88,7 @@ def create_account(payload: SignupRequest) -> SignupResult:
                 session,
                 email=str(payload.email),
                 name=payload.full_name,
+                cpf=payload.cpf,
                 phone=payload.phone,
                 password_hash=hash_password(payload.password),
             )
@@ -109,9 +114,14 @@ def create_account(payload: SignupRequest) -> SignupResult:
             raise
         except IntegrityError as exc:
             session.rollback()
-            # A única unicidade controlada pelo cliente é o e-mail. O slug
-            # recebe sufixo aleatório do servidor e colisão é desprezível.
-            raise ConflictError("Este e-mail já está cadastrado.") from exc
+            constraint_name = getattr(
+                getattr(exc.orig, "diag", None), "constraint_name", None
+            )
+            if constraint_name == "uq_users_cpf_not_null":
+                raise ConflictError(CPF_CONFLICT_MESSAGE) from exc
+            if constraint_name == "uq_users_email":
+                raise ConflictError(EMAIL_CONFLICT_MESSAGE) from exc
+            raise
         except Exception:
             session.rollback()
             raise

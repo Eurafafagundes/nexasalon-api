@@ -2,7 +2,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
-from nexasalon_api.core.normalize import normalize_phone
+from nexasalon_api.core.normalize import is_valid_cpf, normalize_cpf, normalize_phone
 from nexasalon_api.models.enums import BrazilianState
 from nexasalon_api.schemas.auth import TokenPairRead
 
@@ -22,6 +22,7 @@ class SignupRequest(BaseModel):
 
     full_name: str = Field(min_length=2, max_length=255)
     email: EmailStr
+    cpf: str = Field(min_length=11, max_length=14)
     phone: str = Field(min_length=8, max_length=32)
     password: str = Field(min_length=8, max_length=128)
     business_name: str = Field(min_length=2, max_length=255)
@@ -44,6 +45,14 @@ class SignupRequest(BaseModel):
         normalized = normalize_phone(value)
         if len(normalized) not in (10, 11):
             raise ValueError("Informe um telefone brasileiro válido com DDD.")
+        return normalized
+
+    @field_validator("cpf")
+    @classmethod
+    def normalize_and_validate_cpf(cls, value: str) -> str:
+        normalized = normalize_cpf(value)
+        if not is_valid_cpf(normalized):
+            raise ValueError("Informe um CPF válido.")
         return normalized
 
 

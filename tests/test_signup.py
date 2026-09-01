@@ -28,10 +28,11 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-def _payload(email: str | None = None) -> dict:
+def _payload(email: str | None = None, cpf: str = "111.444.777-35") -> dict:
     return {
         "full_name": "Mariana Costa",
         "email": email or f"signup-{uuid.uuid4().hex[:10]}@example.com",
+        "cpf": cpf,
         "phone": "11999999999",
         "password": "SenhaSegura123!",
         "business_name": "Studio Mariana",
@@ -42,8 +43,10 @@ def _payload(email: str | None = None) -> dict:
     }
 
 
-def _signup(client: TestClient, email: str | None = None) -> tuple[dict, dict]:
-    payload = _payload(email)
+def _signup(
+    client: TestClient, email: str | None = None, cpf: str = "111.444.777-35"
+) -> tuple[dict, dict]:
+    payload = _payload(email, cpf)
     response = client.post("/api/v1/signup", json=payload)
     assert response.status_code == 201, response.text
     return payload, response.json()["tokens"]
@@ -81,6 +84,7 @@ def test_signup_cria_tenant_owner_branch_trial_e_sessao(client):
         assert membership.role.name == "OWNER"
         assert membership.professional is None
         assert professional_count == 0
+        assert membership.user.cpf == "11144477735"
 
     me = client.get(
         "/api/v1/auth/me", headers={"Authorization": f"Bearer {tokens['access_token']}"}
@@ -94,7 +98,48 @@ def test_signup_rejeita_email_duplicado(client):
     _signup(client, email)
     response = client.post("/api/v1/signup", json=_payload(email))
     assert response.status_code == 409
-    assert response.json()["error"]["message"] == "Este e-mail já está cadastrado."
+    assert response.json()["error"]["message"] == "Já existe uma conta com este e-mail."
+
+
+def test_signup_aceita_cpf_valido_formatado_e_armazena_so_digitos(client):
+    _payload_data, tokens = _signup(client)
+    membership_id = uuid.UUID(tokens["membership_id"])
+    organization_id = uuid.UUID(tokens["organization_id"])
+
+    with SessionLocal() as session:
+        session.execute(
+            text("SELECT set_config('app.current_org_id', :oid, true)"),
+            {"oid": str(organization_id)},
+        )
+        membership = session.get(OrganizationMembership, membership_id)
+        assert membership is not None
+        assert membership.user.cpf == "11144477735"
+
+
+def test_signup_rejeita_cpf_invalido_sem_criar_conta(client):
+    payload = _payload()
+    payload["cpf"] = "123.456.789-00"
+    response = client.post("/api/v1/signup", json=payload)
+
+    assert response.status_code == 422
+    assert "Informe um CPF válido." in response.text
+    with SessionLocal() as session:
+        from nexasalon_api.repositories import user_repo
+
+        assert user_repo.get_by_email(session, payload["email"]) is None
+
+
+def test_signup_rejeita_cpf_duplicado_sem_expor_usuario(client):
+    _signup(client)
+    payload = _payload()
+    response = client.post("/api/v1/signup", json=payload)
+
+    assert response.status_code == 409
+    assert response.json()["error"] == {
+        "type": "conflict",
+        "message": "Este CPF já possui uma conta no NexaSalon.",
+        "details": None,
+    }
 
 
 def test_signup_nao_aceita_role_tenant_permissions_ou_trial_do_payload(client):
@@ -130,7 +175,7 @@ def test_trial_permite_tres_profissionais_e_rejeita_o_quarto(client):
 
 def test_limite_de_profissionais_e_isolado_por_tenant(client):
     _one, tokens_a = _signup(client)
-    _two, tokens_b = _signup(client)
+    _two, tokens_b = _signup(client, cpf="529.982.247-25")
     headers_a = {"Authorization": f"Bearer {tokens_a['access_token']}"}
     headers_b = {"Authorization": f"Bearer {tokens_b['access_token']}"}
 
@@ -173,9 +218,21 @@ def test_signup_faz_rollback_se_a_emissao_da_sessao_falhar(monkeypatch):
 
     payload = _payload()
 
+    created_organization_id = None
+    real_create_organization = signup_service.organization_repo.create
+
+    def capture_organization(*args, **kwargs):
+        nonlocal created_organization_id
+        organization = real_create_organization(*args, **kwargs)
+        created_organization_id = organization.id
+        return organization
+
     def fail_session(*args, **kwargs):
         raise RuntimeError("falha ao emitir sessão")
 
+    monkeypatch.setattr(
+        signup_service.organization_repo, "create", capture_organization
+    )
     monkeypatch.setattr(
         signup_service.auth_service, "issue_session_tokens", fail_session
     )
@@ -186,6 +243,27 @@ def test_signup_faz_rollback_se_a_emissao_da_sessao_falhar(monkeypatch):
 
     with SessionLocal() as session:
         assert signup_service.user_repo.get_by_email(session, payload["email"]) is None
+        assert created_organization_id is not None
+        session.execute(
+            text("SELECT set_config('app.current_org_id', :oid, true)"),
+            {"oid": str(created_organization_id)},
+        )
+        assert session.get(Organization, created_organization_id) is None
+
+
+def test_usuarios_antigos_sem_cpf_continuam_validos():
+    from nexasalon_api.repositories import user_repo
+
+    suffix = uuid.uuid4().hex[:10]
+    with SessionLocal.begin() as session:
+        first = user_repo.create(
+            session, email=f"legacy-a-{suffix}@example.com", name="Legado A"
+        )
+        second = user_repo.create(
+            session, email=f"legacy-b-{suffix}@example.com", name="Legado B"
+        )
+        assert first.cpf is None
+        assert second.cpf is None
 
 
 def test_trial_expirado_nao_bloqueia_novo_profissional(client):
