@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
-from nexasalon_api.api.deps import get_db, require_any_permission, require_permission
+from nexasalon_api.api.deps import get_db, require_permission, require_role
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.models.enums import OrderStatus
 from nexasalon_api.schemas.order import (
@@ -28,19 +28,26 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 _view = require_permission("orders.view")
 _manage = require_permission("orders.manage")
 _edit_price = require_permission("orders.edit_price")
-# Bug real corrigido: registrar pagamento e fechar a comanda são parte do
-# fluxo OPERACIONAL normal de quem já gerencia a comanda (adiciona/remove
-# item, decide o que vai na conta) — nunca deveria exigir, à parte, uma
-# permission de módulo separado (`payments`) que a própria UI de Equipe
-# e acessos (`ManageAccessDrawer`) nem expõe como toggle (só "Visualizar"
-# e "Gerenciar" de Comandas). Mesmo raciocínio já usado por
-# `professionals.py::_view_professional_services`. `payments.register`
-# continua existindo e sendo suficiente sozinho (MASTER/OWNER/ADMIN/
-# RECEPTIONIST já a têm por padrão) — só ganhou uma alternativa
-# equivalente via `orders.manage`, nunca o inverso: isto NÃO concede
-# nada do módulo Financeiro (`finance.view`/`finance.manage`), que
-# continua inteiramente fora do escopo desta permission.
-_register_payment = require_any_permission("payments.register", "orders.manage")
+# Decisão de produto: confirmar pagamento é restrito por ROLE, não por
+# permission — só OWNER ("Master") e RECEPTIONIST ("Recepcionista")
+# podem fechar comanda com pagamento, mesmo que outro perfil tenha
+# `orders.manage`/`payments.register` concedidos (ex.: via override
+# customizado em Equipe e acessos). Substitui a rodada anterior, que
+# aceitava `orders.manage` como alternativa a `payments.register` —
+# aquilo abria exatamente a brecha que esta regra fecha (qualquer role
+# customizado com "Comandas → Gerenciar" conseguia pagar). `orders.view`/
+# `orders.manage`/`orders.edit_price`/`orders.cancel` continuam
+# permission-based, sem mudança — só o fechamento com pagamento vira
+# role-based. Não concede nada do módulo Financeiro
+# (`finance.view`/`finance.manage` seguem suas próprias permissions).
+_register_payment = require_role(
+    "OWNER",
+    "RECEPTIONIST",
+    message=(
+        "Seu perfil de acesso não permite confirmar pagamentos. "
+        "Apenas Master e Recepcionista podem realizar esta ação."
+    ),
+)
 _cancel = require_permission("orders.cancel")
 
 # Produto na comanda reaproveita as MESMAS fronteiras de autorização de

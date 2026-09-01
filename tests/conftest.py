@@ -96,12 +96,23 @@ def seed_organization(name: str, slug: str) -> ActorContext:
     membership) e devolve o ActorContext correspondente — usado pra
     simular uma segunda empresa nos testes de isolamento multi-tenant.
 
-    O role "Owner" fabricado aqui recebe TODAS as permissions do catálogo
+    O role "OWNER" fabricado aqui recebe TODAS as permissions do catálogo
     (mesmo truque do "Dev Owner" em `core/dev_auth.py`) — desde que as
     rotas da Etapa 2C passaram a exigir `require_permission` (Etapa 2D),
     um `ActorContext` sem permissões apanharia 403 em tudo. Estes testes
     continuam validando regra de negócio/isolamento multi-tenant, não
-    RBAC — RBAC tem cobertura própria em `test_auth.py`."""
+    RBAC — RBAC tem cobertura própria em `test_auth.py`.
+
+    `role_name` usa exatamente `"OWNER"` (maiúsculas, igual ao valor
+    real de produção — migration 0007) — não mais `"Owner"`. Bug real
+    corrigido: nada checava `role_name` pra autorização até
+    `orders.py::_register_payment` (`require_role`, decisão "só OWNER/
+    RECEPTIONIST confirmam pagamento"), então a inconsistência de caixa
+    era só cosmética; virou funcional no instante em que o primeiro
+    `require_role` do projeto passou a existir. Renomear aqui é seguro
+    (nenhum teste em toda a suíte compara `role_name` contra `"Owner"`
+    — só usa como rótulo de fixture) e evita quebrar todo teste HTTP
+    que fecha comanda usando `org_a_actor`/`org_b_actor` diretamente."""
     org_id, user_id, role_id, membership_id = (uuid.uuid4() for _ in range(4))
     with SessionLocal() as session:
         session.execute(text("SELECT set_config('app.current_org_id', :oid, true)"), {"oid": str(org_id)})
@@ -109,7 +120,7 @@ def seed_organization(name: str, slug: str) -> ActorContext:
         session.flush()
         session.add(User(id=user_id, email=f"{slug}@nexasalon.local", name=f"Usuário {name}"))
         session.flush()
-        session.add(Role(id=role_id, organization_id=org_id, name="Owner", is_system=False))
+        session.add(Role(id=role_id, organization_id=org_id, name="OWNER", is_system=False))
         session.flush()
         all_keys = list(session.scalars(text("SELECT key FROM permissions")).all())
         for key in all_keys:
@@ -130,7 +141,7 @@ def seed_organization(name: str, slug: str) -> ActorContext:
         user_id=user_id,
         membership_id=membership_id,
         role_id=role_id,
-        role_name="Owner",
+        role_name="OWNER",
         permissions=frozenset(all_keys),
     )
 

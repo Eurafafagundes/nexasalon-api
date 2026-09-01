@@ -16,18 +16,26 @@ from nexasalon_api.models.identity import User
 _START_A = "2026-08-13T14:00:00-03:00"  # quinta-feira
 
 
-def _restricted_actor(base_actor: ActorContext, *, permissions) -> ActorContext:
+def _restricted_actor(base_actor: ActorContext, *, permissions, role_name: str = "Restrito") -> ActorContext:
+    """`role_name` opcional — necessário pra testar `require_role`
+    (`orders.py::_register_payment`), que checa o NOME do role, não uma
+    permission. Os valores reais de sistema são exatamente
+    `"OWNER"`/`"ADMIN"`/`"RECEPTIONIST"`/`"PROFESSIONAL"` (maiúsculas,
+    migration 0007) — note que a fixture `org_a_actor` (conftest.py)
+    usa `role_name="Owner"` (fixture de teste só, não é o valor real de
+    produção), por isso não serve pra testar `require_role` diretamente;
+    use este helper com `role_name="OWNER"` explícito quando precisar."""
     with SessionLocal() as session:
         session.execute(
             text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(base_actor.organization_id)}
         )
-        user = User(email=f"restrito-{uuid.uuid4().hex[:8]}@nexasalon.local", name="Usuário Restrito")
+        user = User(email=f"restrito-{uuid.uuid4().hex[:8]}@nexasalon.local", name=f"Usuário {role_name}")
         session.add(user)
         session.commit()
         user_id = user.id
     return ActorContext(
         organization_id=base_actor.organization_id, user_id=user_id, membership_id=uuid.uuid4(),
-        role_id=uuid.uuid4(), role_name="Restrito", permissions=frozenset(permissions),
+        role_id=uuid.uuid4(), role_name=role_name, permissions=frozenset(permissions),
     )
 
 
@@ -162,13 +170,13 @@ def test_permissao_orders_edit_price_e_exigida(client_as, org_a_actor):
     assert resp.status_code == 403
 
 
-def test_permissao_payments_register_ou_orders_manage_e_exigida_para_fechar(client_as, org_a_actor):
-    """Bug real corrigido: fechar a comanda (registrar pagamento) é
-    parte do fluxo operacional de quem já GERENCIA a comanda — a UI de
-    Equipe e acessos só expõe "Comandas → Visualizar/Gerenciar", sem
-    nenhum jeito de conceder `payments.register` separadamente. Só
-    `orders.view` (sem `orders.manage` nem `payments.register`) continua
-    barrado; `orders.manage` sozinho já basta (ver teste abaixo)."""
+def test_role_generico_sem_permissao_nenhuma_e_bloqueado_no_fechamento(client_as, org_a_actor):
+    """Checagem básica da dependency `require_role` na rota: um ator
+    com role qualquer (nem OWNER nem RECEPTIONIST) e sem nenhuma
+    permission — o caso mais simples de bloqueio. Cobertura completa
+    da regra (`OWNER`/`RECEPTIONIST` passam, qualquer outro role
+    bloqueia mesmo com `orders.manage`/`payments.register`) está no
+    bloco de testes de "Decisão de produto" mais abaixo."""
     c = client_as(org_a_actor)
     appt = _setup_finished_appointment(c)
     _open_register_for(c, appt["branch_id"])
@@ -231,11 +239,15 @@ def test_isolamento_multi_tenant_comanda_nao_vaza_entre_organizacoes(client_as, 
 
 
 # ---------------------------------------------------------------------
-# Bug real corrigido: "Comandas → Gerenciar" (`orders.manage`) deve
-# bastar pra todo o fluxo operacional normal da comanda, inclusive
-# registrar pagamento e finalizar — sem exigir a permission separada
-# `payments.register` (que a UI de Equipe e acessos não expõe) e sem
-# conceder nada do módulo Financeiro (`finance.view`/`finance.manage`).
+# Decisão de produto: confirmar pagamento (fechar comanda) é restrito
+# por ROLE, não por permission — só OWNER ("Master") e RECEPTIONIST
+# ("Recepcionista"), mesmo que outro perfil tenha `orders.manage`/
+# `payments.register` concedidos (ex.: via override customizado em
+# Equipe e acessos). Substitui a regra permission-based da rodada
+# anterior (que aceitava `orders.manage` como alternativa a
+# `payments.register` — reaberta aqui porque permitia exatamente o que
+# esta regra proíbe: qualquer perfil customizado com "Comandas →
+# Gerenciar" conseguia pagar).
 # ---------------------------------------------------------------------
 
 
@@ -246,7 +258,13 @@ def _open_order_ready_to_close(c):
     return order, register
 
 
-def test_master_pode_fechar_comanda_com_pagamento(client_as, org_a_actor):
+def test_master_role_owner_pode_fechar_comanda_com_pagamento(client_as, org_a_actor):
+    """`org_a_actor` (fixture de `conftest.py`) já usa `role_name="OWNER"`
+    (maiúsculas, igual à migration 0007 — bug real corrigido: era
+    `"Owner"`, inofensivo até agora porque nada checava `role_name` pra
+    autorização; ajustado em `conftest.py::seed_organization` junto com
+    esta correção, senão TODO teste HTTP que fecha comanda via
+    `org_a_actor` diretamente quebraria)."""
     c = client_as(org_a_actor)
     order, register = _open_order_ready_to_close(c)
 
@@ -258,28 +276,17 @@ def test_master_pode_fechar_comanda_com_pagamento(client_as, org_a_actor):
     assert resp.json()["status"] == "closed"
 
 
-def test_funcionario_com_orders_manage_consegue_registrar_pagamento_e_fechar(client_as, org_a_actor):
-    """O cenário real relatado: um funcionário com "Comandas → Visualizar
-    e Gerenciar" marcado em Equipe e acessos (`orders.view` +
-    `orders.manage`, sem `payments.register` — a UI nem tem esse
-    toggle, e sem NENHUMA permission de Agenda) deve conseguir fechar a
-    comanda normalmente.
+def test_recepcionista_role_receptionist_pode_fechar_comanda_com_pagamento(client_as, org_a_actor):
+    """O cenário real pedido: role RECEPTIONIST ("Recepcionista") — sem
+    nenhuma permission (o gate agora ignora `actor.permissions`
+    totalmente pra esta ação) — confirma pagamento normalmente."""
+    master_setup = client_as(org_a_actor)
+    order, register = _open_order_ready_to_close(master_setup)
 
-    Bug real corrigido nesta rodada: `close_order` promove o Appointment
-    pra `paid` via `appointments.mark_paid`, que usava `get_appointment`
-    (escopo de VISIBILIDADE de Agenda — `agenda.view_all`/`view_own`)
-    pra um efeito colateral interno já autorizado pela dependency HTTP
-    deste endpoint. `mark_paid` agora lê o agendamento direto via
-    `appointment_repo.get` (org-scoped, sem escopo de Agenda) — este
-    teste teria falhado com 404 antes dessa correção, mesmo com
-    `orders.manage` presente."""
-    master = client_as(org_a_actor)
-    order, register = _open_order_ready_to_close(master)
+    recepcionista_actor = _restricted_actor(org_a_actor, permissions=set(), role_name="RECEPTIONIST")
+    recepcionista = client_as(recepcionista_actor)
 
-    funcionario_actor = _restricted_actor(org_a_actor, permissions={"orders.view", "orders.manage"})
-    funcionario = client_as(funcionario_actor)
-
-    resp = funcionario.post(
+    resp = recepcionista.post(
         f"/api/v1/orders/{order['id']}/close",
         json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": register["id"]}]},
     )
@@ -287,12 +294,9 @@ def test_funcionario_com_orders_manage_consegue_registrar_pagamento_e_fechar(cli
     assert resp.json()["status"] == "closed"
 
 
-def test_funcionario_com_orders_manage_fecha_consolidado_sem_permissao_de_agenda(client_as, org_a_actor):
-    """Mesmo cenário do teste acima, agora em `close-consolidated`
-    (`orders.py::close_orders_consolidated` também chama `mark_paid` —
-    linha 959) — duas comandas da MESMA cliente, MESMO dia, ambas
-    fechadas juntas por um funcionário sem nenhuma permission de
-    Agenda."""
+def test_recepcionista_fecha_consolidado_tambem(client_as, org_a_actor):
+    """Mesma regra em `close-consolidated`
+    (`orders.py::close_orders_consolidated` usa a mesma dependency)."""
     master = client_as(org_a_actor)
     appt1 = _setup_finished_appointment(master)
     client_id = appt1["client_id"]
@@ -303,10 +307,10 @@ def test_funcionario_com_orders_manage_fecha_consolidado_sem_permissao_de_agenda
     order2 = master.post("/api/v1/orders", json={"appointment_id": appt2["id"]}).json()
     total = str(float(order1["total"]) + float(order2["total"]))
 
-    funcionario_actor = _restricted_actor(org_a_actor, permissions={"orders.view", "orders.manage"})
-    funcionario = client_as(funcionario_actor)
+    recepcionista_actor = _restricted_actor(org_a_actor, permissions=set(), role_name="RECEPTIONIST")
+    recepcionista = client_as(recepcionista_actor)
 
-    resp = funcionario.post(
+    resp = recepcionista.post(
         f"/api/v1/orders/{order1['id']}/close-consolidated",
         json={
             "order_ids": [order1["id"], order2["id"]],
@@ -319,42 +323,56 @@ def test_funcionario_com_orders_manage_fecha_consolidado_sem_permissao_de_agenda
     assert statuses[order2["id"]] == "closed"
 
 
-def test_funcionario_so_com_orders_view_nao_consegue_registrar_pagamento(client_as, org_a_actor):
-    """Só VISUALIZAR a comanda não é GERENCIAR — continua barrado,
-    mesmo sem nenhuma permission de Agenda em jogo (isola a variável:
-    o bloqueio é por faltar `orders.manage`/`payments.register`)."""
+def test_profissional_nao_consegue_registrar_pagamento(client_as, org_a_actor):
+    """Role PROFESSIONAL — mesmo com `orders.view`+`orders.manage`
+    concedidos (consegue visualizar/gerenciar a comanda normalmente),
+    não pode confirmar pagamento."""
     master = client_as(org_a_actor)
     order, register = _open_order_ready_to_close(master)
 
-    view_only_actor = _restricted_actor(org_a_actor, permissions={"orders.view"})
-    view_only = client_as(view_only_actor)
+    profissional_actor = _restricted_actor(
+        org_a_actor, permissions={"orders.view", "orders.manage"}, role_name="PROFESSIONAL"
+    )
+    profissional = client_as(profissional_actor)
 
-    resp = view_only.post(
+    resp = profissional.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": register["id"]}]},
+    )
+    assert resp.status_code == 403, resp.text
+    assert "Apenas Master e Recepcionista" in resp.json()["error"]["message"]
+
+
+def test_outro_perfil_customizado_com_orders_manage_e_payments_register_continua_bloqueado(
+    client_as, org_a_actor
+):
+    """Bug real corrigido: um perfil CUSTOMIZADO (não é literalmente
+    OWNER nem RECEPTIONIST) com `orders.manage` E `payments.register`
+    concedidos — exatamente o que a correção da rodada anterior
+    permitia — agora continua bloqueado. O gate é 100% pelo NOME do
+    role, nenhuma combinação de permission contorna."""
+    master = client_as(org_a_actor)
+    order, register = _open_order_ready_to_close(master)
+
+    outro_perfil_actor = _restricted_actor(
+        org_a_actor,
+        permissions={"orders.view", "orders.manage", "payments.register"},
+        role_name="Atendente Personalizado",
+    )
+    outro_perfil = client_as(outro_perfil_actor)
+
+    resp = outro_perfil.post(
         f"/api/v1/orders/{order['id']}/close",
         json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": register["id"]}]},
     )
     assert resp.status_code == 403, resp.text
 
 
-def test_usuario_sem_nenhuma_permissao_de_comandas_continua_bloqueado(client_as, org_a_actor):
-    master = client_as(org_a_actor)
-    order, register = _open_order_ready_to_close(master)
-
-    sem_acesso_actor = _restricted_actor(org_a_actor, permissions={"clients.view", "finance.view"})
-    sem_acesso = client_as(sem_acesso_actor)
-
-    resp = sem_acesso.post(
-        f"/api/v1/orders/{order['id']}/close",
-        json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": register["id"]}]},
-    )
-    assert resp.status_code == 403, resp.text
-
-
-def test_outro_tenant_nao_fecha_comanda_mesmo_com_orders_manage(client_as, org_a_actor, org_b_actor):
-    """Isolamento por Organization é ortogonal à permissão — um ator de
-    outra org com `orders.manage` completo (via `org_b_actor`, que tem
-    TODAS as permissions) nunca deve conseguir fechar uma comanda que
-    pertence a outra organização."""
+def test_outro_tenant_nao_fecha_comanda_mesmo_sendo_role_owner(client_as, org_a_actor, org_b_actor):
+    """Isolamento por Organization é ortogonal ao role — `org_b_actor`
+    também é role OWNER (a mesma fixture corrigida), mas de OUTRA
+    organização, e nunca deve conseguir fechar uma comanda que pertence
+    à organização de `org_a_actor`."""
     c_a = client_as(org_a_actor)
     order, register = _open_order_ready_to_close(c_a)
 
@@ -367,11 +385,13 @@ def test_outro_tenant_nao_fecha_comanda_mesmo_com_orders_manage(client_as, org_a
 
 
 def test_orders_manage_nao_concede_acesso_ao_modulo_financeiro(client_as, org_a_actor):
-    """A correção afrouxa só o FECHAMENTO da comanda (`payments.register`
-    OU `orders.manage`). `finance.view`/`finance.manage` (Extrato, Caixa,
-    configuração de taxas) continuam exigindo suas próprias permissions —
-    nunca satisfeitas por `orders.manage`."""
-    funcionario_actor = _restricted_actor(org_a_actor, permissions={"orders.view", "orders.manage"})
+    """`orders.manage` (mesmo sozinho, ou combinado com um role qualquer)
+    nunca satisfaz `finance.view`/`finance.manage` (Extrato, Caixa,
+    configuração de taxas) — módulos inteiramente independentes desta
+    regra."""
+    funcionario_actor = _restricted_actor(
+        org_a_actor, permissions={"orders.view", "orders.manage"}, role_name="Atendente Personalizado"
+    )
     funcionario = client_as(funcionario_actor)
 
     extrato_resp = funcionario.get("/api/v1/extract")
