@@ -89,11 +89,34 @@ class ProfessionalServiceItem(BaseModel):
         return self
 
 
-class ProfessionalServiceRead(ProfessionalServiceItem):
+class ProfessionalServiceRead(BaseModel):
+    """NÃO herda de `ProfessionalServiceItem` de propósito (bug real
+    corrigido). `ProfessionalServiceItem` carrega validação de ESCRITA
+    (`gt=0`, `ge=0`, `max_digits`/`decimal_places`, e o
+    `@model_validator` que exige `commission_type`/`commission_value`
+    preenchidos juntos) — correta para aceitar/rejeitar um payload novo,
+    mas nada no banco IMPEDE uma linha antiga violar essas mesmas regras
+    (`commission_type`/`commission_value` são colunas independentes, sem
+    CHECK constraint). Como `ProfessionalServiceRead` reaproveitava o
+    mesmo model_validator via herança, `GET /professionals/{id}/services`
+    quebrava (erro de validação Pydantic) ao tentar servializar QUALQUER
+    linha nessa condição — o profissional aparecia com "não foi possível
+    carregar os serviços" mesmo tendo vínculos reais, porque um único
+    registro inconsistente derrubava a lista inteira. Leitura precisa ser
+    tolerante a dado histórico; só a escrita (`ProfessionalServiceItem`,
+    usado em `ProfessionalServicesReplaceRequest`) deve continuar
+    estrita — isso não muda aqui."""
+
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     professional_id: uuid.UUID
+    service_id: uuid.UUID
+    is_active: bool
+    duration_override_minutes: int | None = None
+    price_override: Decimal | None = None
+    commission_type: CommissionType | None = None
+    commission_value: Decimal | None = None
 
 
 class ProfessionalServicesReplaceRequest(BaseModel):

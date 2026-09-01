@@ -14,8 +14,26 @@ tabela global).
 não presta mais este serviço" reconhecida em todo o resto do domínio
 (ver `test_dynamic_catalog.py::test_professional_service_inativo_impede_agendamento`)
 — a C1 só corrige o FRONTEND, que hoje remove a linha inteira em vez de
-usar essa flag já suportada pelo backend."""
+usar essa flag já suportada pelo backend.
+
+Bug real corrigido (rodada seguinte): `GET /professionals/{id}/services`
+e `GET /services/{id}/professionals` quebravam com 500 se alguma linha
+já existente no banco tivesse `commission_type` preenchido e
+`commission_value` nulo (ou vice-versa) — nada no banco IMPEDE essa
+combinação (colunas independentes, sem CHECK constraint); só a
+validação de ESCRITA (`ProfessionalServiceItem`, testada acima) barra
+isso num payload NOVO. `ProfessionalServiceRead` reaproveitava essa
+mesma validação também na LEITURA (herdava de `ProfessionalServiceItem`),
+então uma única linha antiga nessa condição derrubava a lista inteira —
+o profissional aparecia com "não foi possível carregar os serviços"
+mesmo tendo vínculos reais. Ver `test_get_tolera_linha_com_comissao_inconsistente`
+abaixo, que insere a linha inconsistente DIRETO no banco (bypassando a
+API, que corretamente rejeitaria isso num POST/PUT) pra provar que a
+LEITURA agora é tolerante."""
 import uuid
+
+from nexasalon_api.core.db import SessionLocal
+from nexasalon_api.models.service import ProfessionalService
 
 
 def _create_branch(c, name="Matriz"):
@@ -240,3 +258,47 @@ def test_profissionais_diferentes_tem_comissao_diferente_no_mesmo_servico(client
     duda_rows = c.get(f"/api/v1/professionals/{duda['id']}/services").json()
     assert ianka_rows[0]["commission_value"] == "20.00"
     assert duda_rows[0]["commission_value"] == "25.00"
+
+
+# ---------------------------------------------------------------------
+# Leitura tolera dado histórico inconsistente (bug real corrigido)
+# ---------------------------------------------------------------------
+
+
+def test_get_tolera_linha_com_comissao_inconsistente(client_as, org_a_actor):
+    """Insere DIRETO no banco (nunca via API — o POST/PUT corretamente
+    rejeitaria isto com 422, já coberto acima) uma linha com
+    `commission_type` preenchido e `commission_value` nulo — combinação
+    que nada no banco impede numa linha antiga/legada. Antes da correção,
+    `GET /professionals/{id}/services` e `GET /services/{id}/professionals`
+    quebravam com 500 ao tentar montar essa linha; agora devem devolver
+    normalmente, com os valores reais (mesmo inconsistentes) — leitura
+    nunca deve derrubar a lista inteira por causa de UMA linha ruim."""
+    c = client_as(org_a_actor)
+    branch = _create_branch(c)
+    prof = _create_professional(c, "Jhon", branch["id"])
+    servico = _create_service(c, "Corte")
+
+    with SessionLocal() as session:
+        session.add(
+            ProfessionalService(
+                professional_id=uuid.UUID(prof["id"]),
+                service_id=uuid.UUID(servico["id"]),
+                is_active=True,
+                commission_type="percentage",
+                commission_value=None,
+            )
+        )
+        session.commit()
+
+    resp = c.get(f"/api/v1/professionals/{prof['id']}/services")
+    assert resp.status_code == 200, resp.text
+    rows = resp.json()
+    assert len(rows) == 1
+    assert rows[0]["is_active"] is True
+    assert rows[0]["commission_type"] == "percentage"
+    assert rows[0]["commission_value"] is None
+
+    resp2 = c.get(f"/api/v1/services/{servico['id']}/professionals")
+    assert resp2.status_code == 200, resp2.text
+    assert len(resp2.json()) == 1
