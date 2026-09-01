@@ -938,13 +938,34 @@ def set_custom_status(
 
 def mark_paid(session: Session, actor: ActorContext, appointment_id: uuid.UUID) -> Appointment:
     """Promove pra `PAID` — chamado SÓ por `services/orders.py::close_order`
-    ao registrar o pagamento que fecha a Comanda, nunca pelo PATCH
-    genérico de status (item "não misture status operacional com
-    status financeiro"). Funciona a partir de QUALQUER status
-    operacional — a Comanda não exige ter passado por `FINISHED` antes
-    (item "não condicione a Comanda a ter passado por todos os
-    status")."""
-    appointment = get_appointment(session, actor, appointment_id)
+    (e `close_orders_consolidated`) ao registrar o pagamento que fecha a
+    Comanda, nunca pelo PATCH genérico de status (item "não misture
+    status operacional com status financeiro"). Funciona a partir de
+    QUALQUER status operacional — a Comanda não exige ter passado por
+    `FINISHED` antes (item "não condicione a Comanda a ter passado por
+    todos os status").
+
+    Bug real corrigido: usava `get_appointment` (escopo de VISIBILIDADE
+    de Agenda — `agenda.view_all`/`agenda.view_own`/escopo granular),
+    fazendo um funcionário com `orders.manage`/`payments.register` mas
+    sem nenhuma permission de Agenda levar 404 ("Agendamento não
+    encontrado", mensagem enganosa — o agendamento existe) ao tentar
+    fechar uma comanda que já estava autorizado a fechar pela dependency
+    HTTP. Este é o ÚNICO ponto de entrada de `mark_paid` no sistema
+    inteiro (nunca uma ação autônoma do usuário) — quem chega aqui já
+    foi autorizado a fechar ESTA comanda especificamente; exigir de novo
+    visibilidade de Agenda pra um efeito colateral interno (promover o
+    status do Appointment vinculado) era uma dependência desnecessária
+    entre módulos que deveriam ser independentes. Troca pra
+    `appointment_repo.get` (mesmo padrão de `_reload` neste arquivo) —
+    preserva isolamento por `organization_id` e 404 real quando o
+    agendamento não existe/é de outra organização, só não reaplica o
+    escopo de visibilidade de Agenda. `get_appointment` em si (usada por
+    `GET /appointments/{id}` e por toda outra mutação de agendamento)
+    continua 100% protegida — não foi tocada."""
+    appointment = appointment_repo.get(session, actor.organization_id, appointment_id)
+    if appointment is None:
+        raise NotFoundError("Agendamento não encontrado.")
     old_status = appointment.status
     new_status = _mark_paid_transition(old_status)
     appointment.status = new_status

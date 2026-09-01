@@ -413,6 +413,19 @@ def test_fechar_comanda_com_pix_marca_paga_e_promove_agendamento_pra_paid(org_se
     assert appt.status == AppointmentStatus.PAID
 
 
+def test_mark_paid_com_appointment_inexistente_continua_404(org_session):
+    """Bug real corrigido: `mark_paid` trocou `get_appointment`
+    (escopo de visibilidade de Agenda) por `appointment_repo.get`
+    direto (org-scoped) — isolamento por organização e o 404 real pra
+    agendamento inexistente/de outra org precisam continuar intactos,
+    só a checagem de VISIBILIDADE de Agenda que foi removida daqui."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+
+    with pytest.raises(NotFoundError):
+        appointments.mark_paid(session, actor, uuid.uuid4())
+
+
 def test_fechar_comanda_com_credito_exige_bandeira(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)
