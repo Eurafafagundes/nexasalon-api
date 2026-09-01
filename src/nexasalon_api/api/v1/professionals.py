@@ -3,7 +3,7 @@ import uuid
 from fastapi import APIRouter, Depends, File, UploadFile, status
 from sqlalchemy.orm import Session
 
-from nexasalon_api.api.deps import get_db, require_permission
+from nexasalon_api.api.deps import get_db, require_any_permission, require_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.storage import StorageBackend, get_storage_backend
 from nexasalon_api.schemas.professional import (
@@ -21,6 +21,20 @@ router = APIRouter(prefix="/professionals", tags=["professionals"])
 
 _view = require_permission("professionals.view")
 _manage = require_permission("professionals.manage")
+# Bug real corrigido: consultar quais serviços um profissional executa é
+# uma necessidade OPERACIONAL de quem monta um agendamento (Novo
+# Agendamento na Agenda), não uma necessidade de administrar o cadastro
+# de Profissionais — mesmo raciocínio já usado por `services.py::_lookup`
+# (migration 0030: "acesso ao módulo != uso operacional do dado"). Sem
+# isto, um funcionário criado em Configurações → Equipe e acessos com
+# `agenda.create`/`agenda.edit` (consegue abrir a Agenda e criar
+# agendamentos normalmente) mas sem `professionals.view` — a própria UI
+# de Equipe e acessos nem expõe um jeito de conceder essa permissão —
+# ficava bloqueado só nesta leitura. Só a LEITURA de vínculos afrouxa;
+# `_manage` (criar/editar/desativar profissional, jornada, vínculos de
+# serviço) continua exigindo `professionals.manage` sem alternativa
+# nenhuma — nunca concedido por `agenda.*`.
+_view_professional_services = require_any_permission("professionals.view", "agenda.create", "agenda.edit")
 
 
 @router.get("", response_model=list[ProfessionalRead], summary="Listar profissionais")
@@ -157,7 +171,7 @@ def replace_working_hours(
 def list_professional_services(
     professional_id: uuid.UUID,
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(_view),
+    actor: ActorContext = Depends(_view_professional_services),
 ) -> list[ProfessionalServiceRead]:
     rows = professionals_service.list_professional_services(session, actor.organization_id, professional_id)
     return [ProfessionalServiceRead.model_validate(r) for r in rows]
