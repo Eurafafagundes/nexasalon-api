@@ -3,14 +3,28 @@ import uuid
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
-from nexasalon_api.api.deps import get_db, require_permission
+from nexasalon_api.api.deps import get_db, require_any_permission, require_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.schemas.branch import BranchCreate, BranchRead, BranchUpdate
 from nexasalon_api.services import branches as branches_service
 
 router = APIRouter(prefix="/branches", tags=["branches"])
 
-_view = require_permission("branches.view")
+# Leitura (listar/detalhar) aceita `branches.view` (administrativo, tela
+# de Configurações) OU `agenda.view_own`/`agenda.view_all` — "Unidades"
+# saiu da UX (produto é uma organização com uma Matriz interna única),
+# mas a Agenda e o detalhe de agendamento ainda precisam LER a Branch
+# pra resolver janela de horas/granularidade/timezone da grade
+# (`agenda_view_start`/`agenda_view_end`/`agenda_slot_minutes`) e o
+# endereço exibido no card do agendamento. Sem isto, qualquer ator com
+# só `agenda.view_own`/`agenda.view_all` (ex.: Recepcionista, ou um role
+# customizado) tomava 403 aqui, a Agenda silenciosamente ficava sem
+# nenhuma Branch carregada e a grade caía no estado "Estabelecimento não
+# configurado" mesmo com a Branch corretamente cadastrada — bug real,
+# não hipotético. Escrita (criar/editar/ativar/desativar) continua
+# EXCLUSIVA de `branches.manage` (`_manage`, inalterado) — nunca
+# concedida por `agenda.view_*`.
+_view = require_any_permission("branches.view", "agenda.view_own", "agenda.view_all")
 _manage = require_permission("branches.manage")
 
 
