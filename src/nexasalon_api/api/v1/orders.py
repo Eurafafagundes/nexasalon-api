@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
-from nexasalon_api.api.deps import get_db, require_permission, require_role
+from nexasalon_api.api.deps import get_db, require_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.models.enums import OrderStatus
 from nexasalon_api.schemas.order import (
@@ -28,26 +28,17 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 _view = require_permission("orders.view")
 _manage = require_permission("orders.manage")
 _edit_price = require_permission("orders.edit_price")
-# Decisão de produto: confirmar pagamento é restrito por ROLE, não por
-# permission — só OWNER ("Usuário Master") e RECEPTIONIST ("Recepcionista")
-# podem fechar comanda com pagamento, mesmo que outro perfil tenha
-# `orders.manage`/`payments.register` concedidos (ex.: via override
-# customizado em Equipe e acessos). Substitui a rodada anterior, que
-# aceitava `orders.manage` como alternativa a `payments.register` —
-# aquilo abria exatamente a brecha que esta regra fecha (qualquer role
-# customizado com "Comandas → Gerenciar" conseguia pagar). `orders.view`/
-# `orders.manage`/`orders.edit_price`/`orders.cancel` continuam
-# permission-based, sem mudança — só o fechamento com pagamento vira
-# role-based. Não concede nada do módulo Financeiro
-# (`finance.view`/`finance.manage` seguem suas próprias permissions).
-_register_payment = require_role(
-    "OWNER",
-    "RECEPTIONIST",
-    message=(
-        "Seu perfil de acesso não permite confirmar pagamentos. "
-        "Apenas Usuário Master e Recepcionista podem realizar esta ação."
-    ),
-)
+# Decisão de produto (3 níveis de acesso a Comandas — "Visualizar" /
+# "Criar e editar" / "Finalizar comandas e pagamentos"): finalizar é
+# de novo PERMISSION-based, reaproveitando `payments.register`
+# (migration 0013 — já concedida por padrão a OWNER/ADMIN/RECEPTIONIST,
+# mesmo texto "registrar pagamento(s) e fechar a comanda" que se
+# precisaria pra uma chave nova; nenhuma duplicação). Reverte a rodada
+# anterior (`require_role("OWNER", "RECEPTIONIST")`), que virou role-
+# based por engano — o pedido real sempre foi RBAC granular: qualquer
+# perfil customizado pode receber "Finalizar" explicitamente (ver
+# `ManageAccessDrawer`), não só os dois roles de sistema.
+_register_payment = require_permission("payments.register")
 _cancel = require_permission("orders.cancel")
 
 # Produto na comanda reaproveita as MESMAS fronteiras de autorização de

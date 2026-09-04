@@ -269,36 +269,6 @@ def require_any_permission(*permission_keys: str):
     return _dependency
 
 
-def require_role(*role_names: str, message: str | None = None):
-    """Dependency factory de autorização por NOME DO ROLE da membership —
-    nunca por permission. Reservada a ações de negócio deliberadamente
-    restritas a papéis específicos, onde nenhuma combinação de
-    permission/override deveria conseguir contornar a regra (ex.:
-    confirmar pagamento de comanda — decisão de produto: só OWNER/
-    RECEPTIONIST, mesmo que um role customizado tenha `orders.manage`/
-    `payments.register` concedidos). `actor.role_name` vem de
-    `Role.name` (nunca de um override de permission), então uma
-    organização não consegue burlar isto criando um role customizado
-    com as permissions "certas" — só os NOMES aqui listados passam.
-
-    Uso:
-
-        @router.post("/orders/{order_id}/close")
-        def close_order(
-            ...,
-            actor: ActorContext = Depends(require_role("OWNER", "RECEPTIONIST")),
-        ): ...
-    """
-    allowed = frozenset(role_names)
-
-    def _dependency(actor: ActorContext = Depends(get_current_actor)) -> ActorContext:
-        if actor.role_name not in allowed:
-            raise ForbiddenError(message or "Seu perfil de acesso não permite esta ação.")
-        return actor
-
-    return _dependency
-
-
 def _client_ip(request: Request) -> str:
     """IP do cliente para as chaves de rate limiting (`login:<ip>` etc.).
 

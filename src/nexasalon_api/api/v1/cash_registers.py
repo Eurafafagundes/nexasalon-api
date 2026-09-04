@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
-from nexasalon_api.api.deps import get_db, require_permission
+from nexasalon_api.api.deps import get_db, require_any_permission, require_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.models.enums import CashRegisterStatus
 from nexasalon_api.schemas.cash_register import (
@@ -26,6 +26,17 @@ router = APIRouter(prefix="/cash-registers", tags=["cash-registers"])
 # duplicar conceito que o projeto já tinha, só nunca tinha usado.
 _view = require_permission("finance.view")
 _manage = require_permission("finance.manage")
+# Decisão de produto: "Finalizar comandas e pagamentos" (`payments.
+# register`) precisa listar os caixas ABERTOS pra escolher qual recebe
+# o pagamento — sem isto, quem tem só essa permission (sem `finance.
+# view`) trava no próprio fluxo que já está autorizado a concluir
+# (mesma classe de bug já corrigida em `orders.py::mark_paid`). Só a
+# LISTAGEM afrouxa — `CashRegisterRead` (o schema desta rota) não leva
+# faturamento/totais, só metadados do caixa. Detalhe com resumo
+# financeiro (`GET /{id}`), abrir/fechar e movimentações continuam só
+# com `finance.view`/`finance.manage`, sem alternativa — isto não é
+# "acesso ao Financeiro", é o mínimo operacional pra fechar uma comanda.
+_view_for_payment = require_any_permission("finance.view", "payments.register")
 
 
 def _to_detail(summary: cash_register_service.RegisterSummary) -> CashRegisterDetail:
@@ -67,7 +78,7 @@ def list_registers(
     date_to: datetime | None = Query(None),
     opened_by: uuid.UUID | None = Query(None),
     session: Session = Depends(get_db),
-    actor: ActorContext = Depends(_view),
+    actor: ActorContext = Depends(_view_for_payment),
 ) -> list[CashRegisterRead]:
     registers = cash_register_service.list_registers(
         session, actor, status=status_filter, date_from=date_from, date_to=date_to, opened_by=opened_by
