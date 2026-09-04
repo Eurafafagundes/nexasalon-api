@@ -32,7 +32,7 @@ def _restricted(actor: ActorContext, *, permissions) -> ActorContext:
     )
 
 
-def _setup_finished_appointment(c, *, client_name="Cliente Um", client_notes=None):
+def _setup_finished_appointment(c, *, client_name="Cliente Um", client_notes=None, client_phone=None):
     branch = c.post("/api/v1/branches", json={"name": "Matriz", "slug": f"matriz-{uuid.uuid4().hex[:6]}"}).json()
     professional = c.post("/api/v1/professionals", json={"name": "Ianka"}).json()
     service = c.post(
@@ -48,6 +48,8 @@ def _setup_finished_appointment(c, *, client_name="Cliente Um", client_notes=Non
     client_payload = {"name": client_name}
     if client_notes is not None:
         client_payload["notes"] = client_notes
+    if client_phone is not None:
+        client_payload["phone"] = client_phone
     client = c.post("/api/v1/clients", json=client_payload).json()
 
     appt = c.post(
@@ -236,6 +238,34 @@ def test_comprovante_exige_orders_view(client_as, org_a_actor):
     restricted = _restricted(org_a_actor, permissions=set())
     resp = client_as(restricted).get(f"/api/v1/orders/{order['id']}/receipt")
     assert resp.status_code == 403
+
+
+def test_comprovante_mascara_telefone_e_email_do_cliente_sem_clients_view_contact_data(client_as, org_a_actor):
+    """Item explícito do pedido: Comanda (aqui, o comprovante impresso a
+    partir dela) não pode ser um caminho alternativo pra recuperar
+    telefone/e-mail que o ator não conseguiria ver em `GET /clients/{id}`
+    — `orders.view` sozinho nunca foi suficiente pra ver o módulo
+    Clientes, e agora também não é suficiente pra ver contato completo
+    no comprovante."""
+    c = client_as(org_a_actor)
+    appt, branch, _service, _client = _setup_finished_appointment(c, client_phone="61988887777")
+    register = c.post("/api/v1/cash-registers", json={"branch_id": branch["id"], "initial_amount": "0"}).json()
+    order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
+    c.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={"payments": [{"method": "pix", "amount": "310.00", "cash_register_id": register["id"]}]},
+    )
+
+    restricted = _restricted(org_a_actor, permissions={"orders.view"})
+    resp = client_as(restricted).get(f"/api/v1/orders/{order['id']}/receipt")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["client"]["phone"] == "(**) *****-7777"
+    assert "61988887777" not in resp.text
+
+    full = _restricted(org_a_actor, permissions={"orders.view", "clients.view_contact_data"})
+    resp_full = client_as(full).get(f"/api/v1/orders/{order['id']}/receipt")
+    assert resp_full.json()["client"]["phone"] == "61988887777"
 
 
 def test_comprovante_isolamento_multi_tenant(client_as, org_a_actor, org_b_actor):

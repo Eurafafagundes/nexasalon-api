@@ -81,6 +81,16 @@ class ClientRead(ClientBase):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+    # `True` por padrão (valor do `model_validate` direto do ORM, que
+    # não tem esse conceito) — SEMPRE sobrescrito explicitamente pela
+    # rota via `core/client_privacy.py::apply_client_contact_masking`
+    # antes de sair como resposta HTTP. Quando `False`, `phone`/
+    # `whatsapp`/`cpf`/`email`/endereço acima já vêm mascarados —
+    # nunca um campo novo pro frontend decidir sozinho se esconde algo,
+    # é só o motivo de já terem vindo mascarados do backend (distingue
+    # "Oculto" de "Não informado" na UI, especialmente pro endereço,
+    # que é zerado por completo quando mascarado).
+    can_view_contact_data: bool = True
 
 
 class ClientLookupRead(BaseModel):
@@ -97,6 +107,7 @@ class ClientLookupRead(BaseModel):
     name: str
     phone: str | None
     whatsapp: str | None
+    can_view_contact_data: bool = True
 
 
 class ClientHistory(BaseModel):

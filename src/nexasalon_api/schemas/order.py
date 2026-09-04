@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from nexasalon_api.core.client_privacy import mask_receipt_contact
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import (
     CardBrand,
@@ -524,7 +525,9 @@ class OrderReceiptRead(BaseModel):
     total: Decimal
 
     @classmethod
-    def build(cls, order: Order, client: Client, organization: Organization) -> "OrderReceiptRead":
+    def build(
+        cls, order: Order, client: Client, organization: Organization, *, can_view_contact: bool = True
+    ) -> "OrderReceiptRead":
         service_items = [
             ReceiptItem(
                 kind="service",
@@ -556,10 +559,17 @@ class OrderReceiptRead(BaseModel):
         ]
         items = service_items + product_items
         subtotal = sum((i.total for i in items), Decimal("0"))
+        # Mesma regra de `core/client_privacy.py` — quem imprime/vê o
+        # comprovante pela Comanda (gate: `orders.view`, sem exigir a
+        # permission de contato) não pode usar este caminho pra recuperar
+        # telefone/e-mail que não conseguiria ver em `GET /clients/{id}`.
+        receipt_phone, receipt_email = mask_receipt_contact(
+            phone=client.phone, email=client.email, can_view_contact=can_view_contact
+        )
         return cls(
             order_number=order.order_number,
             closed_at=order.closed_at,
-            client=ReceiptClient(name=client.name, phone=client.phone, email=client.email),
+            client=ReceiptClient(name=client.name, phone=receipt_phone, email=receipt_email),
             establishment=ReceiptEstablishment(
                 name=organization.name,
                 legal_name=organization.legal_name,

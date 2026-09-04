@@ -48,6 +48,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.actor import ActorContext
+from nexasalon_api.core.client_privacy import client_can_view_contact
 from nexasalon_api.core.exceptions import (
     ConflictError,
     NotFoundError,
@@ -281,7 +282,8 @@ def get_order_receipt(session: Session, actor: ActorContext, order_id: uuid.UUID
     organization = organization_repo.get(session, actor.organization_id)
     if organization is None:
         raise NotFoundError("Organização não encontrada.")
-    return OrderReceiptRead.build(order, client, organization)
+    can_view_contact = client_can_view_contact(actor.permissions)
+    return OrderReceiptRead.build(order, client, organization, can_view_contact=can_view_contact)
 
 
 def update_order_item(

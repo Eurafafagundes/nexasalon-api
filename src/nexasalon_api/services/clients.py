@@ -74,12 +74,42 @@ def create_client(session: Session, organization_id: uuid.UUID, data: ClientCrea
     return client_repo.create(session, organization_id, **data.model_dump())
 
 
+# Campos de contato/identificação sensível — os mesmos que
+# `core/client_privacy.py` mascara nas respostas de leitura. Só quem
+# consegue VER o valor real pode alterá-lo (ver `update_client` abaixo)
+# — nunca dá pra "adivinhar e sobrescrever" um telefone/CPF/e-mail/
+# endereço que não se enxerga.
+_CONTACT_FIELDS = frozenset(
+    {"phone", "whatsapp", "email", "cpf", "cep", "state", "city", "neighborhood", "address_line", "address_number", "complement"}
+)
+
+
 def update_client(
-    session: Session, organization_id: uuid.UUID, client_id: uuid.UUID, data: ClientUpdate
+    session: Session,
+    organization_id: uuid.UUID,
+    client_id: uuid.UUID,
+    data: ClientUpdate,
+    *,
+    can_view_contact: bool = True,
 ) -> Client:
+    """`can_view_contact=False` (ator sem `clients.view_contact_data`)
+    ignora por completo os campos de contato do payload — preserva o
+    que já estava salvo. Bug real evitado: o frontend, sem poder ver o
+    telefone/CPF/e-mail/endereço reais, só teria como pré-preencher o
+    formulário de edição com os PLACEHOLDERS mascarados
+    ("(**) *****-1234", "Oculto"...); sem esta proteção, salvar sem
+    tocar nesses campos gravaria o placeholder como se fosse o dado
+    real. Continua permitindo editar nome/nascimento/gênero/
+    observações normalmente — só o que exige VER o dado pra editar com
+    segurança fica de fora."""
     client = get_client(session, organization_id, client_id)
-    _assert_cpf_not_duplicated(session, organization_id, data.cpf, exclude_client_id=client.id)
-    for field, value in data.model_dump().items():
+    updates = data.model_dump()
+    if not can_view_contact:
+        for field in _CONTACT_FIELDS:
+            updates.pop(field, None)
+    else:
+        _assert_cpf_not_duplicated(session, organization_id, data.cpf, exclude_client_id=client.id)
+    for field, value in updates.items():
         setattr(client, field, value)
     return client_repo.save(session, client)
 

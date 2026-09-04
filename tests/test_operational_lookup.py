@@ -29,7 +29,12 @@ def test_clients_lookup_funciona_com_permissao_granular_sem_view_amplo(client_as
     # Schema enxuto — nunca CPF/endereço/histórico (isso é Ficha 360°,
     # exige `clients.view`, não `clients.lookup`).
     for item in body:
-        assert set(item.keys()) == {"id", "name", "phone", "whatsapp"}
+        assert set(item.keys()) == {"id", "name", "phone", "whatsapp", "can_view_contact_data"}
+    # Sem `clients.view_contact_data`, o telefone sai mascarado mesmo no
+    # lookup — nunca o valor completo (ver core/client_privacy.py).
+    found = next(item for item in body if item["id"] == client["id"])
+    assert found["phone"] == "(**) *****-7777"
+    assert found["can_view_contact_data"] is False
 
 
 def test_clients_lookup_sem_nenhuma_permissao_recebe_403(client_as, org_a_actor):
