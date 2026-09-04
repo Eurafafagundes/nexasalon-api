@@ -1227,6 +1227,121 @@ def test_permission_overrides_get_put_roundtrip(client, scenario):
     assert "agenda.view_all" in prof_me.json()["permissions"]
 
 
+def test_agenda_create_edit_via_override_sem_view_e_normalizado_com_view_own(client, scenario):
+    """Bug real corrigido: até esta normalização, salvar um override
+    GRANT em `agenda.create`/`agenda.edit` sem NENHUM view (como o
+    `ManageAccessDrawer` fazia antes da correção do toggle "Criar/
+    editar") deixava a pessoa com "permissões de Agenda ativadas" mas
+    incapaz de abrir /agenda (`_view_agenda` sempre exigiu view_own OU
+    view_all — nunca aceitou create/edit como substituto, e continua
+    não aceitando). `compute_effective_permissions` agora garante
+    `agenda.view_own` sempre que create/edit está presente sem nenhum
+    view — o PUT abaixo simula exatamente o payload que a versão
+    ANTIGA do drawer mandava (só create+edit)."""
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    headers = _auth_headers(owner_body["tokens"]["access_token"])
+
+    put_resp = client.put(
+        f"/api/v1/users/{scenario.prof_membership_id}/permission-overrides",
+        json={
+            "overrides": [
+                {"permission_key": "agenda.create", "effect": "grant"},
+                {"permission_key": "agenda.edit", "effect": "grant"},
+                {"permission_key": "agenda.view_own", "effect": "deny"},
+            ]
+        },
+        headers=headers,
+    )
+    assert put_resp.status_code == 200, put_resp.text
+
+    prof_body = _login(client, scenario.prof_email, scenario.password)
+    prof_headers = _auth_headers(prof_body["tokens"]["access_token"])
+    me = client.get("/api/v1/auth/me", headers=prof_headers)
+    perms = me.json()["permissions"]
+    assert "agenda.create" in perms
+    assert "agenda.edit" in perms
+    assert "agenda.view_own" in perms or "agenda.view_all" in perms
+
+    # Prova ponta a ponta: a Agenda de fato abre, não só a lista de
+    # permissions parece certa.
+    agenda_resp = client.get(
+        "/api/v1/agenda", params={"date": "2026-08-13"}, headers=prof_headers,
+    )
+    assert agenda_resp.status_code == 200, agenda_resp.text
+
+
+def test_agenda_estado_legado_role_sem_view_e_normalizado_sem_migration(client, scenario):
+    """Simula um role CUSTOMIZADO criado antes desta correção existir —
+    `agenda.create`/`agenda.edit` gravados direto em `role_permissions`,
+    sem nenhum `agenda.view_own`/`agenda.view_all` — e confirma que a
+    normalização em `compute_effective_permissions` corrige isso
+    automaticamente a cada request, sem precisar de migration/backfill
+    nem de reabrir o ManageAccessDrawer e salvar de novo."""
+    session = SessionLocal()
+    session.execute(text("SELECT set_config('app.current_org_id', :oid, true)"), {"oid": str(scenario.org_a_id)})
+    role_id = uuid.uuid4()
+    session.execute(
+        text(
+            "INSERT INTO roles (id, organization_id, name, is_system) "
+            "VALUES (:id, :org_id, 'Atendente Legado', false)"
+        ),
+        {"id": str(role_id), "org_id": str(scenario.org_a_id)},
+    )
+    for key in ("agenda.create", "agenda.edit"):
+        session.execute(
+            text("INSERT INTO role_permissions (role_id, permission_key) VALUES (:role_id, :key)"),
+            {"role_id": str(role_id), "key": key},
+        )
+    legacy_user = _new_user(session, scenario.password)
+    legacy_email = legacy_user.email
+    org_a = session.get(Organization, scenario.org_a_id)
+    _new_membership(session, legacy_user, org_a, role_id)
+    session.commit()
+    session.close()
+
+    body = _login(client, legacy_email, scenario.password)
+    headers = _auth_headers(body["tokens"]["access_token"])
+    me = client.get("/api/v1/auth/me", headers=headers)
+    perms = me.json()["permissions"]
+    assert "agenda.create" in perms
+    assert "agenda.view_own" in perms or "agenda.view_all" in perms
+
+    agenda_resp = client.get("/api/v1/agenda", params={"date": "2026-08-13"}, headers=headers)
+    assert agenda_resp.status_code == 200, agenda_resp.text
+
+
+def test_normalizacao_de_agenda_nao_vaza_view_own_pra_quem_nao_tem_create_nem_edit(client, scenario):
+    """A normalização só age quando create/edit está presente — alguém
+    sem NENHUM dos dois (e sem view) continua exatamente sem acesso
+    nenhum à Agenda, nunca ganha `agenda.view_own` de graça."""
+    session = SessionLocal()
+    session.execute(text("SELECT set_config('app.current_org_id', :oid, true)"), {"oid": str(scenario.org_a_id)})
+    session.add(
+        MembershipPermissionOverride(
+            membership_id=scenario.prof_membership_id, permission_key="agenda.view_own", effect=PermissionEffect.DENY,
+        )
+    )
+    session.add(
+        MembershipPermissionOverride(
+            membership_id=scenario.prof_membership_id, permission_key="agenda.edit", effect=PermissionEffect.DENY,
+        )
+    )
+    session.commit()
+    session.close()
+
+    body = _login(client, scenario.prof_email, scenario.password)
+    headers = _auth_headers(body["tokens"]["access_token"])
+    me = client.get("/api/v1/auth/me", headers=headers)
+    perms = me.json()["permissions"]
+    assert "agenda.view_own" not in perms
+    assert "agenda.view_all" not in perms
+    assert "agenda.create" not in perms
+    assert "agenda.edit" not in perms
+
+    agenda_resp = client.get("/api/v1/agenda", params={"date": "2026-08-13"}, headers=headers)
+    assert agenda_resp.status_code == 403
+
+
 def test_permission_overrides_com_chave_desconhecida_e_rejeitado(client, scenario):
     owner_body = _login(client, scenario.single_org_email, scenario.password)
     resp = client.put(

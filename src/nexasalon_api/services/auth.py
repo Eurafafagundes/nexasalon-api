@@ -391,6 +391,27 @@ def compute_effective_permissions(
             granted.add(override.permission_key)
         elif override.effect == PermissionEffect.DENY:
             granted.discard(override.permission_key)
+
+    # Invariante de produto: "Criar/editar Agenda" nunca pode existir sem
+    # NENHUMA permission de visualização — o gate de entrada da Agenda
+    # (`_view_agenda` em api/v1/agenda.py, e o `canView` equivalente no
+    # frontend) sempre exigiu `agenda.view_own`/`agenda.view_all`, nunca
+    # aceitando `agenda.create`/`agenda.edit` como substituto (e isso não
+    # muda aqui). Bug real corrigido: até esta normalização, o convite era
+    # só no MOMENTO DO SAVE (`ManageAccessDrawer::toggleAgendaEdit`) — um
+    # role ou override GRAVADO ANTES dessa correção (estado legado) ou
+    # criado por qualquer caminho que não passe pelo drawer (role
+    # customizado, ajuste direto de override) continuava com
+    # create/edit sem view pra sempre, travando a Agenda mesmo com "as
+    # permissões ativadas". Normalizando aqui — o ÚNICO lugar onde o
+    # conjunto efetivo é computado, sempre do zero, nunca cacheado —
+    # corrige automaticamente QUALQUER estado antigo/futuro nesse formato
+    # a cada request, sem exigir migration/backfill nem novo save.
+    if ("agenda.create" in granted or "agenda.edit" in granted) and not (
+        "agenda.view_own" in granted or "agenda.view_all" in granted
+    ):
+        granted.add("agenda.view_own")
+
     return frozenset(granted)
 
 
