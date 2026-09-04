@@ -116,7 +116,7 @@ def activate_membership(
     actor: ActorContext = Depends(_require_users_manage),
 ) -> MembershipRead:
     membership = user_management_service.set_membership_status(
-        session, actor.organization_id, membership_id, MembershipStatus.ACTIVE
+        session, actor.organization_id, membership_id, MembershipStatus.ACTIVE, actor.user_id
     )
     return _to_membership_read(session, membership)
 
@@ -130,7 +130,28 @@ def deactivate_membership(
     actor: ActorContext = Depends(_require_users_manage),
 ) -> MembershipRead:
     membership = user_management_service.set_membership_status(
-        session, actor.organization_id, membership_id, MembershipStatus.SUSPENDED
+        session, actor.organization_id, membership_id, MembershipStatus.SUSPENDED, actor.user_id
+    )
+    return _to_membership_read(session, membership)
+
+
+@router.patch(
+    "/{membership_id}/remove-access",
+    response_model=MembershipRead,
+    summary="Remover o acesso de uma pessoa a esta organização (nunca apaga o histórico)",
+)
+def remove_membership_access(
+    membership_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_require_users_manage),
+) -> MembershipRead:
+    """"Remover acesso" (Configurações > Acessos) — soft: só muda
+    `OrganizationMembership.status` para `REMOVED` (`User` nunca é
+    apagado, nem qualquer Agenda/Comanda/Pagamento/AuditLog que
+    referencia essa pessoa). Recusa (422) tirar o único Usuário Master
+    ativo da organização — ver `set_membership_status`."""
+    membership = user_management_service.set_membership_status(
+        session, actor.organization_id, membership_id, MembershipStatus.REMOVED, actor.user_id
     )
     return _to_membership_read(session, membership)
 

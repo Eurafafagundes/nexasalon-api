@@ -15,6 +15,17 @@ from nexasalon_api.models.enums import AuditAction, MembershipStatus, Permission
 from nexasalon_api.models.identity import MembershipPermissionOverride, OrganizationMembership, User
 from nexasalon_api.models.rbac import Permission
 from nexasalon_api.repositories import audit_log_repo, membership_repo, professional_repo, rbac_repo, user_repo
+from nexasalon_api.services.auth import compute_effective_permissions
+
+# "Usuário Master" (rótulo de produto do role OWNER) nunca é identificado
+# por NOME de role aqui — 100% consistente com o resto do RBAC, que é
+# permission-based (ver `services/auth.py::compute_effective_permissions`
+# e a docstring de `config/rbac-labels.ts` no frontend, que documenta
+# `organization.manage` como a ÚNICA permission que distingue OWNER de
+# ADMIN — migration 0007: "ADMIN -> todas, exceto organization.manage").
+# Um role CUSTOMIZADO que receba `organization.manage` conta igualmente
+# como Master pra este guard — nunca uma checagem de `role.name`.
+_MASTER_PERMISSION = "organization.manage"
 
 
 def _get_membership_in_org(
@@ -151,19 +162,64 @@ def resend_invite(
     return create_invite_token(user_id=membership.user_id, membership_id=membership.id)
 
 
+def _assert_not_last_active_master(
+    session: Session, organization_id: uuid.UUID, membership: OrganizationMembership
+) -> None:
+    """Bloqueia tirar de ACTIVE a última membership com a permission
+    `organization.manage` ("Usuário Master") — sem isso a organização
+    fica sem NINGUÉM capaz de gerenciá-la (nem sequer reverter o próprio
+    erro). Só entra em jogo quando a membership sendo alterada de fato É
+    uma Master ativa; qualquer outro caso (Recepcionista, Profissional,
+    ou uma Master que não é a última) segue sem restrição nenhuma."""
+    if _MASTER_PERMISSION not in compute_effective_permissions(session, membership):
+        return
+    others = membership_repo.list_for_organization(session, organization_id, include_inactive=False)
+    remaining_masters = [
+        m for m in others
+        if m.id != membership.id and _MASTER_PERMISSION in compute_effective_permissions(session, m)
+    ]
+    if not remaining_masters:
+        raise ValidationDomainError(
+            "Não é possível remover o acesso do único Usuário Master desta organização. "
+            "Promova outra pessoa a Usuário Master antes de continuar."
+        )
+
+
 def set_membership_status(
     session: Session,
     organization_id: uuid.UUID,
     membership_id: uuid.UUID,
     status: MembershipStatus,
+    actor_user_id: uuid.UUID,
 ) -> OrganizationMembership:
-    """Ativar/desativar. Ao mudar para não-ACTIVE, o corte de acesso é
-    imediato: `refresh()` e o dependency de `get_current_actor` (Etapa
-    seguinte) sempre reconferem o status da membership no banco a cada
-    requisição — nunca a partir de um valor cacheado no token."""
+    """Ativar/desativar/remover o acesso (`MembershipStatus.REMOVED` —
+    "Remover acesso" na UI de Configurações > Acessos, nunca um hard
+    delete: a linha continua existindo, preservando `created_by`/
+    histórico de Agenda/Comanda/Pagamento/AuditLog que referenciam este
+    `user_id`). Ao mudar para não-ACTIVE, o corte de acesso é imediato:
+    `get_current_actor` (`api/deps.py`) sempre reconfere o status da
+    membership no banco a cada requisição, nunca a partir de um valor
+    cacheado no token — e `membership_repo.list_active_for_user`
+    (seletor de organização no login) só considera `status == ACTIVE`,
+    então a pessoa some da lista de organizações acessíveis sem afetar
+    nenhuma OUTRA membership dela em outra Organization."""
     membership = _get_membership_in_org(session, organization_id, membership_id)
+    old_status = membership.status
+
+    if old_status == MembershipStatus.ACTIVE and status != MembershipStatus.ACTIVE:
+        _assert_not_last_active_master(session, organization_id, membership)
+
     membership.status = status
-    return membership_repo.save(session, membership)
+    membership_repo.save(session, membership)
+
+    session.flush()
+    audit_log_repo.create(
+        session, organization_id=organization_id, user_id=actor_user_id,
+        entity_type="membership", entity_id=membership.id, action=AuditAction.UPDATE,
+        old_values={"status": old_status.value},
+        new_values={"status": status.value},
+    )
+    return membership
 
 
 def assign_role(

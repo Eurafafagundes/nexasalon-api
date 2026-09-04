@@ -480,6 +480,72 @@ def test_membership_desativada_corta_acesso_imediatamente(client, scenario):
     assert refresh_after.status_code == 403
 
 
+def test_remover_acesso_via_api_corta_sessao_imediatamente(client, scenario):
+    """Mesmo cenário do teste acima, mas ponta a ponta pela rota REAL de
+    produto (`PATCH /users/{id}/remove-access`, "Remover acesso" em
+    Configurações > Acessos) em vez de alterar o status via SQL direto —
+    prova que o fluxo completo (Master autenticado chamando a API)
+    corta a sessão da pessoa removida imediatamente, sem esperar o
+    token expirar."""
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    owner_token = owner_body["tokens"]["access_token"]
+
+    recep_body = _login(client, scenario.recep_email, scenario.password)
+    recep_token = recep_body["tokens"]["access_token"]
+
+    recep_me_before = client.get("/api/v1/auth/me", headers=_auth_headers(recep_token))
+    assert recep_me_before.status_code == 200
+
+    remove_resp = client.patch(
+        f"/api/v1/users/{scenario.recep_membership_id}/remove-access", headers=_auth_headers(owner_token)
+    )
+    assert remove_resp.status_code == 200, remove_resp.text
+    assert remove_resp.json()["status"] == "removed"
+
+    recep_me_after = client.get("/api/v1/auth/me", headers=_auth_headers(recep_token))
+    assert recep_me_after.status_code == 403
+
+    # Um NOVO login (não só o token antigo) também precisa recusar —
+    # `list_active_for_user` só considera `status == ACTIVE`.
+    relogin = client.post(
+        "/api/v1/auth/login", json={"email": scenario.recep_email, "password": scenario.password}
+    )
+    assert relogin.status_code in (401, 403)
+
+
+def test_remover_acesso_nao_afeta_outra_organization(client, scenario):
+    """`multi_org_user` tem membership ATIVA em duas organizações (ADMIN
+    na Org A, RECEPTIONIST na Org B) — remover o acesso dela na Org A
+    nunca pode afetar a Org B."""
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    owner_token = owner_body["tokens"]["access_token"]
+
+    remove_resp = client.patch(
+        f"/api/v1/users/{scenario.multi_membership_a_id}/remove-access", headers=_auth_headers(owner_token)
+    )
+    assert remove_resp.status_code == 200, remove_resp.text
+
+    # A Org B continua 100% acessível — login + seleção de organização
+    # funcionam normalmente, sem nenhum rastro da remoção na Org A.
+    multi_login = _login(client, scenario.multi_org_email, scenario.password)
+    assert multi_login["status"] == "select_organization"
+    select_resp = client.post(
+        "/api/v1/auth/select-organization",
+        json={"org_selection_token": multi_login["org_selection_token"], "organization_id": str(scenario.org_b_id)},
+    )
+    assert select_resp.status_code == 200, select_resp.text
+    me = client.get("/api/v1/auth/me", headers=_auth_headers(select_resp.json()["access_token"]))
+    assert me.status_code == 200
+    assert me.json()["organization"]["id"] == str(scenario.org_b_id)
+
+    # E tentar selecionar a Org A (onde o acesso foi removido) agora falha.
+    select_a = client.post(
+        "/api/v1/auth/select-organization",
+        json={"org_selection_token": multi_login["org_selection_token"], "organization_id": str(scenario.org_a_id)},
+    )
+    assert select_a.status_code == 403
+
+
 # ---------------------------------------------------------------------
 # Permissions por role / overrides / view_own x view_all
 # ---------------------------------------------------------------------
