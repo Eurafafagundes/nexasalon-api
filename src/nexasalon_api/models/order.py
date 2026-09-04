@@ -357,6 +357,27 @@ class Payment(Base, UUIDPKMixin, TimestampMixin):
     net_amount_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
     fee_status: Mapped[PaymentFeeStatus | None] = mapped_column(pg_enum(PaymentFeeStatus, "payment_fee_status"))
 
+    # --- Reabertura de comanda (migration 0044) ---
+    # NUNCA apagamos/editamos o pagamento em si (mesma filosofia de
+    # ledger append-only já usada em `StockMovement`/`CashMovement`) —
+    # `reversed_at` preenchido é o marcador de "este lançamento não
+    # conta mais" (faturamento/extrato/comissão já páram de contar
+    # sozinhos por filtrarem `Order.status == CLOSED`; o Caixa, que lê
+    # `Payment` diretamente por `cash_register_id` sem olhar pro status
+    # da Order, é quem PRECISA deste campo pra não continuar somando um
+    # pagamento revertido no resumo ao vivo — ver
+    # `services/cash_register.py::build_summary`). `NULL` (nunca
+    # backfilled) = pagamento ativo, comportamento de sempre; mesmo
+    # padrão "nullable, sem valor inventado pro histórico" já usado por
+    # `fee_status`. `reversed_by_name` é snapshot (mesmo motivo de
+    # `created_by_name`) — quem reverteu continua identificável mesmo
+    # se o usuário for removido depois.
+    reversed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    reversed_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    reversed_by_name: Mapped[str | None] = mapped_column(String(255))
+
     order: Mapped["Order"] = relationship(back_populates="payments")
 
 
