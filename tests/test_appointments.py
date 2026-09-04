@@ -296,8 +296,44 @@ def test_horario_fora_da_jornada_gera_erro(org_session):
         branch_id=branch.id, client_id=client.id,
         items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(20, 0))],
     )
-    with pytest.raises(ValidationDomainError):
+    with pytest.raises(ValidationDomainError) as exc_info:
         appointments.create_appointment(session, actor, data)
+
+    # Bug real corrigido: a mensagem mostrava `start_at.isoformat()` cru
+    # (ex.: "...2026-09-04T11:00:00+00:00)"), ilegível pra quem usa o
+    # balcão. Agora é sempre em português, sem timestamp ISO, e enriquece
+    # com a jornada real (09-18, ver `_setup_basic`) quando ela é conhecida.
+    message = str(exc_info.value)
+    assert "09:00 às 18:00" in message
+    assert "T20:00:00" not in message
+    assert "+00:00" not in message
+    assert "-03:00" not in message
+
+
+def test_horario_fora_da_jornada_sem_jornada_cadastrada_usa_mensagem_generica(org_session):
+    """Quando o profissional não tem NENHUMA jornada cadastrada pro dia
+    (`windows` vazio em `_working_hours_error_message`), não há horário
+    de atendimento pra mostrar — cai no texto genérico, mas continua
+    sem nenhum detalhe técnico."""
+    session, org_id = org_session
+    branch = _branch(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    service = _service(session, org_id, duration=60, price=100)
+    _link(session, prof.id, service.id)
+    client = _client(session, org_id)
+    session.flush()
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    with pytest.raises(ValidationDomainError) as exc_info:
+        appointments.create_appointment(session, actor, data)
+
+    message = str(exc_info.value)
+    assert message == "Este horário está fora da jornada de trabalho do profissional. Escolha outro horário."
+    assert "T14:00:00" not in message
 
 
 def test_conflito_com_schedule_block_gera_erro(org_session):
@@ -335,8 +371,14 @@ def test_conflito_com_agendamento_existente_gera_409(org_session):
         branch_id=branch.id, client_id=client.id,
         items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 30))],
     )
-    with pytest.raises(ConflictError):
+    with pytest.raises(ConflictError) as exc_info:
         appointments.create_appointment(session, actor, second)
+
+    # Bug real corrigido: a mensagem mostrava `snapshot.start_at.isoformat()`
+    # cru — sem timestamp ISO agora, só o texto humano e orientado à ação.
+    message = str(exc_info.value)
+    assert message == "Profissional já tem um atendimento nesse horário. Escolha outro horário."
+    assert "T14:30:00" not in message
 
 
 def test_force_overlap_sem_permissao_gera_403_mesmo_sem_conflito_real(org_session):

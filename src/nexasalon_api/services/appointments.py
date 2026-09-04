@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -89,6 +90,26 @@ class _ItemSnapshot:
     has_conflict: bool
 
 
+def _working_hours_error_message(windows: list[tuple[datetime, datetime]], tz: ZoneInfo) -> str:
+    """Mensagem SEMPRE humana pro usuário final — bug real corrigido
+    (mostrava `start_at.isoformat()` cru, ex.:
+    "...2026-09-04T11:00:00+00:00)", timestamp ISO com timezone,
+    ilegível pra quem usa o balcão). Enriquece com a jornada real
+    quando ela é conhecida (`windows` não vazio — o caso comum: o
+    profissional atende NAQUELE dia, só não nesse horário específico);
+    cai pro texto genérico quando não há jornada nenhuma cadastrada
+    pro dia (nada de horário pra mostrar). Detalhe técnico (o instante
+    exato solicitado) não é necessário aqui — quem chama já sabe qual
+    horário pediu; a mensagem só precisa dizer O QUE atende."""
+    if not windows:
+        return "Este horário está fora da jornada de trabalho do profissional. Escolha outro horário."
+    ranges = " e ".join(
+        f"{w_start.astimezone(tz).strftime('%H:%M')} às {w_end.astimezone(tz).strftime('%H:%M')}"
+        for w_start, w_end in windows
+    )
+    return f"Este profissional não atende nesse horário. Horário de atendimento: {ranges}."
+
+
 def _assert_within_working_hours(
     session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID, professional_id: uuid.UUID,
     start_at: datetime, end_at: datetime,
@@ -104,9 +125,7 @@ def _assert_within_working_hours(
     local_date = start_at.astimezone(tz).date()
     windows = availability.effective_working_windows_utc(session, organization_id, professional_id, local_date, tz)
     if not any(w_start <= start_at and end_at <= w_end for w_start, w_end in windows):
-        raise ValidationDomainError(
-            f"Horário fora da jornada de trabalho do profissional ({start_at.isoformat()})."
-        )
+        raise ValidationDomainError(_working_hours_error_message(windows, tz))
 
 
 def _assert_no_schedule_block(
@@ -229,9 +248,11 @@ def _apply_conflict_policy(snapshots: list[_ItemSnapshot], effective_force_overl
     for snapshot in snapshots:
         if snapshot.has_conflict:
             if not effective_force_overlap:
-                raise ConflictError(
-                    f"Profissional já tem um atendimento nesse horário ({snapshot.start_at.isoformat()})."
-                )
+                # Bug real corrigido: mostrava o timestamp ISO cru
+                # (`snapshot.start_at.isoformat()`) — o usuário já está
+                # olhando pro horário que acabou de escolher, não
+                # precisa dele repetido tecnicamente na mensagem.
+                raise ConflictError("Profissional já tem um atendimento nesse horário. Escolha outro horário.")
             any_forced = True
     return any_forced
 
@@ -1091,7 +1112,10 @@ def update_appointment_item(
     if has_conflict:
         effective_force_overlap = _resolve_force_overlap(actor, data.force_overlap)
         if not effective_force_overlap:
-            raise ConflictError(f"Profissional já tem um atendimento nesse horário ({target_start_at.isoformat()}).")
+            # Bug real corrigido: mesma mensagem humana de
+            # `_apply_conflict_policy` (sem ISO cru) — o usuário já
+            # está olhando pro horário que acabou de escolher.
+            raise ConflictError("Profissional já tem um atendimento nesse horário. Escolha outro horário.")
         any_forced = True
     _maybe_allow_overlap(session, any_forced)
 
@@ -1271,9 +1295,10 @@ def _validate_reschedule_slot(
         exclude_appointment_id=appointment_id,
     )
     if conflicts:
-        raise ConflictError(
-            f"Este horário acabou de ficar indisponível ({start_at.isoformat()}) — escolha outro horário."
-        )
+        # Bug real corrigido: mesma razão das outras mensagens de
+        # conflito neste arquivo — sem ISO cru, a cliente já está
+        # olhando pro horário que acabou de escolher no reagendamento.
+        raise ConflictError("Este horário acabou de ficar indisponível. Escolha outro horário.")
 
 
 def reschedule_by_customer(
