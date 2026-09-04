@@ -54,11 +54,18 @@ from nexasalon_api.core.exceptions import (
     NotFoundError,
     ValidationDomainError,
 )
-from nexasalon_api.models.enums import AuditAction, OrderProductItemKind, OrderStatus, StockMovementDirection
+from nexasalon_api.models.enums import (
+    AuditAction,
+    CashRegisterStatus,
+    OrderProductItemKind,
+    OrderStatus,
+    StockMovementDirection,
+)
 from nexasalon_api.models.order import Order
 from nexasalon_api.repositories import (
     appointment_repo,
     audit_log_repo,
+    cash_register_repo,
     client_repo,
     order_item_repo,
     order_product_item_repo,
@@ -81,6 +88,7 @@ from nexasalon_api.schemas.order import (
     OrderProductItemCreate,
     OrderProductItemUpdate,
     OrderReceiptRead,
+    OrderReopen,
 )
 from nexasalon_api.services import appointments as appointments_service
 from nexasalon_api.services import availability, order_totals
@@ -427,15 +435,25 @@ def cancel_order(session: Session, actor: ActorContext, order_id: uuid.UUID, dat
     status pra `closed`), então a checagem de status sozinha já garante
     "sem pagamento, sem baixa definitiva, sem fechamento" (item
     explícito do pedido). Nunca aceita cancelar uma comanda já
-    `closed`/`cancelled` — pedido explícito: exigir o fluxo financeiro
-    de estorno/reversão nesses casos (não implementado nesta versão),
-    nunca "desfazer" silenciosamente."""
+    `closed` — pedido explícito: `CLOSED` precisa passar por
+    `reopen_order` (exige `orders.reopen`, permission separada e mais
+    sensível) ANTES de poder ser cancelada — nunca um cancelamento
+    direto que pulasse a reversão financeira. Já `cancelled` é só
+    idempotência (segunda tentativa da mesma ação).
+
+    Rodada "Reabertura e Cancelamento de Comandas": se a comanda tinha
+    um Appointment vinculado, ele também é cancelado (libera o horário,
+    some da grade operacional — ver `agenda-grid.tsx`, que já filtra
+    `cancelled` client-side) — nunca APAGADO, continua no histórico.
+    Ver `appointments_service.cancel_appointment_for_order_cancel` pro
+    porquê disso NUNCA falha a operação inteira (idempotente, aceita
+    `FINISHED` também)."""
     organization_id = actor.organization_id
     order = _get_order_for_update_or_404(session, organization_id, order_id)
     if order.status != OrderStatus.OPEN:
         raise ConflictError(
             "Só é possível cancelar uma comanda aberta e sem pagamento/fechamento — "
-            "esta já foi fechada ou cancelada."
+            "esta já foi fechada ou cancelada. Se ela já foi paga, reabra a comanda antes de cancelar."
         )
 
     order.status = OrderStatus.CANCELLED
@@ -450,6 +468,168 @@ def cancel_order(session: Session, actor: ActorContext, order_id: uuid.UUID, dat
         action=AuditAction.UPDATE,
         old_values={"status": "open"},
         new_values={"status": "cancelled", "change_type": "cancel", "reason": data.reason},
+    )
+    appointments_service.cancel_appointment_for_order_cancel(session, actor, order.appointment_id)
+    return _reload(session, organization_id, order_id)
+
+
+def reopen_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data: OrderReopen) -> Order:
+    """Rodada "Reabertura e Cancelamento de Comandas" — desfaz o
+    fechamento de uma comanda `CLOSED`, voltando pra `OPEN` (fluxo
+    completo: `CLOSED -> reopen -> OPEN -> cancel -> CANCELLED`, nunca
+    um cancelamento direto de uma comanda fechada — ver `cancel_order`).
+    Exige `orders.reopen` (checado na rota) — permission SEPARADA de
+    `orders.cancel`, deliberadamente mais restrita (só OWNER/ADMIN por
+    padrão, migration 0045): reabrir desfaz uma venda JÁ RECEBIDA, uma
+    operação bem mais sensível que cancelar uma comanda ainda sem
+    pagamento.
+
+    NUNCA apaga/edita o `Payment` original nem o `StockMovement`
+    original (ledger append-only, mesmo raciocínio de todo o resto do
+    domínio) — marca o pagamento como revertido
+    (`Payment.reversed_at`/`reversed_by`) e gera um movimento de
+    estoque COMPENSATÓRIO (mesmo mecanismo de `correct_consumption`),
+    nunca reescreve histórico. Faturamento/Extrato/Comissão já páram de
+    contar sozinhos assim que `Order.status` deixa de ser `CLOSED`
+    (todos filtram por isso) — a única coisa que NÃO se corrige sozinha
+    é o resumo do Caixa (lê `Payment` direto por `cash_register_id`,
+    sem olhar pro status da Order — por isso `Payment.reversed_at`
+    existe, ver `services/cash_register.py::build_summary`).
+
+    DUAS travas ANTES de reverter qualquer coisa (falha rápido, nunca
+    reversão parcial):
+
+      1. Caixa relacionado a algum pagamento já FECHADO — bloqueia.
+         Reverter um pagamento cujo caixa já foi conferido/fechado
+         mudaria silenciosamente uma reconciliação física já feita
+         (`CashRegister.expected_amount`/`counted_amount`/`difference`
+         são fotos congeladas no fechamento do caixa, nunca
+         recalculadas depois) — pedido explícito do usuário pra nunca
+         permitir isso silenciosamente.
+      2. Comissão de algum serviço já LIQUIDADA (`OrderItem.
+         commission_settlement_id` preenchido) — bloqueia. Um
+         `CommissionSettlement` é imutável por design (documentado em
+         `models/commission.py`, sem rota de edição/exclusão) — dinheiro
+         já pode ter sido efetivamente repassado ao profissional; desfazer
+         isso é uma correção administrativa (`CommissionAdjustment` na
+         próxima liquidação), não algo que a reabertura da comanda deva
+         tentar resolver sozinha.
+
+    Mesmo lock (`get_for_update`) ANTES de checar status de
+    `close_order`/`cancel_order` — retry-safe, nunca reabre duas vezes."""
+    organization_id = actor.organization_id
+    order = _get_order_for_update_or_404(session, organization_id, order_id)
+    if order.status != OrderStatus.CLOSED:
+        raise ConflictError("Só é possível reabrir uma comanda finalizada (fechada).")
+
+    active_payments = [p for p in order.payments if p.reversed_at is None]
+
+    # Trava 1 — qualquer caixa relacionado já fechado bloqueia a
+    # reabertura inteira (nunca reversão parcial: ou reverte tudo, ou
+    # nada).
+    register_ids = {p.cash_register_id for p in active_payments}
+    for register_id in register_ids:
+        register = cash_register_repo.get(session, organization_id, register_id)
+        if register is None or register.status != CashRegisterStatus.OPEN:
+            raise ValidationDomainError(
+                "Não é possível reabrir: o caixa relacionado a um dos pagamentos desta comanda já está "
+                "fechado. Procure o fluxo administrativo de ajuste/estorno para corrigir o caixa fechado "
+                "antes de reabrir esta comanda."
+            )
+
+    # Trava 2 — comissão já liquidada (paga ao profissional) bloqueia.
+    if any(item.commission_settlement_id is not None for item in order.items):
+        raise ValidationDomainError(
+            "Não é possível reabrir: a comissão de um dos serviços desta comanda já foi incluída numa "
+            "liquidação de pagamento ao profissional. Faça o ajuste manual em Comissões antes de reabrir."
+        )
+
+    actor_user = user_repo.get(session, actor.user_id)
+    actor_name = actor_user.name if actor_user is not None else None
+    now = datetime.now(timezone.utc)
+
+    # Reverte pagamentos — nunca apaga/edita a linha original.
+    for payment in active_payments:
+        payment.reversed_at = now
+        payment.reversed_by = actor.user_id
+        payment.reversed_by_name = actor_name
+        audit_log_repo.create(
+            session,
+            organization_id=organization_id,
+            user_id=actor.user_id,
+            entity_type="payment",
+            entity_id=payment.id,
+            action=AuditAction.UPDATE,
+            old_values={"reversed": False},
+            new_values={
+                "reversed": True, "change_type": "reopen_reversal", "order_id": str(order_id),
+                "amount": str(payment.amount), "cash_register_id": str(payment.cash_register_id),
+                "reason": data.reason,
+            },
+        )
+
+    # Reverte a baixa de estoque de cada linha de produto já baixada —
+    # movimento COMPENSATÓRIO (IN, reason=ADJUSTMENT), nunca edita o
+    # StockMovement original. Volta `stock_movement_id` pra `NULL`: é
+    # o que faz a comanda reaberta se comportar como qualquer comanda
+    # `OPEN` de verdade (permite editar/remover a linha de novo — ver
+    # `remove_product_item`, que exige exatamente essa invariante — e
+    # gera uma baixa NOVA no próximo fechamento, com a quantidade que
+    # sobreviver até lá).
+    for product_item in order.product_items:
+        if product_item.stock_movement_id is None:
+            continue
+        movement = stock_service.record_consumption_correction(
+            session,
+            actor,
+            product_id=product_item.product_id,
+            branch_id=order.branch_id,
+            order_id=order.id,
+            quantity=product_item.quantity,
+            direction=StockMovementDirection.IN,
+            observation=(
+                f"Reabertura da Comanda #{order.order_number} — devolve ao estoque a baixa de "
+                f"'{product_item.product_name}' feita no fechamento anterior."
+            ),
+            idempotency_key=uuid.uuid4(),
+        )
+        product_item.stock_movement_id = None
+        audit_log_repo.create(
+            session,
+            organization_id=organization_id,
+            user_id=actor.user_id,
+            entity_type="order_product_item",
+            entity_id=product_item.id,
+            action=AuditAction.UPDATE,
+            old_values={"stock_movement_id": None},
+            new_values={
+                "change_type": "reopen_stock_reversal",
+                "compensating_stock_movement_id": str(movement.id),
+            },
+        )
+
+    # Desfaz a promoção automática do Appointment pra `paid` (ver
+    # `close_order` -> `mark_paid`) — volta pra `finished`, nunca deixa
+    # a Order `OPEN` de novo com o Appointment ainda `paid`.
+    appointments_service.demote_appointment_from_paid_for_order_reopen(session, actor, order.appointment_id)
+
+    order.status = OrderStatus.OPEN
+    order.closed_at = None
+    order.closed_by = None
+    session.flush()
+
+    audit_log_repo.create(
+        session,
+        organization_id=organization_id,
+        user_id=actor.user_id,
+        entity_type="order",
+        entity_id=order.id,
+        action=AuditAction.UPDATE,
+        old_values={"status": "closed"},
+        new_values={
+            "status": "open", "change_type": "reopen", "reason": data.reason,
+            "reversed_payment_ids": [str(p.id) for p in active_payments],
+        },
     )
     return _reload(session, organization_id, order_id)
 

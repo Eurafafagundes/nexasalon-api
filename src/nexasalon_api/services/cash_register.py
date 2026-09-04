@@ -313,6 +313,18 @@ def build_summary(session: Session, organization_id: uuid.UUID, register: CashRe
     cash_payments_total = Decimal("0")
     order_ids: set[uuid.UUID] = set()
     for p in payments:
+        # Rodada "Reabertura de Comanda" (migration 0044) — pagamento
+        # revertido (`Payment.reversed_at`) continua na lista devolvida
+        # abaixo (`payments=payments`, histórico sempre consultável,
+        # nunca escondido), mas nunca soma em NENHUM total daqui pra
+        # baixo: diferente de faturamento/extrato/comissão (que já
+        # param de contar sozinhos por filtrarem `Order.status ==
+        # CLOSED`), o Caixa lê `Payment` direto por `cash_register_id`
+        # sem olhar pro status da Order — sem esta exclusão explícita,
+        # um pagamento revertido continuaria inflando o resumo ao vivo
+        # de um caixa ainda aberto.
+        if p.reversed_at is not None:
+            continue
         total, count = totals_by_method[p.method]
         totals_by_method[p.method] = (total + p.amount, count + 1)
         total_revenue += p.amount

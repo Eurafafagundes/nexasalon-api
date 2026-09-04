@@ -56,6 +56,8 @@ from nexasalon_api.services.appointment_state_machine import (
     assert_cancellable,
     assert_online_change_window,
     assert_reschedulable,
+    demote_paid_for_reopen,
+    is_cancellable_via_linked_order,
     next_status,
 )
 from nexasalon_api.services.appointment_state_machine import (
@@ -1018,6 +1020,85 @@ def cancel_appointment(session: Session, actor: ActorContext, appointment_id: uu
         new_values={"status": AppointmentStatus.CANCELLED.value, "change_type": "cancel"},
     )
     return _reload(session, actor.organization_id, appointment_id)
+
+
+def cancel_appointment_for_order_cancel(session: Session, actor: ActorContext, appointment_id: uuid.UUID) -> None:
+    """Rodada "Reabertura e Cancelamento de Comandas" — chamado SÓ por
+    `services/orders.py::cancel_order` quando a Comanda cancelada
+    (`OPEN`) tinha um Appointment vinculado, nunca uma ação autônoma do
+    usuário (mesmo raciocínio de `mark_paid` acima: quem chegou aqui já
+    foi autorizado por `orders.cancel`, então usa `appointment_repo.get`
+    direto, não `get_appointment`/`_assert_can_edit`, que reaplicariam
+    escopo de Agenda desnecessário pra um efeito colateral interno).
+
+    Aceita cancelar a partir de `FINISHED` também (diferente do
+    cancelamento manual via `POST /appointments/{id}/cancel`,
+    `_CANCELLABLE_FROM`) — uma Comanda nasce sem exigir nenhum status
+    específico do Appointment (`create_order`), e o caso mais comum é
+    abri-la depois do atendimento já concluído; cancelar essa Comanda
+    por engano precisa liberar o horário mesmo assim (ver
+    `is_cancellable_via_linked_order`).
+
+    NUNCA levanta erro se o Appointment não puder ser cancelado (já
+    `CANCELLED` — idempotência, uma segunda tentativa de cancelar a
+    mesma comanda não pode falhar aqui; ou `PAID`/`NO_SHOW` — não
+    deveria ser alcançável pra uma Comanda `OPEN`, mas se acontecer por
+    alguma inconsistência antiga, o cancelamento da COMANDA não pode
+    travar por causa disso) — só não toca no Appointment nesses casos,
+    silenciosamente, sem afetar o restante da transação."""
+    appointment = appointment_repo.get(session, actor.organization_id, appointment_id)
+    if appointment is None:
+        return
+    if not is_cancellable_via_linked_order(appointment.status):
+        return
+    old_status = appointment.status
+    appointment.status = AppointmentStatus.CANCELLED
+    appointment.updated_by = actor.user_id
+    session.flush()
+
+    audit_log_repo.create(
+        session, organization_id=actor.organization_id, user_id=actor.user_id, entity_type="appointment",
+        entity_id=appointment_id, action=AuditAction.UPDATE,
+        old_values={"status": old_status.value},
+        new_values={
+            "status": AppointmentStatus.CANCELLED.value, "change_type": "cancel_via_order_cancel",
+        },
+    )
+
+
+def demote_appointment_from_paid_for_order_reopen(
+    session: Session, actor: ActorContext, appointment_id: uuid.UUID
+) -> None:
+    """Rodada "Reabertura e Cancelamento de Comandas" — chamado SÓ por
+    `services/orders.py::reopen_order`, o inverso de `mark_paid`: a
+    Comanda que promoveu o Appointment pra `PAID` está sendo reaberta,
+    então o Appointment precisa voltar pra `FINISHED` (nunca continuar
+    `PAID` com a Comanda `OPEN` de novo — os dois ficariam
+    inconsistentes entre si). Mesmo padrão de acesso direto via
+    `appointment_repo.get` de `mark_paid`/`cancel_appointment_for_order_cancel`
+    acima (efeito colateral interno, já autorizado por `orders.reopen`
+    na rota).
+
+    Idempotente: se o Appointment não estiver `PAID` (reabertura
+    chamada de novo, ou nunca chegou a ser promovido), não faz nada —
+    ver `demote_paid_for_reopen`."""
+    appointment = appointment_repo.get(session, actor.organization_id, appointment_id)
+    if appointment is None:
+        return
+    new_status = demote_paid_for_reopen(appointment.status)
+    if new_status is None:
+        return
+    old_status = appointment.status
+    appointment.status = new_status
+    appointment.updated_by = actor.user_id
+    session.flush()
+
+    audit_log_repo.create(
+        session, organization_id=actor.organization_id, user_id=actor.user_id, entity_type="appointment",
+        entity_id=appointment_id, action=AuditAction.UPDATE,
+        old_values={"status": old_status.value},
+        new_values={"status": new_status.value, "change_type": "reopen_via_order_reopen"},
+    )
 
 
 def update_appointment_item(

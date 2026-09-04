@@ -20,6 +20,7 @@ from nexasalon_api.schemas.order import (
     OrderRead,
     OrderReceiptRead,
     OrderRelatedRead,
+    OrderReopen,
 )
 from nexasalon_api.services import orders as orders_service
 
@@ -40,6 +41,12 @@ _edit_price = require_permission("orders.edit_price")
 # `ManageAccessDrawer`), não só os dois roles de sistema.
 _register_payment = require_permission("payments.register")
 _cancel = require_permission("orders.cancel")
+# Rodada "Reabertura e Cancelamento de Comandas" — permission SEPARADA
+# de `orders.cancel` (migration 0045, só OWNER/ADMIN por padrão):
+# reabrir desfaz uma venda já recebida (pagamento/estoque/comissão),
+# operação bem mais sensível que cancelar uma comanda ainda sem
+# pagamento — ver `services/orders.py::reopen_order`.
+_reopen = require_permission("orders.reopen")
 
 # Produto na comanda reaproveita as MESMAS fronteiras de autorização de
 # serviço na comanda — adicionar/remover produto é "gerenciar a
@@ -266,4 +273,19 @@ def cancel_order(
     actor: ActorContext = Depends(_cancel),
 ) -> OrderRead:
     order = orders_service.cancel_order(session, actor, order_id, payload)
+    return OrderRead.from_order(order)
+
+
+@router.post(
+    "/{order_id}/reopen",
+    response_model=OrderRead,
+    summary="Reabrir uma comanda finalizada — desfaz pagamento/estoque/comissão (motivo obrigatório)",
+)
+def reopen_order(
+    order_id: uuid.UUID,
+    payload: OrderReopen,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_reopen),
+) -> OrderRead:
+    order = orders_service.reopen_order(session, actor, order_id, payload)
     return OrderRead.from_order(order)

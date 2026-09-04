@@ -63,6 +63,17 @@ class OrderCancel(BaseModel):
     reason: str = Field(min_length=3, max_length=255)
 
 
+class OrderReopen(BaseModel):
+    """`POST /orders/{id}/reopen` — reabrir uma comanda FECHADA (desfaz
+    pagamento/estoque/promoção do Appointment, ver
+    `services/orders.py::reopen_order`). Mesmo padrão de `OrderCancel`
+    — motivo sempre obrigatório, nunca opcional, porque essa é a única
+    explicação que fica registrada de por que um pagamento já recebido
+    deixou de contar."""
+
+    reason: str = Field(min_length=3, max_length=255)
+
+
 class OrderItemUpdate(BaseModel):
     """Campos editáveis de uma linha de SERVIÇO da comanda — `price`
     (já existia) e `duration_minutes` (Etapa C — item "edição auditada
@@ -286,6 +297,14 @@ class PaymentRead(BaseModel):
     fee_amount_snapshot: Decimal | None = None
     net_amount_snapshot: Decimal | None = None
     fee_status: PaymentFeeStatus | None = None
+    # Reabertura de comanda (migration 0044) — `reversed_at` preenchido
+    # = este lançamento foi desfeito (`services/orders.py::reopen_order`)
+    # e não conta mais em nenhum total, mas continua na lista pra
+    # sempre (histórico consultável, nunca escondido/apagado). O
+    # frontend usa isto pra mostrar "Estornado" na linha, nunca infere
+    # isso do valor/método.
+    reversed_at: datetime | None = None
+    reversed_by_name: str | None = None
 
 
 class OrderRead(BaseModel):

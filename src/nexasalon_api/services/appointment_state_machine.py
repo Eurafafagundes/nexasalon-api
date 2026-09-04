@@ -78,6 +78,39 @@ _CANCELLABLE_FROM = frozenset(
     }
 )
 
+# Rodada "Reabertura e Cancelamento de Comandas" — cancelar a Comanda
+# ABERTA vinculada a um Appointment precisa poder cancelar o Appointment
+# TAMBÉM, mesmo raciocínio de `_CANCELLABLE_FROM` acima, mas incluindo
+# `FINISHED`: uma Comanda pode nascer de um Appointment já concluído
+# (`create_order` não exige nenhum status específico — é o caso mais
+# comum, comanda aberta depois do atendimento pronto), e cancelar essa
+# Comanda por engano precisa liberar o horário mesmo assim. Constante
+# SEPARADA de `_CANCELLABLE_FROM` (não reaproveitada) — a diferença é
+# proposital, então nunca fica implícita.
+_CANCELLABLE_FROM_VIA_LINKED_ORDER = _CANCELLABLE_FROM | {AppointmentStatus.FINISHED}
+
+
+def is_cancellable_via_linked_order(current: AppointmentStatus) -> bool:
+    return current in _CANCELLABLE_FROM_VIA_LINKED_ORDER
+
+
+def demote_paid_for_reopen(current: AppointmentStatus) -> AppointmentStatus | None:
+    """Usado SÓ por `services/orders.py::reopen_order`, o inverso de
+    `mark_paid` — reabrir a Comanda que promoveu o Appointment pra
+    `PAID` precisa desfazer essa promoção também (senão a Order volta
+    pra `OPEN` com o Appointment ainda `PAID`, inconsistente). Sempre
+    volta pra `FINISHED` (nunca tenta "lembrar" em que status
+    operacional o Appointment estava antes de virar `PAID` — não é
+    rastreado, e `FINISHED` é a suposição mais segura: o atendimento
+    claramente já tinha acontecido pra chegar a ser cobrado). Devolve
+    `None` (nenhuma mudança) se o Appointment não estiver `PAID` —
+    idempotência: uma segunda reabertura, ou um Appointment que nunca
+    chegou a ser promovido, não deve levantar erro nem "regredir" nada."""
+    if current != AppointmentStatus.PAID:
+        return None
+    return AppointmentStatus.FINISHED
+
+
 # Etapa N5 — de quais estados dá pra reagendar (mudar só data/horário,
 # nunca serviço/profissional). Mesmo conjunto de `_CANCELLABLE_FROM`
 # hoje (um agendamento concluído/pago/cancelado/faltou não faz sentido
