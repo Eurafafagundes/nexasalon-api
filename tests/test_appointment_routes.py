@@ -190,6 +190,30 @@ def test_isolamento_entre_organizacoes_via_http(client_as, org_a_actor, org_b_ac
     assert resp_b.status_code == 404
 
 
+def test_agenda_list_isolamento_entre_organizacoes_via_http(client_as, org_a_actor, org_b_actor):
+    """`GET /api/v1/agenda` (usado pela Agenda pra carregar a grade) só
+    devolve itens da própria organização — mesmo `org_b_actor` com
+    `agenda.view_all` de fábrica (`org_b_actor`/`seed_organization`
+    concede TODAS as permissions) não vê nada da Org A."""
+    c_a = client_as(org_a_actor)
+    branch, professional, service, client = _setup_agenda(c_a)
+    c_a.post(
+        "/api/v1/appointments",
+        json={
+            "branch_id": branch["id"], "client_id": client["id"],
+            "items": [{"professional_id": professional["id"], "service_id": service["id"], "start_at": _START}],
+        },
+    )
+
+    resp_a = c_a.get("/api/v1/agenda", params={"date": "2026-08-13", "branch_id": branch["id"]})
+    assert resp_a.status_code == 200, resp_a.text
+    assert len(resp_a.json()) == 1
+
+    resp_b = client_as(org_b_actor).get("/api/v1/agenda", params={"date": "2026-08-13", "branch_id": branch["id"]})
+    assert resp_b.status_code == 200, resp_b.text
+    assert resp_b.json() == []
+
+
 def test_view_own_via_http(client_as, org_a_actor):
     c = client_as(org_a_actor)
     branch, professional, service, client = _setup_agenda(c)
