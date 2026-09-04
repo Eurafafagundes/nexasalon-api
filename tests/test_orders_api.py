@@ -17,14 +17,11 @@ _START_A = "2026-08-13T14:00:00-03:00"  # quinta-feira
 
 
 def _restricted_actor(base_actor: ActorContext, *, permissions, role_name: str = "Restrito") -> ActorContext:
-    """`role_name` opcional — necessário pra testar `require_role`
-    (`orders.py::_register_payment`), que checa o NOME do role, não uma
-    permission. Os valores reais de sistema são exatamente
-    `"OWNER"`/`"ADMIN"`/`"RECEPTIONIST"`/`"PROFESSIONAL"` (maiúsculas,
-    migration 0007) — note que a fixture `org_a_actor` (conftest.py)
-    usa `role_name="Owner"` (fixture de teste só, não é o valor real de
-    produção), por isso não serve pra testar `require_role` diretamente;
-    use este helper com `role_name="OWNER"` explícito quando precisar."""
+    """`role_name` opcional — só pra dar um nome legível ao ator nos
+    testes (autorização de Comandas é 100% por PERMISSION, não checa
+    `role_name` — ver `orders.py::_register_payment`). Útil pra deixar
+    claro que "Finalizar comandas e pagamentos" funciona mesmo com um
+    role qualquer, nome nenhum de sistema é exigido."""
     with SessionLocal() as session:
         session.execute(
             text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(base_actor.organization_id)}
@@ -170,13 +167,12 @@ def test_permissao_orders_edit_price_e_exigida(client_as, org_a_actor):
     assert resp.status_code == 403
 
 
-def test_role_generico_sem_permissao_nenhuma_e_bloqueado_no_fechamento(client_as, org_a_actor):
-    """Checagem básica da dependency `require_role` na rota: um ator
-    com role qualquer (nem OWNER nem RECEPTIONIST) e sem nenhuma
-    permission — o caso mais simples de bloqueio. Cobertura completa
-    da regra (`OWNER`/`RECEPTIONIST` passam, qualquer outro role
-    bloqueia mesmo com `orders.manage`/`payments.register`) está no
-    bloco de testes de "Decisão de produto" mais abaixo."""
+def test_role_generico_sem_payments_register_e_bloqueado_no_fechamento(client_as, org_a_actor):
+    """Checagem básica da dependency `require_permission("payments.
+    register")` na rota — `orders.view` sozinho (sem `payments.
+    register`) não fecha. Matriz completa dos 3 níveis (view/edit/
+    close) está no bloco de testes de "Decisão de produto" mais
+    abaixo."""
     c = client_as(org_a_actor)
     appt = _setup_finished_appointment(c)
     _open_register_for(c, appt["branch_id"])
@@ -239,16 +235,21 @@ def test_isolamento_multi_tenant_comanda_nao_vaza_entre_organizacoes(client_as, 
 
 
 # ---------------------------------------------------------------------
-# Decisão de produto: confirmar pagamento (fechar comanda) é restrito
-# por ROLE, não por permission — só OWNER ("Master") e RECEPTIONIST
-# ("Recepcionista"), mesmo que outro perfil tenha `orders.manage`/
-# `payments.register` concedidos (ex.: via override customizado em
-# Equipe e acessos). Substitui a regra permission-based da rodada
-# anterior (que aceitava `orders.manage` como alternativa a
-# `payments.register` — reaberta aqui porque permitia exatamente o que
-# esta regra proíbe: qualquer perfil customizado com "Comandas →
-# Gerenciar" conseguia pagar).
+# Decisão de produto: Comandas em 3 NÍVEIS PERMISSION-based, cada um
+# incluindo o anterior — "Visualizar comandas" (`orders.view`),
+# "Criar e editar comandas" (+ `orders.manage` + `orders.edit_price`,
+# mas SEM poder registrar pagamento) e "Finalizar comandas e
+# pagamentos" (+ `payments.register`, reaproveitada — nenhuma
+# permission nova). Substitui a regra ROLE-based da rodada anterior
+# (`require_role("OWNER", "RECEPTIONIST")`) — reaberta aqui porque o
+# pedido real sempre foi RBAC granular: qualquer perfil, inclusive
+# customizado, pode receber "Finalizar" explicitamente em Equipe e
+# acessos, não só os dois roles de sistema.
 # ---------------------------------------------------------------------
+
+_VIEW_LEVEL = {"orders.view"}
+_EDIT_LEVEL = {"orders.view", "orders.manage", "orders.edit_price"}
+_CLOSE_LEVEL = {"orders.view", "orders.manage", "orders.edit_price", "payments.register"}
 
 
 def _open_order_ready_to_close(c):
@@ -258,13 +259,9 @@ def _open_order_ready_to_close(c):
     return order, register
 
 
-def test_master_role_owner_pode_fechar_comanda_com_pagamento(client_as, org_a_actor):
-    """`org_a_actor` (fixture de `conftest.py`) já usa `role_name="OWNER"`
-    (maiúsculas, igual à migration 0007 — bug real corrigido: era
-    `"Owner"`, inofensivo até agora porque nada checava `role_name` pra
-    autorização; ajustado em `conftest.py::seed_organization` junto com
-    esta correção, senão TODO teste HTTP que fecha comanda via
-    `org_a_actor` diretamente quebraria)."""
+def test_master_pode_fechar_comanda_com_pagamento(client_as, org_a_actor):
+    """`org_a_actor` (OWNER de fábrica, todas as permissions) sempre
+    consegue finalizar — "Master deve possuir automaticamente todas"."""
     c = client_as(org_a_actor)
     order, register = _open_order_ready_to_close(c)
 
@@ -276,17 +273,62 @@ def test_master_role_owner_pode_fechar_comanda_com_pagamento(client_as, org_a_ac
     assert resp.json()["status"] == "closed"
 
 
-def test_recepcionista_role_receptionist_pode_fechar_comanda_com_pagamento(client_as, org_a_actor):
-    """O cenário real pedido: role RECEPTIONIST ("Recepcionista") — sem
-    nenhuma permission (o gate agora ignora `actor.permissions`
-    totalmente pra esta ação) — confirma pagamento normalmente."""
-    master_setup = client_as(org_a_actor)
-    order, register = _open_order_ready_to_close(master_setup)
+def test_nivel_1_visualizar_nao_consegue_gerenciar_nem_finalizar(client_as, org_a_actor):
+    """Nível 1 (só `orders.view`) — somente leitura: nem editar item,
+    nem adicionar produto, nem finalizar."""
+    master = client_as(org_a_actor)
+    order, register = _open_order_ready_to_close(master)
+    item_id = order["items"][0]["id"]
 
-    recepcionista_actor = _restricted_actor(org_a_actor, permissions=set(), role_name="RECEPTIONIST")
-    recepcionista = client_as(recepcionista_actor)
+    view_only = client_as(_restricted_actor(org_a_actor, permissions=_VIEW_LEVEL))
 
-    resp = recepcionista.post(
+    assert view_only.get(f"/api/v1/orders/{order['id']}").status_code == 200
+
+    resp_manage = view_only.post(f"/api/v1/orders/{order['id']}/products", json={"product_id": str(uuid.uuid4()), "quantity": "1"})
+    assert resp_manage.status_code == 403, resp_manage.text
+
+    resp_edit = view_only.patch(f"/api/v1/orders/{order['id']}/items/{item_id}", json={"price": "1.00"})
+    assert resp_edit.status_code == 403, resp_edit.text
+
+    resp_close = view_only.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": register["id"]}]},
+    )
+    assert resp_close.status_code == 403, resp_close.text
+
+
+def test_nivel_2_criar_e_editar_consegue_gerenciar_e_editar_mas_nao_finalizar(client_as, org_a_actor):
+    """Nível 2 (`orders.view`+`orders.manage`+`orders.edit_price`) —
+    monta a comanda inteira, mas NÃO registra pagamento nem fecha."""
+    master = client_as(org_a_actor)
+    order, register = _open_order_ready_to_close(master)
+    item_id = order["items"][0]["id"]
+
+    editor = client_as(_restricted_actor(org_a_actor, permissions=_EDIT_LEVEL))
+
+    resp_edit = editor.patch(f"/api/v1/orders/{order['id']}/items/{item_id}", json={"price": "90.00"})
+    assert resp_edit.status_code == 200, resp_edit.text
+
+    resp_close = editor.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": register["id"]}]},
+    )
+    assert resp_close.status_code == 403, resp_close.text
+
+
+def test_nivel_3_finalizar_consegue_tudo_inclusive_fechar_com_pagamento(client_as, org_a_actor):
+    """Nível 3 (+ `payments.register`) — o cenário real pedido: um
+    perfil CUSTOMIZADO (nome de role qualquer, não precisa ser OWNER
+    nem RECEPTIONIST) que recebeu "Finalizar comandas e pagamentos"
+    explicitamente consegue finalizar normalmente. Bug real corrigido
+    em relação à rodada anterior: o gate voltou a ser por PERMISSION,
+    não por nome de role."""
+    master = client_as(org_a_actor)
+    order, register = _open_order_ready_to_close(master)
+
+    closer = client_as(_restricted_actor(org_a_actor, permissions=_CLOSE_LEVEL, role_name="Atendente Sênior"))
+
+    resp = closer.post(
         f"/api/v1/orders/{order['id']}/close",
         json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": register["id"]}]},
     )
@@ -294,7 +336,7 @@ def test_recepcionista_role_receptionist_pode_fechar_comanda_com_pagamento(clien
     assert resp.json()["status"] == "closed"
 
 
-def test_recepcionista_fecha_consolidado_tambem(client_as, org_a_actor):
+def test_nivel_3_fecha_consolidado_tambem(client_as, org_a_actor):
     """Mesma regra em `close-consolidated`
     (`orders.py::close_orders_consolidated` usa a mesma dependency)."""
     master = client_as(org_a_actor)
@@ -307,10 +349,9 @@ def test_recepcionista_fecha_consolidado_tambem(client_as, org_a_actor):
     order2 = master.post("/api/v1/orders", json={"appointment_id": appt2["id"]}).json()
     total = str(float(order1["total"]) + float(order2["total"]))
 
-    recepcionista_actor = _restricted_actor(org_a_actor, permissions=set(), role_name="RECEPTIONIST")
-    recepcionista = client_as(recepcionista_actor)
+    closer = client_as(_restricted_actor(org_a_actor, permissions=_CLOSE_LEVEL))
 
-    resp = recepcionista.post(
+    resp = closer.post(
         f"/api/v1/orders/{order1['id']}/close-consolidated",
         json={
             "order_ids": [order1["id"], order2["id"]],
@@ -323,54 +364,22 @@ def test_recepcionista_fecha_consolidado_tambem(client_as, org_a_actor):
     assert statuses[order2["id"]] == "closed"
 
 
-def test_profissional_nao_consegue_registrar_pagamento(client_as, org_a_actor):
-    """Role PROFESSIONAL — mesmo com `orders.view`+`orders.manage`
-    concedidos (consegue visualizar/gerenciar a comanda normalmente),
-    não pode confirmar pagamento."""
+def test_usuario_sem_nenhuma_permissao_de_comandas_bloqueado(client_as, org_a_actor):
     master = client_as(org_a_actor)
     order, register = _open_order_ready_to_close(master)
 
-    profissional_actor = _restricted_actor(
-        org_a_actor, permissions={"orders.view", "orders.manage"}, role_name="PROFESSIONAL"
-    )
-    profissional = client_as(profissional_actor)
+    sem_acesso = client_as(_restricted_actor(org_a_actor, permissions={"clients.view", "finance.view"}))
 
-    resp = profissional.post(
-        f"/api/v1/orders/{order['id']}/close",
-        json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": register["id"]}]},
-    )
-    assert resp.status_code == 403, resp.text
-    assert "Apenas Usuário Master e Recepcionista" in resp.json()["error"]["message"]
-
-
-def test_outro_perfil_customizado_com_orders_manage_e_payments_register_continua_bloqueado(
-    client_as, org_a_actor
-):
-    """Bug real corrigido: um perfil CUSTOMIZADO (não é literalmente
-    OWNER nem RECEPTIONIST) com `orders.manage` E `payments.register`
-    concedidos — exatamente o que a correção da rodada anterior
-    permitia — agora continua bloqueado. O gate é 100% pelo NOME do
-    role, nenhuma combinação de permission contorna."""
-    master = client_as(org_a_actor)
-    order, register = _open_order_ready_to_close(master)
-
-    outro_perfil_actor = _restricted_actor(
-        org_a_actor,
-        permissions={"orders.view", "orders.manage", "payments.register"},
-        role_name="Atendente Personalizado",
-    )
-    outro_perfil = client_as(outro_perfil_actor)
-
-    resp = outro_perfil.post(
+    resp = sem_acesso.post(
         f"/api/v1/orders/{order['id']}/close",
         json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": register["id"]}]},
     )
     assert resp.status_code == 403, resp.text
 
 
-def test_outro_tenant_nao_fecha_comanda_mesmo_sendo_role_owner(client_as, org_a_actor, org_b_actor):
-    """Isolamento por Organization é ortogonal ao role — `org_b_actor`
-    também é role OWNER (a mesma fixture corrigida), mas de OUTRA
+def test_outro_tenant_nao_fecha_comanda_mesmo_com_nivel_3(client_as, org_a_actor, org_b_actor):
+    """Isolamento por Organization é ortogonal à permissão — `org_b_actor`
+    tem TODAS as permissions (nível 3 incluso), mas de OUTRA
     organização, e nunca deve conseguir fechar uma comanda que pertence
     à organização de `org_a_actor`."""
     c_a = client_as(org_a_actor)
@@ -384,21 +393,129 @@ def test_outro_tenant_nao_fecha_comanda_mesmo_sendo_role_owner(client_as, org_a_
     assert resp.status_code in (403, 404), resp.text
 
 
-def test_orders_manage_nao_concede_acesso_ao_modulo_financeiro(client_as, org_a_actor):
-    """`orders.manage` (mesmo sozinho, ou combinado com um role qualquer)
-    nunca satisfaz `finance.view`/`finance.manage` (Extrato, Caixa,
-    configuração de taxas) — módulos inteiramente independentes desta
-    regra."""
-    funcionario_actor = _restricted_actor(
-        org_a_actor, permissions={"orders.view", "orders.manage"}, role_name="Atendente Personalizado"
+def test_orders_manage_sozinho_nao_concede_acesso_ao_modulo_financeiro(client_as, org_a_actor):
+    """Nível 2 (`orders.manage`, sem `payments.register`) não abre
+    Extrato/Caixa/Taxas — nem sequer a listagem de caixas (que só o
+    nível 3 destrava, ver teste seguinte)."""
+    editor = client_as(_restricted_actor(org_a_actor, permissions=_EDIT_LEVEL))
+
+    assert editor.get("/api/v1/extract").status_code == 403
+    assert editor.get("/api/v1/cash-registers").status_code == 403
+    assert editor.get("/api/v1/payment-fee-rules").status_code == 403
+
+
+def test_payments_register_libera_so_a_listagem_de_caixas_nunca_o_resto_do_financeiro(client_as, org_a_actor):
+    """Bug real corrigido nesta rodada: nível 3 (`payments.register`)
+    precisa listar os caixas ABERTOS pra escolher qual recebe o
+    pagamento (mesma classe de bug já corrigida em
+    `orders.py::mark_paid`) — sem abrir NADA além disso do Financeiro:
+    nem o detalhe de um caixa (que leva faturamento/totais), nem abrir/
+    fechar caixa, nem Extrato, nem Taxas."""
+    master = client_as(org_a_actor)
+    appt = _setup_finished_appointment(master)
+    register = _open_register_for(master, appt["branch_id"])
+
+    closer = client_as(_restricted_actor(org_a_actor, permissions=_CLOSE_LEVEL))
+
+    list_resp = closer.get("/api/v1/cash-registers", params={"status": "open"})
+    assert list_resp.status_code == 200, list_resp.text
+    assert any(r["id"] == register["id"] for r in list_resp.json())
+
+    detail_resp = closer.get(f"/api/v1/cash-registers/{register['id']}")
+    assert detail_resp.status_code == 403, detail_resp.text
+
+    open_resp = closer.post("/api/v1/cash-registers", json={"branch_id": appt["branch_id"], "initial_amount": "0"})
+    assert open_resp.status_code == 403, open_resp.text
+
+    close_register_resp = closer.post(
+        f"/api/v1/cash-registers/{register['id']}/close", json={"counted_amount": "0"}
     )
-    funcionario = client_as(funcionario_actor)
+    assert close_register_resp.status_code == 403, close_register_resp.text
 
-    extrato_resp = funcionario.get("/api/v1/extract")
-    assert extrato_resp.status_code == 403, extrato_resp.text
+    assert closer.get("/api/v1/extract").status_code == 403
+    assert closer.get("/api/v1/payment-fee-rules").status_code == 403
 
-    caixas_resp = funcionario.get("/api/v1/cash-registers")
-    assert caixas_resp.status_code == 403, caixas_resp.text
 
-    taxas_resp = funcionario.get("/api/v1/payment-fee-rules")
-    assert taxas_resp.status_code == 403, taxas_resp.text
+# ---------------------------------------------------------------------
+# Cadastro de cliente durante o fluxo da Comanda — nível 2 ("Criar e
+# editar comandas") precisa conseguir pesquisar/cadastrar o cliente
+# necessário pra abrir a comanda, sem ganhar o módulo inteiro de
+# Clientes. `POST /clients` e `GET /clients/lookup` já aceitavam a
+# permissão granular `clients.create`/`clients.lookup` (migration 0030,
+# criada originalmente pro mesmo motivo — Agenda), então a solução é
+# reaproveitar essas duas chaves, NUNCA `clients.manage`/`clients.view`
+# nem acoplar `orders.manage` a Clientes no backend (ver
+# `ManageAccessDrawer::COMANDAS_EDIT_KEYS`, que agora inclui as duas).
+# ---------------------------------------------------------------------
+
+_EDIT_LEVEL_WITH_CLIENT_OPS = _EDIT_LEVEL | {"clients.lookup", "clients.create"}
+_CLOSE_LEVEL_WITH_CLIENT_OPS = _CLOSE_LEVEL | {"clients.lookup", "clients.create"}
+
+
+def test_nivel_1_visualizar_nao_cadastra_nem_pesquisa_cliente(client_as, org_a_actor):
+    view_only = client_as(_restricted_actor(org_a_actor, permissions=_VIEW_LEVEL))
+
+    create_resp = view_only.post("/api/v1/clients", json={"name": "Cliente Novo", "phone": "61911112222"})
+    assert create_resp.status_code == 403, create_resp.text
+
+    lookup_resp = view_only.get("/api/v1/clients/lookup", params={"search": "Cliente"})
+    assert lookup_resp.status_code == 403, lookup_resp.text
+
+
+def test_nivel_2_orders_manage_sozinho_nao_cadastra_cliente(client_as, org_a_actor):
+    """`orders.manage`/`orders.edit_price` sozinhos (sem as chaves
+    operacionais de Clientes) continuam bloqueados — a permissão
+    NUNCA foi acoplada no backend; quem monta um perfil customizado só
+    com as chaves de Comandas, sem passar pelo bundle padrão do
+    `ManageAccessDrawer`, precisa conceder `clients.lookup`/
+    `clients.create` explicitamente."""
+    editor_sem_client_ops = client_as(_restricted_actor(org_a_actor, permissions=_EDIT_LEVEL))
+
+    create_resp = editor_sem_client_ops.post(
+        "/api/v1/clients", json={"name": "Cliente Novo", "phone": "61911112222"}
+    )
+    assert create_resp.status_code == 403, create_resp.text
+
+
+def test_nivel_2_criar_e_editar_cadastra_e_pesquisa_cliente(client_as, org_a_actor):
+    """Com o bundle padrão que `ManageAccessDrawer` concede pra "Criar e
+    editar comandas" (`_EDIT_LEVEL` + `clients.lookup`/`clients.create`)
+    — cadastra cliente novo e pesquisa cliente já existente, sem
+    `clients.view`/`clients.manage`."""
+    editor = client_as(_restricted_actor(org_a_actor, permissions=_EDIT_LEVEL_WITH_CLIENT_OPS))
+
+    create_resp = editor.post("/api/v1/clients", json={"name": "Cliente Novo", "phone": "61911112222"})
+    assert create_resp.status_code == 201, create_resp.text
+
+    lookup_resp = editor.get("/api/v1/clients/lookup", params={"search": "Cliente Novo"})
+    assert lookup_resp.status_code == 200, lookup_resp.text
+    assert any(item["id"] == create_resp.json()["id"] for item in lookup_resp.json())
+
+    # Nunca abre a Ficha 360°/listagem completa — isso continua exigindo
+    # `clients.view`/`clients.manage`, que este ator não tem.
+    assert editor.get("/api/v1/clients").status_code == 403
+    assert editor.get(f"/api/v1/clients/{create_resp.json()['id']}").status_code == 403
+
+
+def test_nivel_3_finalizar_tambem_cadastra_cliente(client_as, org_a_actor):
+    """Nível 3 inclui o nível 2 por completo — também cadastra cliente."""
+    closer = client_as(_restricted_actor(org_a_actor, permissions=_CLOSE_LEVEL_WITH_CLIENT_OPS))
+
+    resp = closer.post("/api/v1/clients", json={"name": "Cliente Nível 3", "phone": "61933334444"})
+    assert resp.status_code == 201, resp.text
+
+
+def test_isolamento_multi_tenant_no_cadastro_de_cliente_via_nivel_2(client_as, org_a_actor, org_b_actor):
+    """Cliente cadastrado por um ator de nível 2 nasce sempre na
+    organização do próprio ator (derivada do `ActorContext`, nunca de
+    um campo enviado pelo frontend) — outro tenant, mesmo com o mesmo
+    bundle de permissões, não o enxerga."""
+    editor_a = client_as(_restricted_actor(org_a_actor, permissions=_EDIT_LEVEL_WITH_CLIENT_OPS))
+    created = editor_a.post(
+        "/api/v1/clients", json={"name": "Só da Org A via Comanda", "phone": "61955556666"}
+    ).json()
+
+    editor_b = client_as(_restricted_actor(org_b_actor, permissions=_EDIT_LEVEL_WITH_CLIENT_OPS))
+    lookup_resp = editor_b.get("/api/v1/clients/lookup", params={"search": "Só da Org A via Comanda"})
+    assert lookup_resp.status_code == 200, lookup_resp.text
+    assert all(item["id"] != created["id"] for item in lookup_resp.json())
