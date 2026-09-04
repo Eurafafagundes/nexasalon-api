@@ -340,7 +340,7 @@ def test_profissional_nao_consegue_registrar_pagamento(client_as, org_a_actor):
         json={"payments": [{"method": "pix", "amount": order["total"], "cash_register_id": register["id"]}]},
     )
     assert resp.status_code == 403, resp.text
-    assert "Apenas Master e Recepcionista" in resp.json()["error"]["message"]
+    assert "Apenas Usuário Master e Recepcionista" in resp.json()["error"]["message"]
 
 
 def test_outro_perfil_customizado_com_orders_manage_e_payments_register_continua_bloqueado(

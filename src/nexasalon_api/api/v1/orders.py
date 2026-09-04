@@ -29,7 +29,7 @@ _view = require_permission("orders.view")
 _manage = require_permission("orders.manage")
 _edit_price = require_permission("orders.edit_price")
 # Decisão de produto: confirmar pagamento é restrito por ROLE, não por
-# permission — só OWNER ("Master") e RECEPTIONIST ("Recepcionista")
+# permission — só OWNER ("Usuário Master") e RECEPTIONIST ("Recepcionista")
 # podem fechar comanda com pagamento, mesmo que outro perfil tenha
 # `orders.manage`/`payments.register` concedidos (ex.: via override
 # customizado em Equipe e acessos). Substitui a rodada anterior, que
@@ -45,7 +45,7 @@ _register_payment = require_role(
     "RECEPTIONIST",
     message=(
         "Seu perfil de acesso não permite confirmar pagamentos. "
-        "Apenas Master e Recepcionista podem realizar esta ação."
+        "Apenas Usuário Master e Recepcionista podem realizar esta ação."
     ),
 )
 _cancel = require_permission("orders.cancel")
