@@ -1,7 +1,7 @@
 import uuid
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from nexasalon_api.models.enums import MembershipStatus
 from nexasalon_api.models.identity import OrganizationMembership
@@ -9,6 +9,26 @@ from nexasalon_api.models.identity import OrganizationMembership
 
 def get(session: Session, membership_id: uuid.UUID) -> OrganizationMembership | None:
     return session.get(OrganizationMembership, membership_id)
+
+
+def get_with_user_and_role(session: Session, membership_id: uuid.UUID) -> OrganizationMembership | None:
+    """Igual a `get`, mas resolve `.user`/`.role` no MESMO round trip
+    (`joinedload`, 1 query com JOIN) em vez de precisar de 2 buscas
+    adicionais separadas depois. Item de performance (Etapa 2A, "quick
+    win 3") — usado exclusivamente por
+    `api/deps.py::_get_real_current_actor` (o caminho de autenticação
+    de TODA requisição), que antes fazia `membership_repo.get` +
+    `user_repo.get` + `rbac_repo.get_role` como 3 SELECTs
+    independentes. `get` acima continua exatamente como estava — nenhum
+    outro chamador foi tocado, e nenhuma coluna/relacionamento novo foi
+    criado, só uma forma de buscar o que já existia com menos idas ao
+    banco."""
+    stmt = (
+        select(OrganizationMembership)
+        .options(joinedload(OrganizationMembership.user), joinedload(OrganizationMembership.role))
+        .where(OrganizationMembership.id == membership_id)
+    )
+    return session.scalars(stmt).first()
 
 
 def get_by_user_and_org(

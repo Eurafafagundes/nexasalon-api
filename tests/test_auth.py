@@ -21,17 +21,21 @@ import uuid
 
 import jwt
 import pytest
+from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import event, text
 
+from nexasalon_api.api.deps import _get_real_current_actor
 from nexasalon_api.core.config import settings
 from nexasalon_api.core.db import SessionLocal
+from nexasalon_api.core.db import engine as db_engine
 from nexasalon_api.core.rate_limit import rate_limiter
-from nexasalon_api.core.security import hash_password
+from nexasalon_api.core.security import create_access_token, hash_password
 from nexasalon_api.main import app
 from nexasalon_api.models.enums import MembershipStatus, PermissionEffect
 from nexasalon_api.models.identity import MembershipPermissionOverride, OrganizationMembership, User
 from nexasalon_api.models.organization import Organization
+from nexasalon_api.models.professional import Professional
 
 
 @pytest.fixture(autouse=True)
@@ -544,6 +548,156 @@ def test_remover_acesso_nao_afeta_outra_organization(client, scenario):
         json={"org_selection_token": multi_login["org_selection_token"], "organization_id": str(scenario.org_a_id)},
     )
     assert select_a.status_code == 403
+
+
+# ---------------------------------------------------------------------
+# Etapa 2A, item 3 — `_get_real_current_actor` consolida
+# `membership_repo.get` + `rbac_repo.get_role` num único JOIN
+# (`membership_repo.get_with_user_and_role`). `compute_effective_
+# permissions` NÃO foi tocado. Estes testes provam que o resultado é
+# funcionalmente idêntico ao de antes — mesma permissão, mesmo role,
+# mesmo profissional associado, mesmo corte de acesso — e medem a
+# contagem real de queries.
+# ---------------------------------------------------------------------
+
+
+def test_membership_removida_corta_acesso_imediatamente(client, scenario):
+    """Mesmo raciocínio de `test_membership_desativada_corta_acesso_
+    imediatamente`, agora com `MembershipStatus.REMOVED` (item "Remover
+    acesso") — o check em `_get_real_current_actor` é `status !=
+    ACTIVE`, nunca uma lista de status "ruins" enumerados, então
+    REMOVED é cortado pelo EXATO MESMO caminho que SUSPENDED, incluindo
+    depois da consolidação de queries desta rodada."""
+    body = _login(client, scenario.recep_email, scenario.password)
+    access_token = body["tokens"]["access_token"]
+
+    me_before = client.get("/api/v1/auth/me", headers=_auth_headers(access_token))
+    assert me_before.status_code == 200
+
+    session = SessionLocal()
+    session.execute(
+        text("SELECT set_config('app.current_org_id', :oid, true)"), {"oid": str(scenario.org_a_id)}
+    )
+    membership = session.get(OrganizationMembership, scenario.recep_membership_id)
+    membership.status = MembershipStatus.REMOVED
+    session.commit()
+    session.close()
+
+    me_after = client.get("/api/v1/auth/me", headers=_auth_headers(access_token))
+    assert me_after.status_code == 403
+
+    refresh_after = client.post("/api/v1/auth/refresh", headers=_csrf_headers())
+    assert refresh_after.status_code == 403
+
+
+def test_get_current_actor_resolve_professional_associado_ao_usuario(client, scenario):
+    """`ActorContext.professional_id` (exposto em `/auth/me` via
+    `membership.professional_id`) é resolvido por uma busca SEPARADA
+    (`professional_repo.get_by_user`), não tocada por este item — mas
+    precisa continuar funcionando IDENTICAMENTE depois da consolidação
+    de `membership`/`user`/`role` num único JOIN."""
+    session = SessionLocal()
+    session.execute(
+        text("SELECT set_config('app.current_org_id', :oid, true)"), {"oid": str(scenario.org_a_id)}
+    )
+    professional = Professional(
+        organization_id=scenario.org_a_id, name="Profissional Vinculado", user_id=scenario.prof_user_id
+    )
+    session.add(professional)
+    session.commit()
+    professional_id = professional.id
+    session.close()
+
+    body = _login(client, scenario.prof_email, scenario.password)
+    me = client.get("/api/v1/auth/me", headers=_auth_headers(body["tokens"]["access_token"]))
+    assert me.status_code == 200
+    assert me.json()["membership"]["professional_id"] == str(professional_id)
+
+
+def test_get_real_current_actor_resultado_identico_para_master_recepcionista_profissional(client, scenario):
+    """Chama `_get_real_current_actor` DIRETAMENTE (sem passar pela
+    rota) para os três perfis do cenário — prova que `role_name`,
+    `permissions` e `organization_id` continuam batendo exatamente com
+    o que os testes de permissão já estabelecidos
+    (`test_owner_continua_com_todas_as_permissoes_do_catalogo`,
+    `test_permissions_efetivas_por_role`) esperam, agora vindos do
+    caminho consolidado (`get_with_user_and_role`)."""
+    cases = [
+        (scenario.single_org_user_id, scenario.single_membership_id, "OWNER"),
+        (scenario.recep_user_id, scenario.recep_membership_id, "RECEPTIONIST"),
+        (scenario.prof_user_id, scenario.prof_membership_id, "PROFESSIONAL"),
+    ]
+    for user_id, membership_id, expected_role in cases:
+        token = create_access_token(user_id=user_id, organization_id=scenario.org_a_id, membership_id=membership_id)
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        actor = _get_real_current_actor(credentials)
+        assert actor.role_name == expected_role
+        assert actor.organization_id == scenario.org_a_id
+        assert actor.user_id == user_id
+        assert actor.membership_id == membership_id
+        assert len(actor.permissions) > 0
+
+
+def test_get_real_current_actor_tenant_isolation_preservado(client, scenario):
+    """Um token com `organization_id` que não bate com a organização
+    real da membership continua sendo recusado — mesma checagem de
+    antes (`membership.organization_id != organization_id`), agora
+    dentro da query consolidada."""
+    from nexasalon_api.core.exceptions import ForbiddenError
+
+    token = create_access_token(
+        user_id=scenario.single_org_user_id, organization_id=scenario.org_b_id,
+        membership_id=scenario.single_membership_id,
+    )
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    with pytest.raises(ForbiddenError):
+        _get_real_current_actor(credentials)
+
+
+def test_get_real_current_actor_conta_queries_e_elimina_a_busca_separada_de_role(client, scenario):
+    """Contagem real de queries — prova mensurável do item 3.
+
+    ANTES desta rodada (contado no código, linha a linha):
+      2x set_config + user.get (1) + membership.get (1) + role.get (1)
+      + compute_effective_permissions (2) + professional.get_by_user (1)
+      + resolve_viewable_and_editable_ids (0, escopo ALL/ALL default)
+      = 8 SELECTs.
+
+    DEPOIS: `membership.get` + `role.get` viram UMA query só
+    (`get_with_user_and_role`, JOIN) = 7 SELECTs — 1 query eliminada
+    por requisição autenticada, sem mudar nenhum resultado.
+
+    Medido aqui via `before_cursor_execute` chamando
+    `_get_real_current_actor` diretamente (isola só esta função, sem o
+    resto da pipeline de `/auth/me`, que tem suas próprias queries não
+    tocadas por este item)."""
+    token = create_access_token(
+        user_id=scenario.single_org_user_id, organization_id=scenario.org_a_id,
+        membership_id=scenario.single_membership_id,
+    )
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+    statements: list[str] = []
+
+    def _counter(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(db_engine, "before_cursor_execute", _counter)
+    try:
+        actor = _get_real_current_actor(credentials)
+    finally:
+        event.remove(db_engine, "before_cursor_execute", _counter)
+
+    selects = [s for s in statements if s.strip().upper().startswith("SELECT")]
+    assert len(selects) == 7, selects
+
+    # Nenhuma query busca `roles` sozinha (sem JOIN com
+    # organization_memberships) — prova direta de que a busca separada
+    # de role foi eliminada, não só "coincidentemente" reduzida.
+    roles_only = [s for s in selects if "roles" in s.lower() and "organization_memberships" not in s.lower()]
+    assert roles_only == [], roles_only
+
+    assert actor.role_name == "OWNER"
 
 
 # ---------------------------------------------------------------------

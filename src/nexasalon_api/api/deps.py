@@ -45,7 +45,6 @@ from nexasalon_api.repositories import (
     membership_repo,
     organization_repo,
     professional_repo,
-    rbac_repo,
     user_repo,
 )
 from nexasalon_api.services import agenda_access
@@ -93,7 +92,21 @@ def _get_real_current_actor(
         # organização A não consegue, mesmo manipulando IDs, chegar aos
         # dados da B: o token só é aceito para a org com a qual ele foi
         # emitido, e essa membership é reconferida a cada request.
-        membership = membership_repo.get(session, membership_id)
+        #
+        # Item de performance (Etapa 2A, "quick win 3") —
+        # `get_with_user_and_role` busca `membership` JÁ com `.role`
+        # resolvido no mesmo JOIN (1 SELECT em vez de 2: antes,
+        # `membership_repo.get` + `rbac_repo.get_role` separados). O
+        # fetch de `user` acima continua EXATAMENTE como antes — uma
+        # busca independente por `user_id` (não via `membership.user`)
+        # — de propósito: preserva, sem nenhuma alteração, a ordem e o
+        # tipo exato de erro em qualquer cenário, inclusive um token
+        # adulterado/obsoleto onde `membership.user_id` divergisse de
+        # `user_id` (nunca acontece com um token emitido por este
+        # sistema, mas o comportamento continua idêntico ao de antes
+        # mesmo nesse caso hipotético). `compute_effective_permissions`
+        # não foi tocado.
+        membership = membership_repo.get_with_user_and_role(session, membership_id)
         if (
             membership is None
             or membership.user_id != user_id
@@ -103,7 +116,7 @@ def _get_real_current_actor(
         if membership.status != MembershipStatus.ACTIVE:
             raise ForbiddenError("Membership inativa — acesso revogado.")
 
-        role = rbac_repo.get_role(session, membership.role_id)
+        role = membership.role
         permissions = compute_effective_permissions(session, membership)
         professional = professional_repo.get_by_user(session, organization_id, user_id)
 

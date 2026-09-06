@@ -45,6 +45,32 @@ def _serialize_transfer(transfer: StockTransfer, actor: ActorContext, session: S
     return read
 
 
+def _serialize_transfers(
+    transfers: list[StockTransfer], actor: ActorContext, session: Session
+) -> list[StockTransferRead]:
+    """Igual a `[_serialize_transfer(t, ...) for t in transfers]`, mas
+    busca os movimentos de TODAS as transferências numa única query em
+    lote (item de performance, "quick win 4") em vez de uma consulta
+    por transferência. Mesmo schema de resposta, mesmo agrupamento de
+    `movements` por transferência — só troca N queries por 1."""
+    movements = stock_movement_repo.list_for_transfers(session, actor.organization_id, [t.id for t in transfers])
+    # `StockMovement.transfer_id` é `UUID | None` no schema (nem todo
+    # movimento é de transferência), mas a query acima já filtra
+    # `transfer_id IN (...)` — nunca None na prática aqui.
+    movements_by_transfer: dict[uuid.UUID | None, list] = {}
+    for movement in movements:
+        movements_by_transfer.setdefault(movement.transfer_id, []).append(movement)
+
+    reads = []
+    for transfer in transfers:
+        read = StockTransferRead.model_validate(transfer)
+        read.movements = [
+            StockMovementRead.model_validate(m) for m in movements_by_transfer.get(transfer.id, [])
+        ]
+        reads.append(read)
+    return reads
+
+
 @router.post("/stock-movements", status_code=status.HTTP_201_CREATED, summary="Registrar entrada ou saída de estoque")
 def create_stock_movement(
     payload: StockMovementCreate,
@@ -114,7 +140,7 @@ def list_stock_transfers(
     actor: ActorContext = Depends(_view),
 ) -> list[StockTransferRead]:
     transfers = stock_service.list_transfers(session, actor)
-    return [_serialize_transfer(t, actor, session) for t in transfers]
+    return _serialize_transfers(transfers, actor, session)
 
 
 @router.get("/stock-transfers/{transfer_id}", response_model=StockTransferRead, summary="Detalhar transferência")

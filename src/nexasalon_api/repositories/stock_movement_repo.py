@@ -65,6 +65,24 @@ def list_for_transfer(session: Session, organization_id: uuid.UUID, transfer_id:
     return list(session.scalars(stmt).all())
 
 
+def list_for_transfers(
+    session: Session, organization_id: uuid.UUID, transfer_ids: list[uuid.UUID]
+) -> list[StockMovement]:
+    """Busca em LOTE (`WHERE transfer_id IN (...)`) — item de
+    performance (Etapa 2A, "quick win 4"): evita 1 `list_for_transfer`
+    por transferência quando o chamador precisa dos movimentos de
+    VÁRIAS transferências de uma vez (`GET /stock-transfers`, listagem
+    — ver `api/v1/stock.py`). Quem chama agrupa por `transfer_id` em
+    Python; `list_for_transfer` (acima) continua igual, usada pelos
+    endpoints de UMA transferência só (criar/detalhar)."""
+    if not transfer_ids:
+        return []
+    stmt = select(StockMovement).where(
+        StockMovement.organization_id == organization_id, StockMovement.transfer_id.in_(transfer_ids)
+    ).order_by(StockMovement.created_at)
+    return list(session.scalars(stmt).all())
+
+
 def list_for_inventory_count(
     session: Session, organization_id: uuid.UUID, inventory_count_id: uuid.UUID
 ) -> list[StockMovement]:

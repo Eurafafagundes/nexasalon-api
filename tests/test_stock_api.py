@@ -149,6 +149,63 @@ def test_transferencia_via_api(client_as, org_a_actor):
     assert by_branch[destination] == "4.000"
 
 
+def test_listar_transferencias_busca_movimentos_em_lote_nunca_um_por_transferencia(client_as, org_a_actor):
+    """Item de performance (Etapa 2A, "quick win 4") —
+    `GET /stock-transfers` resolvia os movimentos de cada transferência
+    com uma query SEPARADA por transferência (1+N). Cria 3
+    transferências e prova: (1) o resultado continua idêntico — cada
+    transferência com seus 2 movimentos corretos (IN/OUT); (2) só UMA
+    query bate em `stock_movements` filtrando `transfer_id`, nunca uma
+    por transferência."""
+    from sqlalchemy import event
+
+    from nexasalon_api.core.db import engine as db_engine
+
+    c = client_as(org_a_actor)
+    origin = _branch_id(org_a_actor)
+    destination = _branch_id(org_a_actor)
+    product = c.post("/api/v1/products", json={"name": "Produto Lote"}).json()
+    c.post(
+        "/api/v1/stock-movements",
+        json={"product_id": product["id"], "branch_id": origin, "direction": "in", "reason": "purchase", "quantity": "30"},
+    )
+
+    transfer_ids = []
+    for _ in range(3):
+        resp = c.post(
+            "/api/v1/stock-transfers",
+            json={"product_id": product["id"], "origin_branch_id": origin, "destination_branch_id": destination, "quantity": "2"},
+        )
+        assert resp.status_code == 201, resp.text
+        transfer_ids.append(resp.json()["id"])
+
+    statements: list[str] = []
+
+    def _counter(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(db_engine, "before_cursor_execute", _counter)
+    try:
+        listed = c.get("/api/v1/stock-transfers")
+    finally:
+        event.remove(db_engine, "before_cursor_execute", _counter)
+
+    assert listed.status_code == 200, listed.text
+    body = listed.json()
+    listed_by_id = {t["id"]: t for t in body if t["id"] in transfer_ids}
+    assert len(listed_by_id) == 3
+    for transfer in listed_by_id.values():
+        assert len(transfer["movements"]) == 2
+        directions = {m["direction"] for m in transfer["movements"]}
+        assert directions == {"in", "out"}
+
+    stock_movement_queries = [
+        s for s in statements
+        if s.strip().upper().startswith("SELECT") and "stock_movements" in s.lower() and "transfer_id" in s.lower()
+    ]
+    assert len(stock_movement_queries) == 1, stock_movement_queries
+
+
 def test_inventario_completo_via_api(client_as, org_a_actor):
     c = client_as(org_a_actor)
     branch_id = _branch_id(org_a_actor)
