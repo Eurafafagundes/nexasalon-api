@@ -17,6 +17,7 @@ Duas camadas testadas separadamente:
     agenda não deve conseguir buscar diretamente pelo endpoint"."""
 import uuid
 from datetime import datetime, time, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -36,6 +37,7 @@ from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.rbac import Role, RolePermission
 from nexasalon_api.models.service import ProfessionalService, Service
+from nexasalon_api.repositories import agenda_access_repo
 from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate, AppointmentItemUpdate
 from nexasalon_api.services import agenda, agenda_access, appointments
 
@@ -401,6 +403,99 @@ def test_set_agenda_access_persiste_e_resolve_corretamente(org_session):
     )
     session.refresh(membership)
     assert agenda_access.resolve_viewable_ids(session, membership) == frozenset({prof_a.id})
+
+
+def test_resolve_viewable_and_editable_ids_busca_grants_uma_unica_vez(org_session):
+    """Item de performance ("quick win 1"): `resolve_viewable_and_editable_ids`
+    substitui, em `api/deps.py`, a sequência `resolve_viewable_ids` +
+    `resolve_editable_ids` — quando OS DOIS escopos são SELECTED (caso
+    comum, os dois normalmente configurados juntos pela UI de Acessos),
+    a query a `membership_agenda_grants` deve rodar exatamente UMA vez,
+    nunca duas. Mesmo resultado exato de chamar as duas funções
+    separadas (nenhuma regra de escopo/RBAC muda)."""
+    session, org_id = org_session
+    branch, prof_a, prof_b, service, client = _setup_two_professionals(session, org_id)
+    role = _role(session, org_id)
+    membership = _membership(session, org_id, role.id)
+
+    agenda_access.set_agenda_access(
+        session, org_id, membership.id,
+        view_scope=AgendaAccessScope.SELECTED, edit_scope=AgendaAccessScope.SELECTED,
+        viewable_professional_ids=[prof_a.id, prof_b.id], editable_professional_ids=[prof_a.id],
+    )
+    session.refresh(membership)
+
+    call_count = 0
+    real_list_for_membership = agenda_access_repo.list_for_membership
+
+    def _counting(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_list_for_membership(*args, **kwargs)
+
+    with patch.object(agenda_access_repo, "list_for_membership", side_effect=_counting):
+        viewable, editable = agenda_access.resolve_viewable_and_editable_ids(session, membership)
+
+    assert call_count == 1
+    # Mesmo resultado exato das duas funções separadas (asserção acima,
+    # já provada linha 392-393) — só a contagem de queries muda.
+    assert viewable == frozenset({prof_a.id, prof_b.id})
+    assert editable == frozenset({prof_a.id})
+
+
+def test_resolve_viewable_and_editable_ids_com_um_so_escopo_selected_tambem_busca_uma_vez(org_session):
+    """Quando só UM dos dois escopos é SELECTED (o outro ALL), o
+    comportamento já era "uma query só" antes desta rodada — continua
+    assim, e o escopo ALL nunca dispara a query à toa."""
+    session, org_id = org_session
+    branch, prof_a, prof_b, service, client = _setup_two_professionals(session, org_id)
+    role = _role(session, org_id)
+    membership = _membership(session, org_id, role.id)
+
+    agenda_access.set_agenda_access(
+        session, org_id, membership.id,
+        view_scope=AgendaAccessScope.SELECTED, edit_scope=AgendaAccessScope.ALL,
+        viewable_professional_ids=[prof_a.id], editable_professional_ids=[],
+    )
+    session.refresh(membership)
+
+    call_count = 0
+    real_list_for_membership = agenda_access_repo.list_for_membership
+
+    def _counting(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_list_for_membership(*args, **kwargs)
+
+    with patch.object(agenda_access_repo, "list_for_membership", side_effect=_counting):
+        viewable, editable = agenda_access.resolve_viewable_and_editable_ids(session, membership)
+
+    assert call_count == 1
+    assert viewable == frozenset({prof_a.id})
+    assert editable is None  # escopo ALL -> sem restrição adicional, igual a antes.
+
+
+def test_resolve_viewable_and_editable_ids_ambos_all_nunca_consulta_grants(org_session):
+    """Caso mais comum (default de toda membership nova): os dois
+    escopos ALL — nem uma query deveria rodar."""
+    session, org_id = org_session
+    role = _role(session, org_id)
+    membership = _membership(session, org_id, role.id)
+
+    call_count = 0
+    real_list_for_membership = agenda_access_repo.list_for_membership
+
+    def _counting(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_list_for_membership(*args, **kwargs)
+
+    with patch.object(agenda_access_repo, "list_for_membership", side_effect=_counting):
+        viewable, editable = agenda_access.resolve_viewable_and_editable_ids(session, membership)
+
+    assert call_count == 0
+    assert viewable is None
+    assert editable is None
 
 
 # ---------------------------------------------------------------------

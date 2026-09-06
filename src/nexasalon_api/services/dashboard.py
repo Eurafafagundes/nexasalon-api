@@ -410,14 +410,35 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
 
 
 def _first_visit_by_client(
-    session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID | None, client_ids: set[uuid.UUID]
+    session: Session,
+    organization_id: uuid.UUID,
+    branch_id: uuid.UUID | None,
+    client_ids: set[uuid.UUID],
+    cache: dict[tuple[uuid.UUID, uuid.UUID | None, frozenset[uuid.UUID]], dict[uuid.UUID, datetime]] | None = None,
 ) -> dict[uuid.UUID, datetime]:
     """Primeira comanda fechada de cada cliente, olhando o HISTÓRICO
     COMPLETO (sem filtro de data) — precisa disso pra não classificar
     um cliente antigo como "novo" só porque a venda mais recente dele
-    caiu dentro do período filtrado."""
+    caiu dentro do período filtrado.
+
+    `cache` (item de performance, "quick win 2"): opcional, um dict
+    simples criado e descartado por `get_overview`/`get_kpi_detail` a
+    cada chamada — NUNCA global/módulo/Redis, só dura o tempo de UMA
+    requisição. `_new_clients_count`/`_repeat_client_count`/
+    `_repeat_rate`/`_repeat_rate_bucket_values`/`_new_vs_recurring_series`/
+    `_new_clients_bucket_values` chamam esta função com o MESMO
+    (organization_id, branch_id, client_ids) várias vezes dentro de uma
+    única resposta (uma vez por card/sparkline que depende de "primeira
+    visita") — sem cache, a mesma query `GROUP BY Order.client_id` roda
+    de 5 a 7 vezes por request. Com `cache=None` (comportamento
+    default, usado por qualquer chamador que não passe o parâmetro —
+    inclusive testes existentes) o resultado é IDÊNTICO a antes: calcula
+    direto, sem memoizar nada."""
     if not client_ids:
         return {}
+    key = (organization_id, branch_id, frozenset(client_ids))
+    if cache is not None and key in cache:
+        return cache[key]
     stmt = (
         select(Order.client_id, func.min(Order.closed_at))
         .where(
@@ -429,7 +450,10 @@ def _first_visit_by_client(
     )
     if branch_id is not None:
         stmt = stmt.where(Order.branch_id == branch_id)
-    return dict(session.execute(stmt).all())
+    result: dict[uuid.UUID, datetime] = dict(session.execute(stmt).all())
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -628,10 +652,16 @@ def _no_show_rate(data: _PeriodData) -> Decimal:
 
 
 def _new_clients_count(
-    session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID | None, data: _PeriodData, date_from: datetime, date_to: datetime
+    session: Session,
+    organization_id: uuid.UUID,
+    branch_id: uuid.UUID | None,
+    data: _PeriodData,
+    date_from: datetime,
+    date_to: datetime,
+    first_visit_cache: dict | None = None,
 ) -> int:
     client_ids = {row.client_id for row in data.orders}
-    first_visits = _first_visit_by_client(session, organization_id, branch_id, client_ids)
+    first_visits = _first_visit_by_client(session, organization_id, branch_id, client_ids, first_visit_cache)
     return sum(1 for fv in first_visits.values() if date_from <= fv < date_to)
 
 
@@ -649,25 +679,39 @@ def _new_clients_count(
 
 
 def _repeat_client_count(
-    session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID | None, data: _PeriodData, date_from: datetime
+    session: Session,
+    organization_id: uuid.UUID,
+    branch_id: uuid.UUID | None,
+    data: _PeriodData,
+    date_from: datetime,
+    first_visit_cache: dict | None = None,
 ) -> int:
     client_ids = {row.client_id for row in data.orders}
-    first_visits = _first_visit_by_client(session, organization_id, branch_id, client_ids)
+    first_visits = _first_visit_by_client(session, organization_id, branch_id, client_ids, first_visit_cache)
     return sum(1 for cid in client_ids if first_visits.get(cid) is not None and first_visits[cid] < date_from)
 
 
 def _repeat_rate(
-    session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID | None, data: _PeriodData, date_from: datetime
+    session: Session,
+    organization_id: uuid.UUID,
+    branch_id: uuid.UUID | None,
+    data: _PeriodData,
+    date_from: datetime,
+    first_visit_cache: dict | None = None,
 ) -> Decimal:
     served = _clients_served(data)
     if served == 0:
         return Decimal("0")
-    repeat = _repeat_client_count(session, organization_id, branch_id, data, date_from)
+    repeat = _repeat_client_count(session, organization_id, branch_id, data, date_from, first_visit_cache)
     return (Decimal(repeat) / Decimal(served) * Decimal(100)).quantize(Decimal("0.01"))
 
 
 def _repeat_rate_bucket_values(
-    session: Session, filters: DashboardFilters, buckets: list[tuple[datetime, datetime]], data: _PeriodData
+    session: Session,
+    filters: DashboardFilters,
+    buckets: list[tuple[datetime, datetime]],
+    data: _PeriodData,
+    first_visit_cache: dict | None = None,
 ) -> list[Decimal]:
     """Trilha (sparkline) da Taxa de Retorno — referência de "já era
     cliente" é o INÍCIO DE CADA BUCKET (não o início do período inteiro,
@@ -677,7 +721,7 @@ def _repeat_rate_bucket_values(
     card principal — o valor oficial de "Taxa de Retorno" continua
     vindo só de `_repeat_rate`."""
     client_ids = {row.client_id for row in data.orders}
-    first_visit = _first_visit_by_client(session, filters.organization_id, filters.branch_id, client_ids)
+    first_visit = _first_visit_by_client(session, filters.organization_id, filters.branch_id, client_ids, first_visit_cache)
     served_by_bucket: dict[int, set[uuid.UUID]] = defaultdict(set)
     repeat_by_bucket: dict[int, set[uuid.UUID]] = defaultdict(set)
     for row in data.orders:
@@ -1112,9 +1156,10 @@ def _new_vs_recurring_series(
     filters: DashboardFilters,
     buckets: list[tuple[datetime, datetime]],
     data: _PeriodData,
+    first_visit_cache: dict | None = None,
 ) -> list[NewVsRecurringPoint]:
     client_ids = {row.client_id for row in data.orders}
-    first_visit = _first_visit_by_client(session, filters.organization_id, filters.branch_id, client_ids)
+    first_visit = _first_visit_by_client(session, filters.organization_id, filters.branch_id, client_ids, first_visit_cache)
 
     new_by_bucket: dict[int, set[uuid.UUID]] = defaultdict(set)
     recurring_by_bucket: dict[int, set[uuid.UUID]] = defaultdict(set)
@@ -1201,6 +1246,7 @@ def _bucket_values_for_key(
     key: str,
     period_data: _PeriodData | None,
     bucket_list: list[tuple[datetime, datetime]] | None,
+    first_visit_cache: dict | None = None,
 ) -> list[Decimal] | None:
     """Dispatcher ÚNICO "chave -> série por bucket", reaproveitado tanto
     por `get_overview` (sparkline de cada card, só período ATUAL) quanto
@@ -1216,13 +1262,13 @@ def _bucket_values_for_key(
     if key in ("clients_served", "appointments_count", "ticket_average", "no_show_rate"):
         return _generic_bucket_values(key, bucket_list, period_data)
     if key == "new_clients":
-        return _new_clients_bucket_values(session, filters, bucket_list, period_data)
+        return _new_clients_bucket_values(session, filters, bucket_list, period_data, first_visit_cache)
     if key == "orders_count":
         return _orders_count_series_values(bucket_list, period_data)
     if key == "net_revenue":
         return _net_revenue_series_values(session, filters, bucket_list, period_data)
     if key == "repeat_rate":
-        return _repeat_rate_bucket_values(session, filters, bucket_list, period_data)
+        return _repeat_rate_bucket_values(session, filters, bucket_list, period_data, first_visit_cache)
     raise AssertionError(key)  # pragma: no cover — `key` já validado contra `_KPI_KEYS`.
 
 
@@ -1254,6 +1300,15 @@ def get_overview(
     if comparison is not None:
         comparison_buckets = _generate_buckets(filters.compare_from, filters.compare_to, granularity)
 
+    # Item de performance ("quick win 2") — `_first_visit_by_client` é
+    # consultado por até 7 caminhos diferentes abaixo (new_clients,
+    # repeat_rate, seus sparklines, new_vs_recurring) para o MESMO
+    # (organization_id, branch_id, client_ids) de cada período. Este
+    # dict vive só durante esta chamada de `get_overview` — criado aqui,
+    # descartado ao retornar, nunca persistido/compartilhado entre
+    # requests (ver docstring de `_first_visit_by_client`).
+    first_visit_cache: dict = {}
+
     revenue_current = _revenue(current)
     revenue_previous = _revenue(comparison) if comparison is not None else None
     ticket_previous = _ticket_average(comparison) if comparison is not None else None
@@ -1261,7 +1316,12 @@ def get_overview(
     appts_previous = Decimal(_appointments_count(comparison)) if comparison is not None else None
     no_show_previous = _no_show_rate(comparison) if comparison is not None else None
     new_clients_previous = (
-        Decimal(_new_clients_count(session, filters.organization_id, filters.branch_id, comparison, filters.compare_from, filters.compare_to))
+        Decimal(
+            _new_clients_count(
+                session, filters.organization_id, filters.branch_id, comparison,
+                filters.compare_from, filters.compare_to, first_visit_cache,
+            )
+        )
         if comparison is not None
         else None
     )
@@ -1280,15 +1340,19 @@ def get_overview(
     orders_count_current = Decimal(_orders_count(current))
     orders_count_previous = Decimal(_orders_count(comparison)) if comparison is not None else None
 
-    repeat_rate_current = _repeat_rate(session, filters.organization_id, filters.branch_id, current, filters.date_from)
+    repeat_rate_current = _repeat_rate(
+        session, filters.organization_id, filters.branch_id, current, filters.date_from, first_visit_cache
+    )
     repeat_rate_previous = (
-        _repeat_rate(session, filters.organization_id, filters.branch_id, comparison, filters.compare_from)
+        _repeat_rate(
+            session, filters.organization_id, filters.branch_id, comparison, filters.compare_from, first_visit_cache
+        )
         if comparison is not None
         else None
     )
 
     def _sparkline(key: str) -> list[Decimal] | None:
-        return _bucket_values_for_key(session, filters, key, current, buckets)
+        return _bucket_values_for_key(session, filters, key, current, buckets, first_visit_cache)
 
     kpis = DashboardKpis(
         revenue=_kpi_value(KpiKind.CURRENCY, revenue_current, revenue_previous, sparkline=_sparkline("revenue")),
@@ -1300,7 +1364,12 @@ def get_overview(
         no_show_rate=_kpi_value(KpiKind.RATE, _no_show_rate(current), no_show_previous),
         new_clients=_kpi_value(
             KpiKind.COUNT,
-            Decimal(_new_clients_count(session, filters.organization_id, filters.branch_id, current, filters.date_from, filters.date_to)),
+            Decimal(
+                _new_clients_count(
+                    session, filters.organization_id, filters.branch_id, current,
+                    filters.date_from, filters.date_to, first_visit_cache,
+                )
+            ),
             new_clients_previous,
             sparkline=_sparkline("new_clients"),
         ),
@@ -1360,7 +1429,7 @@ def get_overview(
         top_clients=_top_clients(session, filters),
         status_distribution=_status_distribution(current),
         payment_methods=_payment_methods(session, filters),
-        new_vs_recurring=_new_vs_recurring_series(session, filters, buckets, current),
+        new_vs_recurring=_new_vs_recurring_series(session, filters, buckets, current, first_visit_cache),
         retention=_retention_summary(session, filters),
         heatmap=_heatmap(session, filters, org_timezone),
         revenue_fee_summary=fee_summary_current,
@@ -1396,11 +1465,17 @@ def get_kpi_detail(
     buckets = _generate_buckets(filters.date_from, filters.date_to, granularity)
     comparison_buckets = _generate_buckets(filters.compare_from, filters.compare_to, granularity) if comparison is not None else None
 
-    current_values = _bucket_values_for_key(session, filters, key, current, buckets) or [Decimal("0")] * len(buckets)
-    comparison_values = _bucket_values_for_key(session, filters, key, comparison, comparison_buckets)
+    # Mesmo item de performance de `get_overview` ("quick win 2") — este
+    # dict vive só durante esta chamada de `get_kpi_detail`.
+    first_visit_cache: dict = {}
+
+    current_values = _bucket_values_for_key(
+        session, filters, key, current, buckets, first_visit_cache
+    ) or [Decimal("0")] * len(buckets)
+    comparison_values = _bucket_values_for_key(session, filters, key, comparison, comparison_buckets, first_visit_cache)
     series = _align_series(buckets, current_values, comparison_buckets, comparison_values)
 
-    kind, current_total, previous_total = _kpi_totals(session, filters, key, current, comparison)
+    kind, current_total, previous_total = _kpi_totals(session, filters, key, current, comparison, first_visit_cache)
     kpi = _kpi_value(kind, current_total, previous_total)
 
     # Reconciliação Faturamento×Recebido — só no drill-down de `revenue`
@@ -1470,10 +1545,14 @@ def _generic_bucket_values(key: str, buckets: list[tuple[datetime, datetime]], d
 
 
 def _new_clients_bucket_values(
-    session: Session, filters: DashboardFilters, buckets: list[tuple[datetime, datetime]], data: _PeriodData
+    session: Session,
+    filters: DashboardFilters,
+    buckets: list[tuple[datetime, datetime]],
+    data: _PeriodData,
+    first_visit_cache: dict | None = None,
 ) -> list[Decimal]:
     client_ids = {row.client_id for row in data.orders}
-    first_visit = _first_visit_by_client(session, filters.organization_id, filters.branch_id, client_ids)
+    first_visit = _first_visit_by_client(session, filters.organization_id, filters.branch_id, client_ids, first_visit_cache)
     counts = [0] * len(buckets)
     for fv in first_visit.values():
         idx = _bucket_index(buckets, fv)
@@ -1483,7 +1562,12 @@ def _new_clients_bucket_values(
 
 
 def _kpi_totals(
-    session: Session, filters: DashboardFilters, key: str, current: _PeriodData, comparison: _PeriodData | None
+    session: Session,
+    filters: DashboardFilters,
+    key: str,
+    current: _PeriodData,
+    comparison: _PeriodData | None,
+    first_visit_cache: dict | None = None,
 ) -> tuple[KpiKind, Decimal, Decimal | None]:
     if key == "revenue":
         return KpiKind.CURRENCY, _revenue(current), (_revenue(comparison) if comparison else None)
@@ -1507,12 +1591,16 @@ def _kpi_totals(
         return KpiKind.RATE, _no_show_rate(current), (_no_show_rate(comparison) if comparison else None)
     if key == "new_clients":
         current_total = Decimal(
-            _new_clients_count(session, filters.organization_id, filters.branch_id, current, filters.date_from, filters.date_to)
+            _new_clients_count(
+                session, filters.organization_id, filters.branch_id, current,
+                filters.date_from, filters.date_to, first_visit_cache,
+            )
         )
         previous_total = (
             Decimal(
                 _new_clients_count(
-                    session, filters.organization_id, filters.branch_id, comparison, filters.compare_from, filters.compare_to
+                    session, filters.organization_id, filters.branch_id, comparison,
+                    filters.compare_from, filters.compare_to, first_visit_cache,
                 )
             )
             if comparison is not None
@@ -1526,9 +1614,13 @@ def _kpi_totals(
             Decimal(_orders_count(comparison)) if comparison is not None else None,
         )
     if key == "repeat_rate":
-        current_total = _repeat_rate(session, filters.organization_id, filters.branch_id, current, filters.date_from)
+        current_total = _repeat_rate(
+            session, filters.organization_id, filters.branch_id, current, filters.date_from, first_visit_cache
+        )
         previous_total = (
-            _repeat_rate(session, filters.organization_id, filters.branch_id, comparison, filters.compare_from)
+            _repeat_rate(
+                session, filters.organization_id, filters.branch_id, comparison, filters.compare_from, first_visit_cache
+            )
             if comparison is not None
             else None
         )

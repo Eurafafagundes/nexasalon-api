@@ -107,6 +107,15 @@ def _get_real_current_actor(
         permissions = compute_effective_permissions(session, membership)
         professional = professional_repo.get_by_user(session, organization_id, user_id)
 
+        # Escopo granular de agenda — ver services/agenda_access.py.
+        # `None` (ALL) é o caso comum e não bate no banco de novo além
+        # do SELECT já feito acima para resolver `membership`. Busca os
+        # dois de uma vez (`resolve_viewable_and_editable_ids`, item de
+        # performance "quick win 1") em vez de duas chamadas separadas
+        # que repetiam a MESMA query quando view/edit são ambos
+        # SELECTED — mesma regra de escopo exata, só uma query a menos
+        # por requisição autenticada.
+        viewable_ids, editable_ids = agenda_access.resolve_viewable_and_editable_ids(session, membership)
         actor = ActorContext(
             organization_id=organization_id,
             user_id=user_id,
@@ -115,11 +124,8 @@ def _get_real_current_actor(
             role_name=role.name if role is not None else "",
             permissions=permissions,
             professional_id=professional.id if professional is not None else None,
-            # Escopo granular de agenda — ver services/agenda_access.py.
-            # `None` (ALL) é o caso comum e não bate no banco de novo além
-            # do SELECT já feito acima para resolver `membership`.
-            agenda_viewable_professional_ids=agenda_access.resolve_viewable_ids(session, membership),
-            agenda_editable_professional_ids=agenda_access.resolve_editable_ids(session, membership),
+            agenda_viewable_professional_ids=viewable_ids,
+            agenda_editable_professional_ids=editable_ids,
         )
         session.commit()
     except Exception:

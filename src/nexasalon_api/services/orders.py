@@ -166,6 +166,21 @@ def create_order(session: Session, actor: ActorContext, appointment_id: uuid.UUI
                 created_by=actor.user_id,
                 observation=order_observation,
             )
+            # Item de performance ("quick win 4") — resolve TODOS os
+            # serviços e profissionais dos itens do agendamento em duas
+            # queries em lote (`WHERE id IN (...)`), antes do loop, em
+            # vez de 1 `get` de cada por item (`1 + 2N` -> `1 + 2`).
+            # Mesmíssima resolução de nome/fallback de antes — só troca
+            # ONDE a busca acontece, nunca o resultado.
+            services_by_id = {
+                s.id: s for s in service_repo.list_by_ids(session, organization_id, {i.service_id for i in appointment.items})
+            }
+            professionals_by_id = {
+                p.id: p
+                for p in professional_repo.list_by_ids(
+                    session, organization_id, [i.professional_id for i in appointment.items]
+                )
+            }
             for item in appointment.items:
                 # Copia o snapshot do AppointmentItem 1:1 na abertura — a
                 # partir daqui os dois vivem independentes (editar o preço
@@ -176,8 +191,8 @@ def create_order(session: Session, actor: ActorContext, appointment_id: uuid.UUI
                 # esse nome já congelado, e ler o catálogo atual depois
                 # mudaria como uma venda antiga aparece se o serviço for
                 # renomeado ou o profissional sair.
-                service = service_repo.get(session, organization_id, item.service_id)
-                professional = professional_repo.get(session, organization_id, item.professional_id)
+                service = services_by_id.get(item.service_id)
+                professional = professionals_by_id.get(item.professional_id)
                 order_item_repo.create(
                     session,
                     organization_id,

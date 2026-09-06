@@ -14,6 +14,19 @@ def get(session: Session, organization_id: uuid.UUID, client_id: uuid.UUID) -> C
     return session.scalars(stmt).first()
 
 
+def list_by_ids(session: Session, organization_id: uuid.UUID, client_ids: set[uuid.UUID]) -> list[Client]:
+    """Busca em LOTE (`WHERE id IN (...)`) — item de performance
+    ("quick win 3", Extrato): evita 1 `get` por cliente distinto quando
+    o chamador só precisa resolver nome/dado básico de vários clientes
+    de uma vez (ex.: `services/extract.py::get_extract`). Mesmo filtro
+    de `organization_id` de `get` — nunca devolve cliente de outra
+    organização, mesmo que o id esteja no conjunto pedido."""
+    if not client_ids:
+        return []
+    stmt = select(Client).where(Client.id.in_(client_ids), Client.organization_id == organization_id)
+    return list(session.scalars(stmt).all())
+
+
 def get_by_cpf(session: Session, organization_id: uuid.UUID, cpf: str) -> Client | None:
     """`cpf` já deve vir NORMALIZADO (só dígitos — ver
     `schemas/client.py::ClientBase._normalize_and_validate_cpf`).

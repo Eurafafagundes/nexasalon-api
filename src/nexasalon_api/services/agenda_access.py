@@ -75,6 +75,34 @@ def resolve_editable_ids(session: Session, membership: OrganizationMembership) -
     return frozenset(g.professional_id for g in grants if g.can_edit)
 
 
+def resolve_viewable_and_editable_ids(
+    session: Session, membership: OrganizationMembership
+) -> tuple[frozenset[uuid.UUID] | None, frozenset[uuid.UUID] | None]:
+    """Equivalente a chamar `resolve_viewable_ids` + `resolve_editable_ids`
+    separadamente (mesma regra exata: cada escopo — view/edit — decide
+    independentemente se é ALL ou SELECTED, exatamente como as duas
+    funções acima), mas busca `agenda_access_repo.list_for_membership`
+    no MÁXIMO uma vez em vez de duas.
+
+    Item de performance (Etapa 1, "quick win 1"): antes desta função,
+    `api/deps.py::get_current_actor` chamava as duas funções acima em
+    sequência — quando `agenda_view_scope` E `agenda_edit_scope` são
+    ambos SELECTED (o caso comum: a UI de Configurações > Acessos
+    normalmente define os dois juntos), isso disparava a MESMA query
+    (`membership_agenda_grants` desta membership) duas vezes em TODA
+    requisição autenticada do sistema. Aqui a query roda uma única vez
+    e os dois conjuntos são derivados do mesmo resultado — nenhuma
+    regra de escopo/RBAC muda, só o número de queries."""
+    view_selected = membership.agenda_view_scope != AgendaAccessScope.ALL
+    edit_selected = membership.agenda_edit_scope != AgendaAccessScope.ALL
+    if not view_selected and not edit_selected:
+        return None, None
+    grants = agenda_access_repo.list_for_membership(session, membership.id)
+    viewable = frozenset(g.professional_id for g in grants if g.can_view) if view_selected else None
+    editable = frozenset(g.professional_id for g in grants if g.can_edit) if edit_selected else None
+    return viewable, editable
+
+
 @dataclass(frozen=True)
 class AgendaAccessGrant:
     professional_id: uuid.UUID

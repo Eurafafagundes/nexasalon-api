@@ -10,12 +10,14 @@ service layer via `SessionLocal`, sem rota HTTP)."""
 import uuid
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import text
 
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.db import SessionLocal
+from nexasalon_api.models.appointment import Appointment, AppointmentItem
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import (
     AppointmentStatus,
@@ -27,9 +29,11 @@ from nexasalon_api.models.enums import (
     StockMovementReason,
 )
 from nexasalon_api.models.identity import User
+from nexasalon_api.models.order import Order
 from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.service import ProfessionalService, Service
+from nexasalon_api.repositories import client_repo
 from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate
 from nexasalon_api.schemas.order import (
     OrderClose,
@@ -826,3 +830,84 @@ def test_extrato_nao_vaza_entre_organizacoes():
         assert summary.sales == []
         assert summary.revenue_total == Decimal("0")
         assert summary.movements == []
+
+
+# ---------------------------------------------------------------------
+# Item de performance ("quick win 3") — resolver os nomes dos clientes
+# do período numa ÚNICA query (`WHERE id IN (...)`), nunca um
+# `client_repo.get` por cliente distinto.
+# ---------------------------------------------------------------------
+
+
+def _bare_closed_order(session, org_id, branch_id, client_id, order_number, closed_at):
+    """Comanda mínima direto via ORM (sem passar por `orders.create_order`/
+    `close_order`) — suficiente pra testar só a resolução de NOME de
+    cliente do Extrato, que não depende de item/pagamento nenhum."""
+    appt = Appointment(organization_id=org_id, branch_id=branch_id, client_id=client_id, status=AppointmentStatus.PAID)
+    session.add(appt)
+    session.flush()
+    session.add(
+        AppointmentItem(
+            organization_id=org_id, appointment_id=appt.id,
+            service_id=_service(session, org_id, name=f"Serviço {order_number}").id,
+            professional_id=_professional(session, org_id, branch_id).id,
+            start_at=closed_at - timedelta(hours=1), end_at=closed_at, duration_minutes=60, price=Decimal("100.00"),
+        )
+    )
+    order = Order(
+        organization_id=org_id, order_number=order_number, appointment_id=appt.id,
+        branch_id=branch_id, client_id=client_id, status=OrderStatus.CLOSED, closed_at=closed_at,
+    )
+    session.add(order)
+    session.flush()
+    return order
+
+
+def test_extrato_resolve_nomes_de_cliente_em_lote_nunca_um_por_um(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    clients = [_client(session, org_id, name=f"Cliente {i}") for i in range(5)]
+    for i, client in enumerate(clients):
+        _bare_closed_order(session, org_id, branch.id, client.id, 5000 + i, datetime(2026, 8, 10 + i, 12, tzinfo=_TZ))
+
+    call_count = 0
+    real_get = client_repo.get
+
+    def _counting_get(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_get(*args, **kwargs)
+
+    with patch.object(client_repo, "get", side_effect=_counting_get):
+        summary = extract.get_extract(session, actor, date_from=None, date_to=None)
+
+    # `client_repo.get` (busca individual) nunca deveria ser chamado
+    # pelo Extrato — a resolução de nome usa `list_by_ids` (lote).
+    assert call_count == 0
+    assert set(summary.client_names.values()) == {c.name for c in clients}
+    assert len(summary.client_names) == 5
+
+
+def test_extrato_client_names_isolamento_de_tenant_preservado():
+    """`list_by_ids` precisa continuar filtrando por `organization_id` —
+    um cliente de OUTRA organização nunca aparece em `client_names`,
+    mesmo que (hipoteticamente) seu id aparecesse no conjunto pedido."""
+    org_a = uuid.uuid4()
+    org_b = uuid.uuid4()
+    with SessionLocal() as session:
+        session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_a)})
+        session.add(Organization(id=org_a, name="Org A Extrato", slug=f"org-a-ext-{org_a.hex[:8]}"))
+        session.flush()
+        client_a = _client(session, org_a, name="Cliente da Org A")
+        client_a_id = client_a.id
+        session.commit()
+
+    with SessionLocal() as session:
+        session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_b)})
+        session.add(Organization(id=org_b, name="Org B Extrato", slug=f"org-b-ext-{org_b.hex[:8]}"))
+        session.flush()
+        # Pede explicitamente o id do cliente da Org A, mas filtrando pela Org B.
+        result = client_repo.list_by_ids(session, org_b, {client_a_id})
+
+    assert result == []

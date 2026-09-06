@@ -7,6 +7,7 @@ regra de negócio, não o transporte)."""
 import uuid
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import text
@@ -30,6 +31,7 @@ from nexasalon_api.models.identity import User
 from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.service import ProfessionalService, Service
+from nexasalon_api.repositories import professional_repo, service_repo
 from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate
 from nexasalon_api.schemas.order import (
     OrderCancel,
@@ -198,6 +200,49 @@ def test_criar_comanda_copia_itens_do_agendamento_com_total_correto(org_session)
     assert len(order.items) == 2
     prices = sorted(i.price for i in order.items)
     assert prices == [Decimal("100.00"), Decimal("280.00")]
+
+
+def test_criar_comanda_resolve_service_e_professional_em_lote_nunca_um_por_item(org_session):
+    """Item de performance ("quick win 4"): `create_order` resolvia
+    `service_name`/`professional_name` chamando `service_repo.get`/
+    `professional_repo.get` UMA VEZ POR ITEM do agendamento (1+2N
+    queries) — agora busca todos de uma vez (`list_by_ids`, 1+2 no
+    total, qualquer que seja N). `service_repo.get`/`professional_repo.
+    get` nunca deveriam ser chamados por `create_order`."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+
+    service_get_calls = 0
+    professional_get_calls = 0
+    real_service_get = service_repo.get
+    real_professional_get = professional_repo.get
+
+    def _counting_service_get(*args, **kwargs):
+        nonlocal service_get_calls
+        service_get_calls += 1
+        return real_service_get(*args, **kwargs)
+
+    def _counting_professional_get(*args, **kwargs):
+        nonlocal professional_get_calls
+        professional_get_calls += 1
+        return real_professional_get(*args, **kwargs)
+
+    with (
+        patch.object(service_repo, "get", side_effect=_counting_service_get),
+        patch.object(professional_repo, "get", side_effect=_counting_professional_get),
+    ):
+        order = orders.create_order(session, actor, appt.id)
+
+    assert service_get_calls == 0
+    assert professional_get_calls == 0
+    # Equivalência de comportamento — mesmo resultado exato de antes:
+    # nomes corretamente resolvidos do catálogo pra cada item.
+    assert len(order.items) == 2
+    names_by_service = {i.service_name for i in order.items}
+    assert names_by_service == {"Corte", "Coloração"}
+    professional_names = {i.professional_name for i in order.items}
+    assert professional_names == {"Profissional"}
 
 
 def test_criar_comanda_copia_appointment_notes_pra_order_observation_uma_unica_vez(org_session):

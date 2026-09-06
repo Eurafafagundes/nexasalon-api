@@ -20,7 +20,9 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
+
+from nexasalon_api.core.db import engine as db_engine
 
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.db import SessionLocal
@@ -267,6 +269,128 @@ def test_taxa_de_retorno_compara_em_pontos_percentuais(org_session):
     assert overview.kpis.repeat_rate.comparison_value == Decimal("0.00")
     assert overview.kpis.repeat_rate.delta_points == pytest.approx(100.0)
     assert overview.kpis.repeat_rate.delta_percent is None  # rate nunca usa variação percentual.
+
+
+# ---------------------------------------------------------------------
+# Item de performance ("quick win 2") — `_first_visit_by_client` não
+# pode mais ser recalculado várias vezes dentro da MESMA chamada de
+# `get_overview`/`get_kpi_detail` (antes desta rodada, rodava de 5 a 7
+# vezes — uma por card/sparkline que depende de "primeira visita").
+# ---------------------------------------------------------------------
+
+
+class _FirstVisitQueryCounter:
+    """Conta quantas vezes a query de `_first_visit_by_client`
+    (`SELECT client_id, min(closed_at) ... GROUP BY client_id`) chega a
+    executar de verdade no banco — via `before_cursor_execute`, não uma
+    contagem de CHAMADAS à função (que continuaria em 5-7: o cache é
+    verificado DENTRO da própria função, então só contar invocações não
+    provaria nada; o que importa é quantas vezes o SQL de fato roda)."""
+
+    def __init__(self):
+        self.count = 0
+
+    def __call__(self, conn, cursor, statement, parameters, context, executemany):
+        if "min(orders.closed_at)" in statement.lower():
+            self.count += 1
+
+
+def test_first_visit_by_client_nao_e_recalculado_dentro_do_mesmo_overview(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    svc = _service(session, org_id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    returning_client = _client(session, org_id, "Cliente Recorrente")
+    new_client = _client(session, org_id, "Cliente Novo")
+
+    _sale(session, org_id, branch.id, returning_client.id, prof.id, svc.id, cr.id, closed_at=_dt(2026, 7, 1))
+    _sale(session, org_id, branch.id, returning_client.id, prof.id, svc.id, cr.id, closed_at=_dt(2026, 8, 10))
+    _sale(session, org_id, branch.id, new_client.id, prof.id, svc.id, cr.id, closed_at=_dt(2026, 8, 11))
+
+    counter = _FirstVisitQueryCounter()
+    event.listen(db_engine, "before_cursor_execute", counter)
+    try:
+        overview = dashboard_service.get_overview(
+            session, actor, branch_id=None, date_from=_dt(2026, 8, 1), date_to=_dt(2026, 9, 1),
+            compare_from=None, compare_to=None,
+        )
+    finally:
+        event.remove(db_engine, "before_cursor_execute", counter)
+
+    # Sem período comparativo: o conjunto de clientes do período ATUAL é
+    # usado por até 5 caminhos (new_clients, repeat_rate + os dois
+    # sparklines, new_vs_recurring) — antes desta rodada, 5 execuções da
+    # MESMA query; com o cache por request, deve ser exatamente 1.
+    assert counter.count == 1
+    # Resultado continua correto (equivalência de comportamento) —
+    # mesma asserção do teste de repeat_rate acima, valor inalterado.
+    assert overview.kpis.repeat_rate.value == Decimal("50.00")
+    assert overview.kpis.new_clients.value == Decimal("1")
+
+
+def test_first_visit_by_client_com_periodo_comparativo_executa_no_maximo_uma_vez_por_periodo(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    svc = _service(session, org_id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    client = _client(session, org_id)
+
+    _sale(session, org_id, branch.id, client.id, prof.id, svc.id, cr.id, closed_at=_dt(2026, 7, 15))
+    _sale(session, org_id, branch.id, client.id, prof.id, svc.id, cr.id, closed_at=_dt(2026, 8, 15))
+
+    counter = _FirstVisitQueryCounter()
+    event.listen(db_engine, "before_cursor_execute", counter)
+    try:
+        dashboard_service.get_overview(
+            session, actor, branch_id=None, date_from=_dt(2026, 8, 1), date_to=_dt(2026, 9, 1),
+            compare_from=_dt(2026, 7, 1), compare_to=_dt(2026, 8, 1),
+        )
+    finally:
+        event.remove(db_engine, "before_cursor_execute", counter)
+
+    # Período atual e comparativo têm conjuntos de client_ids DIFERENTES
+    # (chaves de cache distintas) — 1 execução por período, nunca mais
+    # que isso mesmo com os múltiplos cards que precisam de cada um.
+    assert counter.count == 2
+
+
+def test_first_visit_by_client_cache_e_por_chamada_nunca_global_entre_requests(org_session):
+    """Explícito por pedido: cache só dentro da MESMA execução/request —
+    duas chamadas SEPARADAS a `get_overview` (dois "requests" simulados,
+    cada uma cria seu próprio `first_visit_cache` novo) precisam voltar
+    a consultar o banco, provando que não existe cache global/persistido
+    entre chamadas."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    svc = _service(session, org_id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    client = _client(session, org_id)
+    _sale(session, org_id, branch.id, client.id, prof.id, svc.id, cr.id, closed_at=_dt(2026, 8, 10))
+
+    counter = _FirstVisitQueryCounter()
+    event.listen(db_engine, "before_cursor_execute", counter)
+    try:
+        dashboard_service.get_overview(
+            session, actor, branch_id=None, date_from=_dt(2026, 8, 1), date_to=_dt(2026, 9, 1),
+            compare_from=None, compare_to=None,
+        )
+        first_request_count = counter.count
+        dashboard_service.get_overview(
+            session, actor, branch_id=None, date_from=_dt(2026, 8, 1), date_to=_dt(2026, 9, 1),
+            compare_from=None, compare_to=None,
+        )
+    finally:
+        event.remove(db_engine, "before_cursor_execute", counter)
+
+    assert first_request_count == 1
+    # A SEGUNDA chamada (novo "request") volta a consultar — não reaproveitou nada da primeira.
+    assert counter.count == 2
 
 
 # ---------------------------------------------------------------------

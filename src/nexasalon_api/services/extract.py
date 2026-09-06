@@ -85,10 +85,12 @@ def get_extract(
         sales = []
         movements = [m for m in all_movements if m.type == CashMovementType.WITHDRAWAL]
 
+    # Item de performance ("quick win 3") — busca todos os clientes
+    # distintos do período numa ÚNICA query (`WHERE id IN (...)`), em
+    # vez de um `client_repo.get` por cliente. Mesmo isolamento de
+    # tenant de antes (`list_by_ids` filtra por `organization_id`).
     client_ids = {o.client_id for o in sales}
-    client_names = {
-        c.id: c.name for c in (client_repo.get(session, actor.organization_id, cid) for cid in client_ids) if c
-    }
+    client_names = {c.id: c.name for c in client_repo.list_by_ids(session, actor.organization_id, client_ids)}
 
     return ExtractSummary(
         revenue_total=revenue_total,
