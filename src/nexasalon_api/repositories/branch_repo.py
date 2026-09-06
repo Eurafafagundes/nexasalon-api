@@ -20,6 +20,18 @@ def list_all(session: Session, organization_id: uuid.UUID, include_inactive: boo
     return list(session.scalars(stmt).all())
 
 
+def list_by_ids(
+    session: Session, organization_id: uuid.UUID, branch_ids: set[uuid.UUID]
+) -> list[Branch]:
+    if not branch_ids:
+        return []
+    stmt = select(Branch).where(
+        Branch.organization_id == organization_id,
+        Branch.id.in_(branch_ids),
+    )
+    return list(session.scalars(stmt).all())
+
+
 def exists(session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID) -> bool:
     return get(session, organization_id, branch_id) is not None
 

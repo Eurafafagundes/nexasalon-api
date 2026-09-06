@@ -247,3 +247,46 @@ def test_export_nao_vaza_entre_organizacoes(client_as, org_a_actor, org_b_actor)
     header, *data_rows = rows
     client_col = header.index("Cliente")
     assert all(r[client_col] != client_a["name"] for r in data_rows)
+
+
+def test_export_busca_multiplos_caixas_em_uma_query_sem_mudar_conteudo(client_as, org_a_actor):
+    from sqlalchemy import event
+
+    from nexasalon_api.core.db import engine as db_engine
+
+    c = client_as(org_a_actor)
+    descriptions = []
+    for index in range(3):
+        branch = c.post(
+            "/api/v1/branches", json={"name": f"Filial lote {index}", "slug": f"filial-lote-{uuid.uuid4().hex[:6]}"}
+        ).json()
+        register = c.post(
+            "/api/v1/cash-registers", json={"branch_id": branch["id"], "initial_amount": "0"}
+        ).json()
+        description = f"Despesa lote {index}"
+        descriptions.append(description)
+        movement = c.post(
+            f"/api/v1/cash-registers/{register['id']}/movements",
+            json={"type": "withdrawal", "amount": "10.00", "description": description},
+        )
+        assert movement.status_code == 200, movement.text
+
+    statements: list[str] = []
+
+    def _counter(conn, cursor, statement, parameters, context, executemany):
+        if statement.strip().upper().startswith("SELECT") and "cash_registers" in statement.lower():
+            statements.append(statement)
+
+    event.listen(db_engine, "before_cursor_execute", _counter)
+    try:
+        response = c.get("/api/v1/extract/export", params={"type": "withdrawal"})
+    finally:
+        event.remove(db_engine, "before_cursor_execute", _counter)
+
+    assert response.status_code == 200, response.text
+    rows = list(load_workbook(BytesIO(response.content)).active.iter_rows(values_only=True))
+    header, *data_rows = rows
+    description_column = header.index("DescriÃ§Ã£o")
+    exported_descriptions = {row[description_column] for row in data_rows}
+    assert set(descriptions) <= exported_descriptions
+    assert len(statements) == 1, statements

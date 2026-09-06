@@ -15,7 +15,12 @@ from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.exceptions import NotFoundError
 from nexasalon_api.models.product import Product
 from nexasalon_api.repositories import branch_repo, stock_level_repo
-from nexasalon_api.schemas.product import ProductCreate, ProductRead, ProductReadWithCost, ProductUpdate
+from nexasalon_api.schemas.product import (
+    ProductCreate,
+    ProductRead,
+    ProductReadWithCost,
+    ProductUpdate,
+)
 from nexasalon_api.schemas.stock import StockLevelMinimumUpdate, StockLevelRead
 from nexasalon_api.services import products as products_service
 
@@ -52,6 +57,19 @@ def list_products(
         session, actor, include_inactive=include_inactive, category=category, for_sale=for_sale, search=search
     )
     return [_serialize_product(p, actor) for p in items]
+
+
+@router.get(
+    "/stock-levels",
+    response_model=list[StockLevelRead],
+    summary="Listar saldos de todos os produtos em lote",
+)
+def list_all_stock_levels(
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> list[StockLevelRead]:
+    levels = stock_level_repo.list_for_org(session, actor.organization_id)
+    return [StockLevelRead.model_validate(level) for level in levels]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, summary="Criar produto")

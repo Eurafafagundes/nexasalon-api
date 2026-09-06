@@ -20,6 +20,22 @@ def list_for_professional(
     return list(session.scalars(stmt).all())
 
 
+def list_for_professionals(
+    session: Session, organization_id: uuid.UUID, professional_ids: list[uuid.UUID]
+) -> list[WorkingHours]:
+    if not professional_ids:
+        return []
+    stmt = (
+        select(WorkingHours)
+        .where(
+            WorkingHours.organization_id == organization_id,
+            WorkingHours.professional_id.in_(professional_ids),
+        )
+        .order_by(WorkingHours.professional_id, WorkingHours.weekday, WorkingHours.start_time)
+    )
+    return list(session.scalars(stmt).all())
+
+
 def replace_all(
     session: Session, organization_id: uuid.UUID, professional_id: uuid.UUID, items: list[dict]
 ) -> list[WorkingHours]:

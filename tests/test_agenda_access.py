@@ -26,23 +26,107 @@ from sqlalchemy import text
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.config import settings
 from nexasalon_api.core.db import SessionLocal
-from nexasalon_api.core.exceptions import ForbiddenError, NotFoundError, ValidationDomainError
+from nexasalon_api.core.exceptions import (
+    ForbiddenError,
+    NotFoundError,
+    ValidationDomainError,
+)
 from nexasalon_api.core.security import hash_password
 from nexasalon_api.main import app
 from nexasalon_api.models.agenda_access import MembershipAgendaGrant
 from nexasalon_api.models.client import Client
-from nexasalon_api.models.enums import AgendaAccessScope, AppointmentStatus, MembershipStatus
+from nexasalon_api.models.enums import (
+    AgendaAccessScope,
+    AppointmentStatus,
+    MembershipStatus,
+)
 from nexasalon_api.models.identity import OrganizationMembership, User
 from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.rbac import Role, RolePermission
 from nexasalon_api.models.service import ProfessionalService, Service
 from nexasalon_api.repositories import agenda_access_repo
-from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItemCreate, AppointmentItemUpdate
+from nexasalon_api.schemas.appointment import (
+    AppointmentCreate,
+    AppointmentItemCreate,
+    AppointmentItemUpdate,
+)
 from nexasalon_api.services import agenda, agenda_access, appointments
 
 _OUR_THURSDAY = 4
 _TZ = timezone(timedelta(hours=-3))
+
+
+def test_jornadas_da_agenda_em_lote_preservam_escopos_e_tenant(
+    client_as, org_a_actor, org_b_actor
+):
+    import dataclasses
+
+    from sqlalchemy import event
+
+    from nexasalon_api.core.db import engine as db_engine
+
+    c_owner = client_as(org_a_actor)
+    branch = c_owner.post(
+        "/api/v1/branches", json={"name": "Agenda lote", "slug": f"agenda-lote-{uuid.uuid4().hex[:8]}"}
+    ).json()
+    professionals = []
+    for index in range(3):
+        professional = c_owner.post(
+            "/api/v1/professionals",
+            json={"name": f"Profissional lote {index}", "branch_id": branch["id"]},
+        ).json()
+        professionals.append(professional)
+    c_owner.put(
+        f"/api/v1/professionals/{professionals[0]['id']}/working-hours",
+        json={"items": [{"weekday": 1, "start_time": "09:00:00", "end_time": "18:00:00", "is_active": True}]},
+    )
+    c_owner.put(
+        f"/api/v1/professionals/{professionals[1]['id']}/working-hours",
+        json={"items": [{"weekday": 2, "start_time": "10:00:00", "end_time": "19:00:00", "is_active": True}]},
+    )
+
+    statements: list[str] = []
+
+    def _counter(conn, cursor, statement, parameters, context, executemany):
+        if statement.strip().upper().startswith("SELECT") and "working_hours" in statement.lower():
+            statements.append(statement)
+
+    event.listen(db_engine, "before_cursor_execute", _counter)
+    try:
+        owner_response = c_owner.get(
+            "/api/v1/agenda/professionals/working-hours", params={"branch_id": branch["id"]}
+        )
+    finally:
+        event.remove(db_engine, "before_cursor_execute", _counter)
+
+    assert owner_response.status_code == 200, owner_response.text
+    assert {row["professional_id"] for row in owner_response.json()} == {
+        professionals[0]["id"], professionals[1]["id"]
+    }
+    assert professionals[2]["id"] not in {row["professional_id"] for row in owner_response.json()}
+    assert len(statements) == 1
+
+    receptionist = dataclasses.replace(org_a_actor, permissions=frozenset({"agenda.view_all"}))
+    receptionist_response = client_as(receptionist).get(
+        "/api/v1/agenda/professionals/working-hours", params={"branch_id": branch["id"]}
+    )
+    assert receptionist_response.status_code == 200
+    assert len(receptionist_response.json()) == 2
+
+    professional_actor = dataclasses.replace(
+        org_a_actor,
+        permissions=frozenset({"agenda.view_own"}),
+        professional_id=uuid.UUID(professionals[0]["id"]),
+        agenda_viewable_professional_ids=None,
+    )
+    own_response = client_as(professional_actor).get(
+        "/api/v1/agenda/professionals/working-hours", params={"branch_id": branch["id"]}
+    )
+    assert {row["professional_id"] for row in own_response.json()} == {professionals[0]["id"]}
+
+    other_tenant_response = client_as(org_b_actor).get("/api/v1/agenda/professionals/working-hours")
+    assert all(row["professional_id"] not in {item["id"] for item in professionals} for row in other_tenant_response.json())
 
 
 # ---------------------------------------------------------------------

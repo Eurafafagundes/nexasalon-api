@@ -18,7 +18,12 @@ from sqlalchemy.orm import Session
 from nexasalon_api.core import units
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.exceptions import NotFoundError, ValidationDomainError
-from nexasalon_api.models.enums import AuditAction, ProductUnit, StockMovementDirection, StockMovementReason
+from nexasalon_api.models.enums import (
+    AuditAction,
+    ProductUnit,
+    StockMovementDirection,
+    StockMovementReason,
+)
 from nexasalon_api.models.product import StockLevel
 from nexasalon_api.models.stock import StockMovement, StockTransfer
 from nexasalon_api.repositories import (
@@ -478,9 +483,7 @@ def get_overview(
     now = date_to or datetime.now(timezone.utc)
     since = date_from or (now - timedelta(days=_DEFAULT_FLOW_DAYS))
 
-    levels = stock_level_repo.list_for_org(session, actor.organization_id)
-    if branch_id is not None:
-        levels = [lv for lv in levels if lv.branch_id == branch_id]
+    levels = stock_level_repo.list_for_org(session, actor.organization_id, branch_id=branch_id)
 
     products_by_id = {p.id: p for p in product_repo.list_all(session, actor.organization_id, include_inactive=True)}
     active_product_ids = {pid for pid, p in products_by_id.items() if p.is_active}

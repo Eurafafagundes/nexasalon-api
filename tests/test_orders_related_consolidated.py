@@ -191,6 +191,44 @@ def test_get_related_orders_mesma_cliente_mesmo_dia_profissionais_diferentes(org
     assert [o.id for o in related2] == [order2.id]
 
 
+def test_get_related_orders_busca_appointments_e_branches_em_lote(org_session):
+    from sqlalchemy import event
+
+    from nexasalon_api.core.db import engine as db_engine
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal(0), None)
+    client = _client(session, org_id, name="Cliente lote")
+    created_orders = []
+    for index in range(5):
+        appointment, _professional_obj = _appointment_for_client(
+            session, org_id, actor, branch, client,
+            prof_name=f"Profissional {index}", service_name=f"ServiÃ§o {index}",
+            price=Decimal(50), start_hour=9 + index,
+        )
+        created_orders.append(orders.create_order(session, actor, appointment.id))
+
+    statements: list[str] = []
+
+    def _counter(conn, cursor, statement, parameters, context, executemany):
+        if statement.strip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(db_engine, "before_cursor_execute", _counter)
+    try:
+        related = orders.get_related_orders(session, actor, created_orders[0])
+    finally:
+        event.remove(db_engine, "before_cursor_execute", _counter)
+
+    assert {order.id for order in related} == {order.id for order in created_orders[1:]}
+    appointment_queries = [statement for statement in statements if "appointments" in statement.lower()]
+    branch_queries = [statement for statement in statements if "branches" in statement.lower()]
+    assert len(appointment_queries) <= 2, appointment_queries
+    assert len(branch_queries) == 1, branch_queries
+
+
 def test_related_orders_ignora_cliente_diferente(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)

@@ -262,8 +262,14 @@ def build_extract_workbook(
         for row in _sale_item_rows(order, client_name, branch_name(order.branch_id)):
             sheet.append(row)
 
+    registers_by_id = {
+        register.id: register
+        for register in cash_register_repo.list_by_ids(
+            session, actor.organization_id, {movement.cash_register_id for movement in summary.movements}
+        )
+    }
     for movement in summary.movements:
-        register = cash_register_repo.get(session, actor.organization_id, movement.cash_register_id)
+        register = registers_by_id.get(movement.cash_register_id)
         sheet.append(_movement_row(movement, branch_name(register.branch_id if register else None)))
 
     for idx, header in enumerate(_HEADER, start=1):

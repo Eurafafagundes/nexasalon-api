@@ -103,3 +103,19 @@ def list_for_clients(session: Session, organization_id: uuid.UUID, client_ids: l
         Appointment.organization_id == organization_id, Appointment.client_id.in_(client_ids)
     )
     return list(session.scalars(stmt).all())
+
+
+def list_by_ids(
+    session: Session, organization_id: uuid.UUID, appointment_ids: list[uuid.UUID]
+) -> list[Appointment]:
+    if not appointment_ids:
+        return []
+    stmt = (
+        select(Appointment)
+        .options(selectinload(Appointment.items))
+        .where(
+            Appointment.organization_id == organization_id,
+            Appointment.id.in_(appointment_ids),
+        )
+    )
+    return list(session.scalars(stmt).all())

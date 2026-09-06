@@ -16,6 +16,18 @@ def get(session: Session, organization_id: uuid.UUID, register_id: uuid.UUID) ->
     return session.scalars(stmt).first()
 
 
+def list_by_ids(
+    session: Session, organization_id: uuid.UUID, register_ids: set[uuid.UUID]
+) -> list[CashRegister]:
+    if not register_ids:
+        return []
+    stmt = select(CashRegister).where(
+        CashRegister.organization_id == organization_id,
+        CashRegister.id.in_(register_ids),
+    )
+    return list(session.scalars(stmt).all())
+
+
 def get_open_for_branch(session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID) -> CashRegister | None:
     """Regra desta rodada (mudou da 0014, ver docstring do model): só um
     caixa aberto POR UNIDADE, não por usuário — qualquer usuário com

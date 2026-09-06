@@ -249,3 +249,66 @@ def test_isolamento_multi_tenant_produtos(client_as, org_a_actor, org_b_actor):
 
     listed_b = c_b.get("/api/v1/products")
     assert all(p["id"] != created["id"] for p in listed_b.json())
+
+
+def test_saldos_em_lote_usam_uma_query_e_preservam_tenant(client_as, org_a_actor, org_b_actor):
+    from sqlalchemy import event
+
+    from nexasalon_api.core.db import engine as db_engine
+
+    c_a = client_as(org_a_actor)
+    branch_id = _branch_id(org_a_actor)
+    product_ids = []
+    for index in range(3):
+        product = c_a.post("/api/v1/products", json={"name": f"Produto lote {index}"}).json()
+        product_ids.append(product["id"])
+        c_a.post(
+            "/api/v1/stock-movements",
+            json={"product_id": product["id"], "branch_id": branch_id, "direction": "in", "reason": "purchase", "quantity": "1"},
+        )
+
+    statements: list[str] = []
+
+    def _counter(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(db_engine, "before_cursor_execute", _counter)
+    try:
+        response = c_a.get("/api/v1/products/stock-levels")
+    finally:
+        event.remove(db_engine, "before_cursor_execute", _counter)
+
+    assert response.status_code == 200, response.text
+    assert {row["product_id"] for row in response.json()} >= set(product_ids)
+    level_queries = [
+        statement for statement in statements
+        if statement.strip().upper().startswith("SELECT") and "stock_levels" in statement.lower()
+    ]
+    assert len(level_queries) == 1, level_queries
+
+    response_b = client_as(org_b_actor).get("/api/v1/products/stock-levels")
+    assert all(row["product_id"] not in product_ids for row in response_b.json())
+
+
+def test_overview_com_branch_filtra_stock_levels_no_sql(client_as, org_a_actor):
+    from sqlalchemy import event
+
+    from nexasalon_api.core.db import engine as db_engine
+
+    c = client_as(org_a_actor)
+    branch_id = _branch_id(org_a_actor)
+    statements: list[str] = []
+
+    def _counter(conn, cursor, statement, parameters, context, executemany):
+        if statement.strip().upper().startswith("SELECT") and "stock_levels" in statement.lower():
+            statements.append(statement)
+
+    event.listen(db_engine, "before_cursor_execute", _counter)
+    try:
+        response = c.get("/api/v1/stock/overview", params={"branch_id": branch_id})
+    finally:
+        event.remove(db_engine, "before_cursor_execute", _counter)
+
+    assert response.status_code == 200, response.text
+    assert len(statements) == 1
+    assert "branch_id" in statements[0].lower()

@@ -43,6 +43,7 @@ existia acima:
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -65,6 +66,7 @@ from nexasalon_api.models.order import Order
 from nexasalon_api.repositories import (
     appointment_repo,
     audit_log_repo,
+    branch_repo,
     cash_register_repo,
     client_repo,
     order_item_repo,
@@ -91,9 +93,9 @@ from nexasalon_api.schemas.order import (
     OrderReopen,
 )
 from nexasalon_api.services import appointments as appointments_service
-from nexasalon_api.services import availability, order_totals
 from nexasalon_api.services import cash_register as cash_register_service
 from nexasalon_api.services import commissions as commissions_service
+from nexasalon_api.services import order_totals
 from nexasalon_api.services import payment_fees as payment_fees_service
 from nexasalon_api.services import stock as stock_service
 
@@ -261,18 +263,36 @@ def get_related_orders(session: Session, actor: ActorContext, order: Order) -> l
     appointment = appointment_repo.get(session, organization_id, order.appointment_id)
     if appointment is None or appointment.starts_at is None:
         return []
-    tz = availability.effective_timezone(session, organization_id, order.branch_id)
-    target_day = appointment.starts_at.astimezone(tz).date()
 
     candidates = order_repo.list_active_for_client(session, organization_id, order.client_id)
+    appointments_by_id = {
+        item.id: item
+        for item in appointment_repo.list_by_ids(
+            session, organization_id, [candidate.appointment_id for candidate in candidates]
+        )
+    }
+    branches_by_id = {
+        branch.id: branch
+        for branch in branch_repo.list_by_ids(
+            session, organization_id, {order.branch_id, *(candidate.branch_id for candidate in candidates)}
+        )
+    }
+    organization = organization_repo.get(session, organization_id)
+    assert organization is not None
+
+    def _timezone(branch_id: uuid.UUID) -> ZoneInfo:
+        branch = branches_by_id.get(branch_id)
+        return ZoneInfo((branch.timezone if branch and branch.timezone else None) or organization.timezone)
+
+    target_day = appointment.starts_at.astimezone(_timezone(order.branch_id)).date()
     related: list[Order] = []
     for candidate in candidates:
         if candidate.id == order.id:
             continue
-        c_appointment = appointment_repo.get(session, organization_id, candidate.appointment_id)
+        c_appointment = appointments_by_id.get(candidate.appointment_id)
         if c_appointment is None or c_appointment.starts_at is None:
             continue
-        c_tz = availability.effective_timezone(session, organization_id, candidate.branch_id)
+        c_tz = _timezone(candidate.branch_id)
         if c_appointment.starts_at.astimezone(c_tz).date() == target_day:
             related.append(candidate)
     return related

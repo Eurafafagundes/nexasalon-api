@@ -31,8 +31,12 @@ def list_for_branch(session: Session, organization_id: uuid.UUID, branch_id: uui
     return list(session.scalars(stmt).all())
 
 
-def list_for_org(session: Session, organization_id: uuid.UUID) -> list[StockLevel]:
+def list_for_org(
+    session: Session, organization_id: uuid.UUID, *, branch_id: uuid.UUID | None = None
+) -> list[StockLevel]:
     stmt = select(StockLevel).where(StockLevel.organization_id == organization_id)
+    if branch_id is not None:
+        stmt = stmt.where(StockLevel.branch_id == branch_id)
     return list(session.scalars(stmt).all())
 
 

@@ -9,9 +9,13 @@ from nexasalon_api.api.deps import get_db, require_any_permission
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.exceptions import ValidationDomainError
 from nexasalon_api.models.enums import AppointmentStatus
-from nexasalon_api.repositories import branch_repo, organization_repo
+from nexasalon_api.repositories import (
+    branch_repo,
+    organization_repo,
+    working_hours_repo,
+)
 from nexasalon_api.schemas.agenda import AgendaItemRead, AvailabilitySlotRead
-from nexasalon_api.schemas.professional import ProfessionalRead
+from nexasalon_api.schemas.professional import ProfessionalRead, WorkingHourRead
 from nexasalon_api.services import agenda as agenda_service
 from nexasalon_api.services import availability as availability_service
 
@@ -101,6 +105,23 @@ def get_schedule_columns(
     sem qualquer alteração de código."""
     professionals = agenda_service.list_schedule_columns(session, actor, branch_id=branch_id)
     return [ProfessionalRead.model_validate(p) for p in professionals]
+
+
+@router.get(
+    "/professionals/working-hours",
+    response_model=list[WorkingHourRead],
+    summary="Jornadas das colunas visíveis da Agenda em lote",
+)
+def get_schedule_columns_working_hours(
+    branch_id: uuid.UUID | None = Query(None),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view_agenda),
+) -> list[WorkingHourRead]:
+    professionals = agenda_service.list_schedule_columns(session, actor, branch_id=branch_id)
+    rows = working_hours_repo.list_for_professionals(
+        session, actor.organization_id, [professional.id for professional in professionals]
+    )
+    return [WorkingHourRead.model_validate(row) for row in rows]
 
 
 @router.get(
