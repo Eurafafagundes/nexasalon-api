@@ -29,6 +29,14 @@ dependencies = [
   # importa `requests` diretamente — não é uma dependência transitiva
   # automática do pacote `google-auth`.
   "requests>=2.31",
+  # Correção de foto de profissional/logo — normaliza a imagem antes de
+  # enviar pro storage: corrige orientação EXIF (fotos de celular vêm
+  # frequentemente com rotação só na tag EXIF, não nos pixels — sem
+  # corrigir isso, a foto aparece deitada/de cabeça pra baixo em quem
+  # ignora EXIF) e limita a maior dimensão (nunca faz upscale, só
+  # protege contra uma imagem enorme sendo salva/servida sem necessidade
+  # — ver `core/image_processing.py`).
+  "pillow>=10.3",
 ]
 
 [project.optional-dependencies]

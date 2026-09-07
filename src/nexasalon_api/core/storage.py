@@ -51,12 +51,14 @@ class S3StorageBackend:
         access_key_id: str,
         secret_access_key: str,
         public_base_url: str | None,
+        use_object_acl: bool = True,
     ) -> None:
         import boto3
 
         self._bucket = bucket
         self._public_base_url = public_base_url
         self._endpoint_url = endpoint_url
+        self._use_object_acl = use_object_acl
         self._client = boto3.client(
             "s3",
             endpoint_url=endpoint_url,
@@ -66,16 +68,17 @@ class S3StorageBackend:
         )
 
     def upload(self, *, key: str, content: bytes, content_type: str) -> str:
-        self._client.put_object(
-            Bucket=self._bucket,
-            Key=key,
-            Body=content,
-            ContentType=content_type,
-            # ACL pública explícita — a logo do estabelecimento precisa
-            # ser exibível direto (comprovante, tela de Configurações)
-            # sem exigir URL assinada/expirável.
-            ACL="public-read",
-        )
+        put_kwargs: dict = {"Bucket": self._bucket, "Key": key, "Body": content, "ContentType": content_type}
+        if self._use_object_acl:
+            # ACL pública explícita — a logo/foto precisa ser exibível
+            # direto (comprovante, Agenda, tela de Configurações) sem
+            # exigir URL assinada/expirável. Nem todo provedor
+            # S3-compatível aceita este parâmetro por objeto (Cloudflare
+            # R2 expõe acesso público a nível de BUCKET, não por ACL) —
+            # `NEXASALON_STORAGE_USE_OBJECT_ACL=false` desliga isto sem
+            # precisar mexer em código (ver `core/config.py`).
+            put_kwargs["ACL"] = "public-read"
+        self._client.put_object(**put_kwargs)
         if self._public_base_url:
             return f"{self._public_base_url.rstrip('/')}/{key}"
         return f"{(self._endpoint_url or '').rstrip('/')}/{self._bucket}/{key}"
@@ -94,6 +97,7 @@ def _build_storage_backend() -> StorageBackend | None:
         access_key_id=settings.storage_access_key_id,
         secret_access_key=settings.storage_secret_access_key,
         public_base_url=settings.storage_public_base_url,
+        use_object_acl=settings.storage_use_object_acl,
     )
 
 
@@ -151,9 +155,16 @@ def build_professional_photo_key(professional_id: uuid.UUID, content_type: str) 
     return f"professionals/{professional_id}/photo-{uuid.uuid4().hex}.{ext}"
 
 
-def require_storage_backend(backend: StorageBackend | None) -> StorageBackend:
+def require_storage_backend(backend: StorageBackend | None, *, label: str = "logo") -> StorageBackend:
+    """`label` entra na mensagem de erro (ex.: "logo", "foto do
+    profissional") — bug real corrigido: antes desta correção, a
+    mensagem sempre dizia "Upload de logo indisponível" mesmo quando
+    quem chamava era `upload_professional_photo`, confundindo o usuário
+    no cadastro de Profissionais. Mesmo raciocínio já aplicado em
+    `_validate_image_upload` (que já recebia `label` corretamente) —
+    faltava propagar o mesmo cuidado aqui."""
     if backend is None:
         raise ServiceUnavailableError(
-            "Upload de logo indisponível: nenhum storage está configurado neste ambiente."
+            f"Upload de {label} indisponível: nenhum storage está configurado neste ambiente."
         )
     return backend

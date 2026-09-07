@@ -217,6 +217,17 @@ class Settings(BaseSettings):
     # na frente do bucket, ou a própria URL pública do bucket/endpoint).
     # Quando `None`, cai no padrão `{endpoint}/{bucket}/{key}`.
     storage_public_base_url: str | None = None
+    # Correção de compatibilidade (upload de foto de profissional): nem
+    # todo provedor S3-compatível aceita `ACL=public-read` por objeto
+    # do mesmo jeito que a AWS S3 — a Cloudflare R2, por exemplo, expõe
+    # acesso público a nível de BUCKET (domínio customizado ou
+    # `r2.dev`), não por ACL individual, e pode rejeitar a chamada se
+    # ela mandar esse parâmetro. `True` (default) preserva o
+    # comportamento atual pra quem já usa AWS S3/DigitalOcean Spaces
+    # (que aceitam); mudar pra `False` via env var é o ajuste necessário
+    # se o provedor escolhido for a R2 — sem isso, o upload falharia
+    # com erro do provedor, não do NexaSalon.
+    storage_use_object_acl: bool = True
     # Content-types aceitos e tamanho máximo pro upload de logo —
     # validado no backend (nunca confiar só no `accept` do <input> do
     # frontend, mesmo raciocínio já aplicado ao CPF na Etapa C.1).

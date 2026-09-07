@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.exceptions import NotFoundError, ValidationDomainError
+from nexasalon_api.core.image_processing import normalize_image
 from nexasalon_api.core.storage import (
     StorageBackend,
     build_professional_photo_key,
@@ -108,14 +109,24 @@ def upload_professional_photo(
     grava base64 no banco — só a URL pública resultante em
     `Professional.photo_url`, substituindo o ponteiro anterior (o objeto
     antigo no bucket não é apagado — ver docstring de
-    `build_professional_photo_key`)."""
+    `build_professional_photo_key`).
+
+    Correção de bug real (qualidade/exibição): antes de enviar pro
+    storage, a imagem passa por `normalize_image`
+    (`core/image_processing.py`) — corrige rotação EXIF (comum em foto
+    de celular) e limita a maior dimensão, sem fazer upscale nem trocar
+    o formato escolhido. `professional.photo_url` só é sobrescrito
+    DEPOIS do upload ter sucesso — uma falha em qualquer etapa (arquivo
+    inválido, storage indisponível, erro de rede) nunca apaga nem troca
+    a foto anterior."""
     professional = get_professional(session, organization_id, professional_id)
     validate_professional_photo_upload(
         content_type=content_type, size_bytes=len(content)
     )
-    backend = require_storage_backend(storage)
+    backend = require_storage_backend(storage, label="foto do profissional")
+    normalized_content = normalize_image(content, content_type, label="foto do profissional")  # type: ignore[arg-type]
     key = build_professional_photo_key(professional_id, content_type)  # type: ignore[arg-type]
-    photo_url = backend.upload(key=key, content=content, content_type=content_type)  # type: ignore[arg-type]
+    photo_url = backend.upload(key=key, content=normalized_content, content_type=content_type)  # type: ignore[arg-type]
     professional.photo_url = photo_url
     return professional_repo.save(session, professional)
 
