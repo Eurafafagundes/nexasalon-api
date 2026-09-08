@@ -36,3 +36,8 @@ def create(session: Session, organization_id: uuid.UUID, **fields) -> ServiceCat
 def save(session: Session, category: ServiceCategory) -> ServiceCategory:
     session.flush()
     return category
+
+
+def delete(session: Session, category: ServiceCategory) -> None:
+    session.delete(category)
+    session.flush()

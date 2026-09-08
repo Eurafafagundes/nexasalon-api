@@ -86,3 +86,16 @@ def deactivate_service_category(
 ) -> ServiceCategoryRead:
     category = service_categories_service.set_category_active(session, actor.organization_id, category_id, False)
     return ServiceCategoryRead.model_validate(category)
+
+
+@router.delete(
+    "/{category_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Excluir categoria (só permitido sem nenhum serviço vinculado)",
+)
+def delete_service_category(
+    category_id: uuid.UUID,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_manage),
+) -> None:
+    service_categories_service.delete_category(session, actor.organization_id, category_id)

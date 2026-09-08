@@ -1,9 +1,21 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from nexasalon_api.models.service import Service
+
+
+def count_by_category(session: Session, organization_id: uuid.UUID, category_id: uuid.UUID) -> int:
+    """Conta TODOS os serviços da categoria (ativos e inativos) — usado
+    pra decidir se `DELETE /service-categories/{id}` pode prosseguir.
+    Um serviço desativado ainda "usa" a categoria (continua existindo,
+    só não aparece pra novos agendamentos), então também bloqueia a
+    exclusão — nunca `include_inactive=False` aqui."""
+    stmt = select(func.count()).select_from(Service).where(
+        Service.organization_id == organization_id, Service.category_id == category_id
+    )
+    return session.scalar(stmt) or 0
 
 
 def get(session: Session, organization_id: uuid.UUID, service_id: uuid.UUID) -> Service | None:
