@@ -50,6 +50,17 @@ class Settings(BaseSettings):
     # nunca de postura de segurança.
     environment: Literal["development", "test", "staging", "production"] = "development"
     dev_auth_enabled: bool = False
+    # Feature flag simples e reversível — bloqueia SÓ a criação pública
+    # de conta/organização nova (`POST /signup`). `True` (default)
+    # preserva exatamente o comportamento de sempre pra quem não setar
+    # nada (inclusive produção, que ainda não tem esta var definida).
+    # Nunca afeta: login, funcionários/convites (`/users`,
+    # `/auth/accept-invite` — fluxos autenticados totalmente separados,
+    # não criam Organization nova), recuperação de senha, ou qualquer
+    # outra rota autenticada. Reativar/desativar de novo não exige
+    # código nem migration — só trocar `NEXASALON_PUBLIC_SIGNUP_ENABLED`
+    # e reiniciar/reimplantar o backend.
+    public_signup_enabled: bool = True
 
     jwt_secret: str = _INSECURE_DEFAULT_JWT_SECRET
     access_token_ttl_minutes: int = 15

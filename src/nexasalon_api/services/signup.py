@@ -5,8 +5,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from nexasalon_api.core.config import settings
 from nexasalon_api.core.db import SessionLocal
-from nexasalon_api.core.exceptions import ConflictError
+from nexasalon_api.core.exceptions import ConflictError, PublicSignupDisabledError
 from nexasalon_api.core.normalize import normalize_slug
 from nexasalon_api.core.security import hash_password
 from nexasalon_api.models.enums import MembershipStatus, OrganizationStatus
@@ -42,6 +43,17 @@ def create_account(payload: SignupRequest) -> SignupResult:
     IDs administrativos, role, status, datas e limites nunca vêm do
     payload público. O contexto RLS é fixado no UUID gerado pelo servidor.
     """
+    # Feature flag (`NEXASALON_PUBLIC_SIGNUP_ENABLED`) — checada ANTES de
+    # abrir qualquer sessão de banco, então desativada não cria absolutamente
+    # nada (nem User, nem Organization, nem Branch, nem Membership) —
+    # nunca uma criação parcial. Só afeta ESTE fluxo público; login,
+    # convite de funcionário (`/users`, `/auth/accept-invite`) e toda
+    # rota autenticada continuam 100% intactos.
+    if not settings.public_signup_enabled:
+        raise PublicSignupDisabledError(
+            "Novos cadastros estão temporariamente indisponíveis. O NexaSalon está em fase de testes."
+        )
+
     organization_id = uuid.uuid4()
     now = datetime.now(timezone.utc)
 

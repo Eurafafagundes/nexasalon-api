@@ -287,3 +287,124 @@ def test_trial_expirado_nao_bloqueia_novo_profissional(client):
             headers=headers,
         )
         assert response.status_code == 201, response.text
+
+
+# --- Feature flag NEXASALON_PUBLIC_SIGNUP_ENABLED -------------------------
+
+
+def test_public_signup_enabled_true_cadastro_continua_funcionando_como_hoje(client, monkeypatch):
+    """Item 1 do checklist: com a flag explicitamente True (o default),
+    nada muda — mesmo caminho feliz de sempre."""
+    monkeypatch.setattr(settings, "public_signup_enabled", True)
+    payload, tokens = _signup(client)
+    assert tokens["access_token"]
+
+    with SessionLocal() as session:
+        from nexasalon_api.repositories import user_repo
+
+        assert user_repo.get_by_email(session, payload["email"]) is not None
+
+
+def test_public_signup_enabled_false_recusa_com_erro_estruturado_do_padrao_existente(client, monkeypatch):
+    """Item 2: recusado, status correto, `error.type` estruturado
+    seguindo EXATAMENTE o mesmo contrato `{"error": {"type", "message",
+    "details"}}` já usado por toda a API (`main.py::handle_domain_error`)
+    — nenhum formato novo."""
+    monkeypatch.setattr(settings, "public_signup_enabled", False)
+    payload = _payload()
+
+    response = client.post("/api/v1/signup", json=payload)
+
+    assert response.status_code == 403, response.text
+    assert response.json()["error"] == {
+        "type": "public_signup_disabled",
+        "message": "Novos cadastros estão temporariamente indisponíveis. O NexaSalon está em fase de testes.",
+        "details": None,
+    }
+
+    # nenhuma conta foi criada pela tentativa recusada
+    with SessionLocal() as session:
+        from nexasalon_api.repositories import user_repo
+
+        assert user_repo.get_by_email(session, payload["email"]) is None
+
+
+def test_public_signup_enabled_false_nunca_abre_sessao_de_banco(monkeypatch):
+    """Prova estrutural (mais forte que só checar ausência de dado
+    depois): com a flag desligada, `create_account` nunca sequer ABRE
+    uma sessão de banco — a checagem acontece ANTES de
+    `with SessionLocal()`, então uma criação parcial de
+    User/Organization/Branch/Membership é estruturalmente impossível,
+    não só "não aconteceu desta vez"."""
+    from nexasalon_api.core.exceptions import PublicSignupDisabledError
+    from nexasalon_api.services import signup as signup_service
+
+    monkeypatch.setattr(settings, "public_signup_enabled", False)
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("SessionLocal não deveria ser chamado com o cadastro público desabilitado")
+
+    monkeypatch.setattr(signup_service, "SessionLocal", _fail_if_called)
+
+    payload = _payload()
+    with pytest.raises(PublicSignupDisabledError) as exc_info:
+        signup_service.create_account(signup_service.SignupRequest.model_validate(payload))
+
+    assert exc_info.value.message == "Novos cadastros estão temporariamente indisponíveis. O NexaSalon está em fase de testes."
+
+
+def test_public_signup_enabled_false_login_de_conta_existente_continua_funcionando(client, monkeypatch):
+    """Item 3: a flag nunca afeta login de quem já tem conta — só a
+    CRIAÇÃO pública de conta nova."""
+    monkeypatch.setattr(settings, "public_signup_enabled", True)
+    payload, _tokens = _signup(client)
+
+    monkeypatch.setattr(settings, "public_signup_enabled", False)
+    response = client.post(
+        "/api/v1/auth/login", json={"email": payload["email"], "password": payload["password"]}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tokens"]["access_token"]
+
+
+def test_public_signup_enabled_false_fluxo_autenticado_nao_e_afetado(client, monkeypatch):
+    """Item 4: com a conta já existente, operação normal do salão (aqui,
+    criar um profissional — um fluxo autenticado comum) continua
+    funcionando normalmente mesmo com o cadastro público fechado."""
+    monkeypatch.setattr(settings, "public_signup_enabled", True)
+    _payload_data, tokens = _signup(client)
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+
+    monkeypatch.setattr(settings, "public_signup_enabled", False)
+    response = client.post(
+        "/api/v1/professionals", json={"name": "Profissional Normal"}, headers=headers
+    )
+
+    assert response.status_code == 201, response.text
+
+
+def test_public_signup_enabled_false_nao_afeta_convite_de_funcionario(client, monkeypatch):
+    """Convite/vínculo de funcionário dentro de um salão já existente
+    (`POST /users`) é um fluxo AUTENTICADO totalmente separado do
+    cadastro público (`POST /signup` — sem autenticação, cria
+    organização nova) — a flag não deve tocar nele."""
+    monkeypatch.setattr(settings, "public_signup_enabled", True)
+    _payload_data, tokens = _signup(client)
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    role_id = next(r["id"] for r in client.get("/api/v1/roles", headers=headers).json() if r["name"] == "RECEPTIONIST")
+
+    monkeypatch.setattr(settings, "public_signup_enabled", False)
+    suffix = uuid.uuid4().hex[:8]
+    response = client.post(
+        "/api/v1/users",
+        json={
+            "email": f"funcionario-{suffix}@example.com",
+            "name": "Funcionário Convidado",
+            "role_id": role_id,
+            "password": "SenhaForte123!",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 201, response.text

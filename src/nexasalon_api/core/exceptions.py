@@ -65,6 +65,18 @@ class TooManyRequestsError(DomainError):
     error_type = "rate_limited"
 
 
+class PublicSignupDisabledError(DomainError):
+    """Feature flag `NEXASALON_PUBLIC_SIGNUP_ENABLED=false` — cadastro
+    público temporariamente fechado (fase de testes), decisão de
+    produto, não uma falha técnica (por isso 403, não 503 — a
+    dependência não está indisponível, o servidor está recusando de
+    propósito). Nunca aplicado a login, convite de funcionário ou
+    qualquer outra rota autenticada."""
+
+    status_code = 403
+    error_type = "public_signup_disabled"
+
+
 class ServiceUnavailableError(DomainError):
     """Dependência externa opcional não configurada neste ambiente —
     ex.: upload de logo (Etapa D) quando nenhum storage foi
