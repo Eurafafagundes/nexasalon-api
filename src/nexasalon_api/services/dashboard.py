@@ -1227,16 +1227,28 @@ def _available_result(
     single_tax_rate = next(iter(seen_rates)) if len(seen_rates) == 1 else None
 
     # --- Custos variáveis / Despesas fixas / não classificados --------
-    fixed_expense_breakdown = fixed_expenses_service.provisions(
+    # `provisions()` (valor contábil por vencimento real) continua INTACTO
+    # e segue sendo a fonte da tela Despesas Fixas/Financeiro — aqui ele só
+    # é usado, como já era, pra saber quais (categoria, unidade) já têm
+    # provisão no período e não devem cair no fallback `legacy_fixed`.
+    provisioned_rows = fixed_expenses_service.provisions(
         session, filters.organization_id, branch_id=filters.branch_id,
         date_from=filters.date_from, date_to=filters.date_to,
     )
-    fixed_expenses_provisioned = sum((row.amount for row in fixed_expense_breakdown), Decimal("0"))
+    # Visão GERENCIAL (rateio por dias operacionais) — é o que o painel
+    # "Resultado disponível" EXIBE e DEDUZ; nunca os dois valores (contábil
+    # x rateado) ao mesmo tempo no card, pra não expor dois números
+    # conflitantes pro mesmo indicador.
+    managerial_rows = fixed_expenses_service.managerial_fixed_costs(
+        session, filters.organization_id, branch_id=filters.branch_id,
+        date_from=filters.date_from, date_to=filters.date_to,
+    )
+    fixed_expenses_managerial = sum((row.amount for row in managerial_rows), Decimal("0"))
     nature_totals = cash_movement_repo.sum_withdrawals_by_nature(
         session, filters.organization_id, date_from=filters.date_from, date_to=filters.date_to,
         branch_id=filters.branch_id,
         provisioned_fixed_category_branches={
-            (row.financial_category_id, row.branch_id) for row in fixed_expense_breakdown
+            (row.financial_category_id, row.branch_id) for row in provisioned_rows
         },
     )
 
@@ -1246,7 +1258,7 @@ def _available_result(
         - commissions
         - known_fee_total
         - nature_totals["variable"]
-        - fixed_expenses_provisioned
+        - fixed_expenses_managerial
         - nature_totals["legacy_fixed"]
     )
     available_percent = (
@@ -1265,8 +1277,8 @@ def _available_result(
         commissions=commissions,
         payment_fees=known_fee_total,
         variable_costs=nature_totals["variable"],
-        fixed_costs=fixed_expenses_provisioned,
-        fixed_expense_breakdown=fixed_expense_breakdown,
+        fixed_costs=fixed_expenses_managerial,
+        fixed_expense_breakdown=managerial_rows,
         legacy_fixed_costs=nature_totals["legacy_fixed"],
         linked_fixed_payments=nature_totals["linked_fixed_payments"],
         unclassified_expenses=nature_totals["unclassified"],

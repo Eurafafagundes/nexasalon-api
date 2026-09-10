@@ -16,7 +16,7 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 from nexasalon_api.models.enums import AppointmentStatus, PaymentMethod
-from nexasalon_api.schemas.fixed_expense import FixedExpenseProvisionRow
+from nexasalon_api.schemas.fixed_expense import FixedCostManagerialRow
 
 
 class KpiKind(str, Enum):
@@ -350,8 +350,17 @@ class AvailableResultSummary(BaseModel):
       - `payment_fees`: idêntico a `revenue_fee_summary.known_fee_total`.
       - `variable_costs`: soma de `CashMovement` tipo WITHDRAWAL no
         período cuja categoria tem natureza variável.
-      - `fixed_costs`: compromissos de `FixedExpense` provisionados
-        pelos vencimentos reais do período; nunca saídas de caixa.
+      - `fixed_costs`: visão GERENCIAL de `FixedExpense` — valor
+        integral de cada despesa (reconhecido na competência real,
+        nunca convertido em mensal fictício) RATEADO pelos dias
+        operacionais (`BusinessHours` da organização) do período
+        filtrado; ver `services/fixed_expenses.py::
+        managerial_fixed_costs`. Fecha exatamente com o valor
+        provisionado quando o período cobre o(s) mês(es) inteiro(s).
+        O valor contábil por vencimento (`provisions()`) NÃO muda e
+        continua disponível na tela Despesas Fixas/Financeiro — só não
+        é reexibido aqui, pra nunca haver dois números conflitantes
+        pro mesmo indicador. Nunca saída de caixa.
       - `legacy_fixed_costs`: fallback de `CashMovement` FIXED histórico,
         sem vínculo, somente quando não existe provisão equivalente para
         a mesma categoria e unidade no período.
@@ -379,7 +388,7 @@ class AvailableResultSummary(BaseModel):
     payment_fees: Decimal | None
     variable_costs: Decimal | None
     fixed_costs: Decimal | None
-    fixed_expense_breakdown: list[FixedExpenseProvisionRow]
+    fixed_expense_breakdown: list[FixedCostManagerialRow]
     legacy_fixed_costs: Decimal
     linked_fixed_payments: Decimal
     unclassified_expenses: Decimal

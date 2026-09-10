@@ -76,3 +76,19 @@ class FixedExpenseSummary(BaseModel):
     competence_month: date
     monthly_average: Decimal
     active_count: int
+
+
+class FixedCostManagerialRow(BaseModel):
+    """Uma linha do rateio GERENCIAL (`services/fixed_expenses.py::
+    managerial_fixed_costs`) — `amount` aqui é a FRAÇÃO da despesa que
+    cai dentro do período filtrado do Dashboard, nunca o valor integral
+    provisionado (esse continua em `FixedExpenseProvisionRow`/
+    `FixedExpenseRead.amount`, inalterados)."""
+
+    fixed_expense_id: uuid.UUID
+    name: str
+    category: str
+    financial_category_id: uuid.UUID
+    branch_id: uuid.UUID
+    competence_month: date
+    amount: Decimal

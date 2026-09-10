@@ -14,7 +14,7 @@ dependendo de quem está olhando).
 Mesmo padrão de `test_dashboard_bi_update.py`: direto no service layer
 via `SessionLocal`, fixtures/helpers duplicados localmente."""
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -40,7 +40,7 @@ from nexasalon_api.models.enums import (
 )
 from nexasalon_api.models.identity import User
 from nexasalon_api.models.order import Order, OrderItem, Payment
-from nexasalon_api.models.organization import Branch, Organization
+from nexasalon_api.models.organization import Branch, BusinessHours, Organization
 from nexasalon_api.models.professional import Professional
 from nexasalon_api.models.service import Service
 from nexasalon_api.schemas.financial_category import (
@@ -533,3 +533,58 @@ def test_reclassificar_categoria_nao_duplica_despesa_fixa_provisionada(org_sessi
     ).available_result
     assert after.variable_costs == Decimal("70.00")
     assert after.fixed_costs == Decimal("0")
+
+
+def test_resultado_disponivel_deduz_e_exibe_o_rateio_gerencial_em_periodo_parcial(org_session):
+    """`fixed_costs` no painel passa a ser a visão GERENCIAL (rateio por
+    dias operacionais de `BusinessHours`), não o valor provisionado
+    bruto — mesmo exemplo do relatório aprovado: Aluguel R$2.420,
+    unidade terça-sábado, Setembro/2026 com 22 dias operacionais. O mês
+    inteiro fecha exatamente com o valor provisionado; um dia isolado
+    mostra só a fração daquele dia — nunca os dois números ao mesmo
+    tempo no card."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    category = financial_categories_service.create_category(
+        session, org_id, FinancialCategoryCreate(name="Estrutura", nature=ExpenseNature.FIXED, display_order=0)
+    )
+    for weekday, is_open in [(0, False), (1, False), (2, True), (3, True), (4, True), (5, True), (6, True)]:
+        session.add(
+            BusinessHours(
+                organization_id=org_id, weekday=weekday, is_open=is_open,
+                start_time=time(9, 0) if is_open else None, end_time=time(19, 0) if is_open else None,
+            )
+        )
+    session.flush()
+    fixed_expenses_service.create_expense(session, actor, FixedExpenseCreate(
+        name="Aluguel", financial_category_id=category.id, amount=Decimal("2420.00"),
+        recurrence=FixedExpenseRecurrence.MONTHLY, due_day=10,
+        start_month=date(2026, 9, 1), branch_id=branch.id, is_active=True,
+    ))
+
+    mes_inteiro = dashboard_service.get_overview(
+        session, actor, branch_id=None,
+        date_from=datetime(2026, 9, 1, tzinfo=timezone.utc), date_to=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert mes_inteiro.fixed_costs == Decimal("2420.00")
+
+    # Quarta-feira 09/09/2026 isolada — dia aberto: R$110 (2420/22), nunca o valor cheio do mês.
+    hoje_aberto = dashboard_service.get_overview(
+        session, actor, branch_id=None,
+        date_from=datetime(2026, 9, 9, tzinfo=timezone.utc), date_to=datetime(2026, 9, 10, tzinfo=timezone.utc),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert hoje_aberto.fixed_costs == Decimal("110.00")
+    assert len(hoje_aberto.fixed_expense_breakdown) == 1
+    assert hoje_aberto.fixed_expense_breakdown[0].amount == Decimal("110.00")
+
+    # Domingo 06/09/2026 — dia fechado: R$0, nunca negativo nem inventado.
+    hoje_fechado = dashboard_service.get_overview(
+        session, actor, branch_id=None,
+        date_from=datetime(2026, 9, 6, tzinfo=timezone.utc), date_to=datetime(2026, 9, 7, tzinfo=timezone.utc),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert hoje_fechado.fixed_costs == Decimal("0")
+    assert hoje_fechado.fixed_expense_breakdown == []

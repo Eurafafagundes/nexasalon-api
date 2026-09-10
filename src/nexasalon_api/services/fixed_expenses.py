@@ -1,6 +1,6 @@
 import calendar
 import uuid
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -20,11 +20,13 @@ from nexasalon_api.models.finance import FixedExpense, FixedExpenseVersion
 from nexasalon_api.repositories import (
     audit_log_repo,
     branch_repo,
+    business_hours_repo,
     financial_category_repo,
     fixed_expense_repo,
     user_repo,
 )
 from nexasalon_api.schemas.fixed_expense import (
+    FixedCostManagerialRow,
     FixedExpenseCreate,
     FixedExpenseProvisionRow,
     FixedExpenseRead,
@@ -340,6 +342,136 @@ def provisions(
                     )
                 )
     return sorted(result, key=lambda row: (row.due_date, row.name.casefold()))
+
+
+def _operational_weekdays(session: Session, organization_id: uuid.UUID) -> set[int] | None:
+    """`None` = organização ainda sem `BusinessHours` configurado — SEM
+    restrição, mesma semântica de `services/business_hours.py::
+    get_window_utc` (todos os dias contam como operacionais). Conjunto
+    vazio é um valor legítimo (config extrema: fechado todo dia da
+    semana) e é tratado à parte por quem consome isso."""
+    rows = business_hours_repo.list_for_organization(session, organization_id)
+    if not rows:
+        return None
+    return {row.weekday for row in rows if row.is_open}
+
+
+def _count_operational_days(operational_weekdays: set[int] | None, start: date, end: date) -> int:
+    """Dias em `[start, end)` (fim exclusive) que caem num dia da
+    semana operacional. `None` conta todo mundo (sem restrição)."""
+    if end <= start:
+        return 0
+    if operational_weekdays is None:
+        return (end - start).days
+    if not operational_weekdays:
+        return 0
+    count = 0
+    day = start
+    while day < end:
+        our_weekday = (day.weekday() + 1) % 7  # Python Mon=0..Sun=6 -> 0=domingo..6=sábado
+        if our_weekday in operational_weekdays:
+            count += 1
+        day += timedelta(days=1)
+    return count
+
+
+def managerial_fixed_costs(
+    session: Session,
+    organization_id: uuid.UUID,
+    *,
+    branch_id: uuid.UUID | None,
+    date_from: datetime,
+    date_to: datetime,
+) -> list[FixedCostManagerialRow]:
+    """Visão GERENCIAL de despesas fixas pro painel "Resultado
+    disponível" do Dashboard — função canônica separada, NUNCA reescreve
+    nem reusa o resultado de `provisions()` (que continua sendo a fonte
+    contábil, intacta, usada pela tela Despesas Fixas/Financeiro).
+
+    Rateia o valor INTEGRAL de cada despesa (reconhecido na competência
+    real via `occurs_in` — mesma regra de sempre, uma despesa
+    trimestral/semestral/anual só entra no(s) mês(es) em que realmente
+    ocorre, nunca vira um valor mensal fictício) pelos dias operacionais
+    do MÊS de competência, proporcional a quantos desses dias caem
+    dentro do período filtrado:
+
+        valor_rateado = valor_integral × dias_operacionais_no_intervalo
+                         ÷ dias_operacionais_do_mês
+
+    Diferença deliberada para `provisions()`: aqui o dia de vencimento
+    (`due_day`) NÃO importa — o que importa é em qual(is) mês(es) de
+    competência o período filtrado toca e quantos dias operacionais de
+    cada um entram no filtro. Um intervalo cruzando dois meses (ex.:
+    29/09 a 03/10) rateia proporcionalmente cada mês por separado, uma
+    linha por competência tocada.
+
+    Fecha EXATO com o valor provisionado quando `[date_from, date_to)`
+    cobre o(s) mês(es) de competência POR INTEIRO — a razão vale 1 pra
+    cada versão nesse caso, sem nenhuma diferença de arredondamento
+    (nunca calcula uma taxa diária arredondada pra depois multiplicar
+    dia a dia; a divisão é única, por linha, e só o resultado dessa
+    divisão é arredondado a centavos).
+
+    `BusinessHours` é da ORGANIZAÇÃO (nunca `WorkingHours` de
+    profissional; bloqueio/feriado de profissional NÃO conta como dia
+    fechado nesta rodada) e não tem histórico — usa sempre a
+    configuração ATUAL pra contar dias operacionais de qualquer mês,
+    passado ou futuro; se `business_hours` mudar, competências passadas
+    são recalculadas com a config NOVA (limitação documentada, mesma
+    decisão já aceita em `services/business_hours.py::get_window_utc`;
+    versionar `BusinessHours` fica pra uma rodada à parte). Organização
+    sem nenhuma linha de `BusinessHours` = sem restrição, todos os dias
+    contam (comportamento retrocompatível de sempre)."""
+    if date_to <= date_from:
+        return []
+
+    operational_weekdays = _operational_weekdays(session, organization_id)
+    start_date, end_date = date_from.date(), date_to.date()
+
+    versions = fixed_expense_repo.versions_for_period(
+        session,
+        organization_id,
+        start_date.replace(day=1),
+        end_date.replace(day=1),
+        branch_id,
+    )
+
+    rows: list[FixedCostManagerialRow] = []
+    for version in versions:
+        for month in months_between(start_date, end_date):
+            if not (
+                version.effective_from <= month
+                and (version.effective_to is None or month < version.effective_to)
+            ) or not occurs_in(version, month):
+                continue
+
+            month_start = month
+            month_end = add_months(month, 1)
+            days_in_month = _count_operational_days(operational_weekdays, month_start, month_end)
+            if days_in_month == 0:
+                continue  # mês inteiro fechado (config extrema) — nada a ratear, evita divisão por zero.
+
+            overlap_start = max(month_start, start_date)
+            overlap_end = min(month_end, end_date)
+            days_in_interval = _count_operational_days(operational_weekdays, overlap_start, overlap_end)
+            if days_in_interval == 0:
+                continue
+
+            amount = (version.amount * days_in_interval / Decimal(days_in_month)).quantize(Decimal("0.01"))
+            if amount <= 0:
+                continue
+            rows.append(
+                FixedCostManagerialRow(
+                    fixed_expense_id=version.fixed_expense_id,
+                    name=version.name,
+                    category=version.category_name_snapshot,
+                    financial_category_id=version.financial_category_id,
+                    branch_id=version.branch_id,
+                    competence_month=month,
+                    amount=amount,
+                )
+            )
+    return sorted(rows, key=lambda row: (row.competence_month, row.name.casefold()))
 
 
 def summary(
