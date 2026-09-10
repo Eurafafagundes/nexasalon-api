@@ -182,6 +182,7 @@ from nexasalon_api.repositories import (
     service_repo,
 )
 from nexasalon_api.schemas.dashboard import (
+    AvailableResultSummary,
     ClientPerformanceRow,
     DashboardKpiDetailResponse,
     DashboardKpis,
@@ -209,10 +210,15 @@ from nexasalon_api.schemas.dashboard import (
     SeriesPoint,
     ServicePerformanceRow,
     StatusDistributionRow,
+    TaxCompetenceBreakdownRow,
     TopServiceRow,
 )
 from nexasalon_api.services import commissions as commissions_service
 from nexasalon_api.services import payment_fees as payment_fees_service
+from nexasalon_api.services import tax_rates as tax_rates_service
+from nexasalon_api.services import fixed_expenses as fixed_expenses_service
+
+_CENTS = Decimal("0.01")
 
 _RETENTION_WINDOW_DAYS = 90
 _TOP_SERVICES_LIMIT = 20
@@ -1130,6 +1136,145 @@ def _financial_summary(
     )
 
 
+def _empty_available_result() -> AvailableResultSummary:
+    return AvailableResultSummary(
+        available=False,
+        gross_revenue=None,
+        taxes_provisioned=None,
+        tax_breakdown=[],
+        has_multiple_tax_rates=False,
+        single_tax_rate=None,
+        has_unconfigured_tax_rate=False,
+        unconfigured_tax_revenue=Decimal("0"),
+        commissions=None,
+        payment_fees=None,
+        variable_costs=None,
+        fixed_costs=None,
+        fixed_expense_breakdown=[],
+        legacy_fixed_costs=Decimal("0"),
+        linked_fixed_payments=Decimal("0"),
+        unclassified_expenses=Decimal("0"),
+        available_result=None,
+        available_percent=None,
+    )
+
+
+def _available_result(
+    session: Session,
+    actor: ActorContext,
+    filters: DashboardFilters,
+    data: _PeriodData,
+    *,
+    gross_revenue: Decimal,
+    known_fee_total: Decimal,
+) -> AvailableResultSummary:
+    """Painel "Resultado disponível" — ver docstring completa em
+    `schemas/dashboard.py::AvailableResultSummary`. Reaproveita
+    `data`/`gross_revenue`/`known_fee_total` já calculados por
+    `get_overview` (nenhuma query nova de Faturamento/Taxa aqui).
+
+    Indisponível por inteiro (`available=False`, todo o resto `None`)
+    quando o ator não tem `commissions.view_all`/`commissions.manage` —
+    ver justificativa na docstring do schema: um total que muda de
+    valor dependendo de QUEM está olhando quebraria a premissa de
+    indicador auditável."""
+    if "commissions.view_all" not in actor.permissions and "commissions.manage" not in actor.permissions:
+        return _empty_available_result()
+
+    commission_overview = commissions_service.get_overview(
+        session, actor, date_from=filters.date_from, date_to=filters.date_to
+    )
+    commissions = commission_overview.known_commission_total
+
+    # --- Impostos provisionados: revenue por competência (mês
+    # calendário) × alíquota vigente NAQUELA competência ---------------
+    months = tax_rates_service.months_between(filters.date_from, filters.date_to)
+    revenue_by_month: dict = {m: Decimal("0") for m in months}
+    for row in data.orders:
+        month_key = row.closed_at.date().replace(day=1)
+        if month_key in revenue_by_month:
+            revenue_by_month[month_key] += row.total
+
+    resolutions = tax_rates_service.resolve_rates_for_months(session, filters.organization_id, months)
+
+    tax_breakdown: list[TaxCompetenceBreakdownRow] = []
+    taxes_provisioned = Decimal("0")
+    unconfigured_tax_revenue = Decimal("0")
+    has_unconfigured_tax_rate = False
+    seen_rates: set[Decimal] = set()
+    for month in months:
+        revenue = revenue_by_month[month]
+        if revenue <= 0:
+            continue
+        resolution = resolutions[month]
+        if resolution.tax_rate is None:
+            has_unconfigured_tax_rate = True
+            unconfigured_tax_revenue += revenue
+            tax_breakdown.append(
+                TaxCompetenceBreakdownRow(competence_month=month, revenue=revenue, tax_rate=None, tax_amount=Decimal("0"))
+            )
+            continue
+        tax_amount = (revenue * resolution.tax_rate / Decimal("100")).quantize(_CENTS)
+        taxes_provisioned += tax_amount
+        seen_rates.add(resolution.tax_rate)
+        tax_breakdown.append(
+            TaxCompetenceBreakdownRow(
+                competence_month=month, revenue=revenue, tax_rate=resolution.tax_rate, tax_amount=tax_amount
+            )
+        )
+
+    has_multiple_tax_rates = len(seen_rates) > 1
+    single_tax_rate = next(iter(seen_rates)) if len(seen_rates) == 1 else None
+
+    # --- Custos variáveis / Despesas fixas / não classificados --------
+    fixed_expense_breakdown = fixed_expenses_service.provisions(
+        session, filters.organization_id, branch_id=filters.branch_id,
+        date_from=filters.date_from, date_to=filters.date_to,
+    )
+    fixed_expenses_provisioned = sum((row.amount for row in fixed_expense_breakdown), Decimal("0"))
+    nature_totals = cash_movement_repo.sum_withdrawals_by_nature(
+        session, filters.organization_id, date_from=filters.date_from, date_to=filters.date_to,
+        branch_id=filters.branch_id,
+        provisioned_fixed_category_branches={
+            (row.financial_category_id, row.branch_id) for row in fixed_expense_breakdown
+        },
+    )
+
+    available_result = (
+        gross_revenue
+        - taxes_provisioned
+        - commissions
+        - known_fee_total
+        - nature_totals["variable"]
+        - fixed_expenses_provisioned
+        - nature_totals["legacy_fixed"]
+    )
+    available_percent = (
+        (available_result / gross_revenue * Decimal("100")).quantize(_CENTS) if gross_revenue > 0 else None
+    )
+
+    return AvailableResultSummary(
+        available=True,
+        gross_revenue=gross_revenue,
+        taxes_provisioned=taxes_provisioned,
+        tax_breakdown=tax_breakdown,
+        has_multiple_tax_rates=has_multiple_tax_rates,
+        single_tax_rate=single_tax_rate,
+        has_unconfigured_tax_rate=has_unconfigured_tax_rate,
+        unconfigured_tax_revenue=unconfigured_tax_revenue,
+        commissions=commissions,
+        payment_fees=known_fee_total,
+        variable_costs=nature_totals["variable"],
+        fixed_costs=fixed_expenses_provisioned,
+        fixed_expense_breakdown=fixed_expense_breakdown,
+        legacy_fixed_costs=nature_totals["legacy_fixed"],
+        linked_fixed_payments=nature_totals["linked_fixed_payments"],
+        unclassified_expenses=nature_totals["unclassified"],
+        available_result=available_result,
+        available_percent=available_percent,
+    )
+
+
 def _heatmap(session: Session, filters: DashboardFilters, org_timezone: str) -> list[HeatmapCell]:
     local_start = func.timezone(org_timezone, Appointment.starts_at)
     weekday_expr = func.extract("isodow", local_start) - 1  # 1..7 (seg..dom) -> 0..6
@@ -1435,6 +1580,10 @@ def get_overview(
         revenue_fee_summary=fee_summary_current,
         financial_summary=_financial_summary(
             session, actor, filters, received=_received(current), known_fee_total=fee_summary_current.known_fee_total
+        ),
+        available_result=_available_result(
+            session, actor, filters, current,
+            gross_revenue=revenue_current, known_fee_total=fee_summary_current.known_fee_total,
         ),
     )
 

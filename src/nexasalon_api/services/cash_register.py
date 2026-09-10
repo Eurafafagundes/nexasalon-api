@@ -18,10 +18,29 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.actor import ActorContext
-from nexasalon_api.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationDomainError
+from nexasalon_api.core.exceptions import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ValidationDomainError,
+)
 from nexasalon_api.models.cash_register import CashMovement, CashRegister
-from nexasalon_api.models.enums import AuditAction, CashMovementType, CashRegisterStatus, PaymentMethod
-from nexasalon_api.repositories import audit_log_repo, cash_movement_repo, cash_register_repo, payment_repo, user_repo
+from nexasalon_api.models.enums import (
+    AuditAction,
+    CashMovementType,
+    CashRegisterStatus,
+    ExpenseNature,
+    PaymentMethod,
+)
+from nexasalon_api.repositories import (
+    audit_log_repo,
+    cash_movement_repo,
+    cash_register_repo,
+    financial_category_repo,
+    fixed_expense_repo,
+    payment_repo,
+    user_repo,
+)
 from nexasalon_api.services import cash_register_config as cash_register_config_service
 from nexasalon_api.services.availability import effective_timezone
 
@@ -229,11 +248,42 @@ def register_movement(
     description: str,
     *,
     category: str | None = None,
+    financial_category_id: uuid.UUID | None = None,
+    fixed_expense_id: uuid.UUID | None = None,
     method: PaymentMethod = PaymentMethod.CASH,
 ) -> CashRegister:
     register = _get_register_or_404(session, actor.organization_id, register_id)
     if register.status != CashRegisterStatus.OPEN:
         raise ValidationDomainError("Só é possível registrar entrada/despesa em um caixa aberto.")
+
+    resolved_category_name = category
+    if fixed_expense_id is not None:
+        if movement_type != CashMovementType.WITHDRAWAL:
+            raise ValidationDomainError("Somente uma despesa pode ser vinculada a uma despesa fixa.")
+        expense = fixed_expense_repo.get_with_versions(session, actor.organization_id, fixed_expense_id)
+        if expense is None:
+            raise NotFoundError("Despesa fixa não encontrada.")
+        month = datetime.now(timezone.utc).date().replace(day=1)
+        version = next((v for v in reversed(expense.versions) if v.effective_from <= month and (v.effective_to is None or month < v.effective_to)), None)
+        if version is None or version.branch_id != register.branch_id or not version.is_active:
+            raise ValidationDomainError("A despesa fixa não está ativa nesta unidade e competência.")
+        if financial_category_id is not None and financial_category_id != version.financial_category_id:
+            raise ValidationDomainError("A categoria deve corresponder à despesa fixa vinculada.")
+        financial_category_id = version.financial_category_id
+        resolved_category_name = version.category_name_snapshot
+    elif financial_category_id is not None:
+        financial_category = financial_category_repo.get(session, actor.organization_id, financial_category_id)
+        if financial_category is None:
+            raise NotFoundError("Categoria financeira não encontrada.")
+        if movement_type == CashMovementType.WITHDRAWAL and financial_category.nature == ExpenseNature.FIXED:
+            raise ValidationDomainError(
+                "Para evitar dupla contagem, uma categoria fixa exige o vínculo com a despesa fixa provisionada."
+            )
+        # Denormaliza o nome pro campo legado `category`, exibido em
+        # telas que ainda leem só texto livre — nunca sobrescreve o que
+        # o usuário digitou manualmente quando NÃO escolheu uma
+        # categoria estruturada.
+        resolved_category_name = financial_category.name
 
     name = _resolve_user_name(session, actor.user_id)
     movement = cash_movement_repo.create(
@@ -243,7 +293,9 @@ def register_movement(
         type=movement_type,
         amount=amount,
         description=description,
-        category=category,
+        category=resolved_category_name,
+        financial_category_id=financial_category_id,
+        fixed_expense_id=fixed_expense_id,
         method=method,
         created_by=actor.user_id,
         created_by_name=name,
@@ -261,7 +313,9 @@ def register_movement(
             "type": movement_type.value,
             "amount": str(amount),
             "description": description,
-            "category": category,
+            "category": resolved_category_name,
+            "financial_category_id": str(financial_category_id) if financial_category_id else None,
+            "fixed_expense_id": str(fixed_expense_id) if fixed_expense_id else None,
             "method": method.value,
             "cash_register_id": str(register_id),
         },

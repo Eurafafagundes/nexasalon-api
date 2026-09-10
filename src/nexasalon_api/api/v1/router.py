@@ -14,6 +14,8 @@ from . import (
     customer_auth,
     dashboard,
     extract,
+    financial_categories,
+    fixed_expenses,
     inventory_counts,
     orders,
     organizations,
@@ -27,6 +29,7 @@ from . import (
     services,
     signup,
     stock,
+    tax_rates,
     users,
 )
 
@@ -51,6 +54,9 @@ api_v1_router.include_router(cash_registers.router)
 api_v1_router.include_router(cash_register_config.router)
 api_v1_router.include_router(extract.router)
 api_v1_router.include_router(payment_fee_rules.router)
+api_v1_router.include_router(tax_rates.router)
+api_v1_router.include_router(financial_categories.router)
+api_v1_router.include_router(fixed_expenses.router)
 api_v1_router.include_router(dashboard.router)
 api_v1_router.include_router(commissions.router)
 api_v1_router.include_router(products.router)

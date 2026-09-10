@@ -7,7 +7,11 @@ from decimal import Decimal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nexasalon_api.models.cash_register import CashMovement, CashRegister
-from nexasalon_api.models.enums import CashMovementType, CashRegisterStatus, PaymentMethod
+from nexasalon_api.models.enums import (
+    CashMovementType,
+    CashRegisterStatus,
+    PaymentMethod,
+)
 from nexasalon_api.schemas.order import PaymentRead
 
 
@@ -42,6 +46,13 @@ class CashMovementCreate(BaseModel):
     amount: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
     description: str = Field(min_length=1, max_length=500)
     category: str | None = Field(default=None, max_length=120)
+    # Painel "Resultado disponível" (Dashboard): categoria ESTRUTURADA
+    # (ver `models/finance.py::FinancialCategory`), opcional — escolhida
+    # só no momento da criação, nunca preenchida depois (ledger
+    # append-only). `category` (texto livre) continua aceito por
+    # compatibilidade; os dois podem coexistir.
+    financial_category_id: uuid.UUID | None = None
+    fixed_expense_id: uuid.UUID | None = None
     method: PaymentMethod = PaymentMethod.CASH
 
     @model_validator(mode="after")
@@ -60,6 +71,8 @@ class CashMovementRead(BaseModel):
     amount: Decimal
     description: str
     category: str | None
+    financial_category_id: uuid.UUID | None
+    fixed_expense_id: uuid.UUID | None
     method: PaymentMethod
     created_by: uuid.UUID
     created_by_name: str

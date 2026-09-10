@@ -372,6 +372,35 @@ STOCK_MOVEMENT_REASONS_BY_DIRECTION: dict[StockMovementDirection, frozenset[Stoc
 }
 
 
+class ExpenseNature(str, Enum):
+    """Natureza de uma `FinancialCategory` — usada pelo painel "Resultado
+    disponível" pra separar (-) Custos variáveis de (-) Despesas fixas.
+    A classificação vive na CATEGORIA (não em cada `CashMovement`
+    individual, ver `models/finance.py`) — reclassificar uma categoria
+    já reclassifica toda movimentação futura vinculada a ela, sem
+    precisar editar lançamento a lençamento.
+
+    Categorias antigas (criadas antes desta feature, se algum dia
+    migradas de `CashMovement.category` texto livre) e qualquer
+    `CashMovement` sem `financial_category_id` (todo o histórico
+    anterior a esta feature, ver migration correspondente) NÃO contam
+    como FIXED nem VARIABLE — ficam fora do cálculo, expostas
+    separadamente como "não classificadas" (nunca uma suposição
+    silenciosa)."""
+
+    FIXED = "fixed"
+    VARIABLE = "variable"
+
+
+class FixedExpenseRecurrence(str, Enum):
+    """Periodicidade suportada pelos compromissos fixos provisionados."""
+
+    MONTHLY = "monthly"
+    QUARTERLY = "quarterly"
+    SEMIANNUAL = "semiannual"
+    ANNUAL = "annual"
+
+
 class InventoryCountStatus(str, Enum):
     """Um inventário `OPEN` ainda recebe contagens (`counted_quantity`)
     linha a linha; ao fechar (`CLOSED`) vira somente-leitura — as

@@ -9,13 +9,14 @@ mesma coisa. O drill-down por KPI (`GET /dashboard/kpi/{key}`) é a
 precisar mudar o contrato do overview.
 """
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 
 from pydantic import BaseModel, Field
 
 from nexasalon_api.models.enums import AppointmentStatus, PaymentMethod
+from nexasalon_api.schemas.fixed_expense import FixedExpenseProvisionRow
 
 
 class KpiKind(str, Enum):
@@ -303,6 +304,89 @@ class FinancialSummary(BaseModel):
     expenses: Decimal
 
 
+class TaxCompetenceBreakdownRow(BaseModel):
+    """Uma competência (mês) dentro do período do Dashboard, com o
+    faturamento ATRIBUÍDO a ela e a alíquota que estava vigente NAQUELA
+    competência — nunca a alíquota atual. Só inclui competências com
+    faturamento > 0 (mês sem venda não aparece, mesmo que tenha uma
+    linha de alíquota configurada)."""
+
+    competence_month: date
+    revenue: Decimal
+    tax_rate: Decimal | None  # None = organização nunca configurou alíquota até esta competência.
+    tax_amount: Decimal
+
+
+class AvailableResultSummary(BaseModel):
+    """Painel "Resultado disponível" — indicador GERENCIAL (não
+    contábil, nunca chamado de "Lucro líquido"): Faturamento Bruto menos
+    Impostos provisionados, Comissões, Taxas de pagamento, Custos
+    variáveis e Despesas fixas do período selecionado no Dashboard.
+
+    Aditivo ao contrato existente — nunca redefine `kpis.revenue`,
+    `kpis.net_revenue`, `revenue_fee_summary` nem `financial_summary`
+    (todos continuam com a MESMA semântica de sempre). Cada linha reusa
+    uma fonte de verdade já existente:
+
+      - `gross_revenue`: idêntico a `kpis.revenue.value` (nunca uma
+        segunda soma de faturamento).
+      - `taxes_provisioned`: PROVISÃO gerencial (faturamento aplicável
+        × alíquota vigente EM CADA COMPETÊNCIA tocada pelo período —
+        ver `tax_breakdown`) — nunca um lançamento de caixa/pagamento
+        real. `has_unconfigured_tax_rate=True` quando alguma competência
+        com faturamento não tinha nenhuma alíquota configurada até ela
+        (nesse caso `unconfigured_tax_revenue` guarda o faturamento
+        daquelas competências, nunca tratado como 0% de imposto).
+      - `commissions`: idêntico a
+        `financial_summary.commissions_calculated` — soma dos
+        snapshots de comissão (`OrderItem.commission_amount_snapshot`)
+        das comandas fechadas no período, nunca a comissão atual
+        recalculada. `None` (o painel inteiro fica indisponível, ver
+        `available_result`) quando o ator não tem
+        `commissions.view_all`/`commissions.manage` — mostrar "Resultado
+        disponível" com uma comissão ausente daria um total
+        materialmente diferente pra usuários diferentes no MESMO
+        período, o que quebraria a premissa de indicador auditável.
+      - `payment_fees`: idêntico a `revenue_fee_summary.known_fee_total`.
+      - `variable_costs`: soma de `CashMovement` tipo WITHDRAWAL no
+        período cuja categoria tem natureza variável.
+      - `fixed_costs`: compromissos de `FixedExpense` provisionados
+        pelos vencimentos reais do período; nunca saídas de caixa.
+      - `legacy_fixed_costs`: fallback de `CashMovement` FIXED histórico,
+        sem vínculo, somente quando não existe provisão equivalente para
+        a mesma categoria e unidade no período.
+      - `linked_fixed_payments`: pagamentos realizados vinculados a uma
+        `FixedExpense`; valor informativo, nunca deduzido novamente.
+      - `unclassified_expenses`: WITHDRAWAL sem `financial_category_id`
+        (todo o histórico anterior a esta feature, ou lançamento novo
+        deixado sem categoria) — NUNCA somado a `variable_costs` nem
+        `fixed_costs`; o frontend deve avisar quando > 0.
+
+    `available_result = gross_revenue - taxes_provisioned - commissions
+    - payment_fees - variable_costs - fixed_costs - legacy_fixed_costs`.
+    `linked_fixed_payments` não participa da fórmula. `available_percent`
+    é `None` quando `gross_revenue == 0` (nunca divisão por zero)."""
+
+    available: bool  # False quando o ator não tem permissão de Comissões — todo o resto do payload é None.
+    gross_revenue: Decimal | None
+    taxes_provisioned: Decimal | None
+    tax_breakdown: list[TaxCompetenceBreakdownRow]
+    has_multiple_tax_rates: bool
+    single_tax_rate: Decimal | None  # preenchido só quando UMA única alíquota se aplicou a todo o período.
+    has_unconfigured_tax_rate: bool
+    unconfigured_tax_revenue: Decimal
+    commissions: Decimal | None
+    payment_fees: Decimal | None
+    variable_costs: Decimal | None
+    fixed_costs: Decimal | None
+    fixed_expense_breakdown: list[FixedExpenseProvisionRow]
+    legacy_fixed_costs: Decimal
+    linked_fixed_payments: Decimal
+    unclassified_expenses: Decimal
+    available_result: Decimal | None
+    available_percent: Decimal | None
+
+
 class DashboardOverviewResponse(BaseModel):
     date_from: datetime
     date_to: datetime
@@ -328,6 +412,7 @@ class DashboardOverviewResponse(BaseModel):
     heatmap: list[HeatmapCell]
     revenue_fee_summary: RevenueFeeSummary
     financial_summary: FinancialSummary
+    available_result: AvailableResultSummary
 
 
 # ---------------------------------------------------------------------------

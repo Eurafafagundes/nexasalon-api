@@ -115,7 +115,15 @@ class CashMovement(Base, UUIDPKMixin, TimestampMixin):
     entram na soma de entradas/saídas "não-venda" pro Extrato, mas não
     mexem no dinheiro físico do caixa. `category` é texto livre
     simples (item "categorias simples/configuráveis, sem sistema
-    contábil complexo") — sem tabela de categorias nesta rodada."""
+    contábil complexo") — mantido por compatibilidade.
+
+    `financial_category_id` (painel "Resultado disponível"): FK
+    OPCIONAL pra `FinancialCategory` (ver `models/finance.py`),
+    escolhida no momento da CRIAÇÃO do lançamento — nunca preenchida
+    retroativamente (o ledger é append-only, sem UPDATE). Todo
+    `CashMovement` criado antes desta coluna existir fica com
+    `financial_category_id IS NULL` para sempre, contando como "não
+    classificado" nas somas de Custos variáveis/Despesas fixas."""
 
     __tablename__ = "cash_movements"
     __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)
@@ -130,6 +138,12 @@ class CashMovement(Base, UUIDPKMixin, TimestampMixin):
     amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     category: Mapped[str | None] = mapped_column(String(120))
+    financial_category_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("financial_categories.id", ondelete="SET NULL")
+    )
+    fixed_expense_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("fixed_expenses.id", ondelete="SET NULL"), index=True
+    )
     method: Mapped["PaymentMethod"] = mapped_column(  # noqa: F821 — importado abaixo
         pg_enum(PaymentMethod, "payment_method"),
         nullable=False,

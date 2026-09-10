@@ -20,6 +20,7 @@ from .appointment_status_style import AppointmentStatusStyle  # noqa: F401
 from .appointment_custom_status import AppointmentCustomStatus  # noqa: F401
 from .cash_register import CashRegister, CashMovement  # noqa: F401
 from .cash_register_config import CashRegisterConfig  # noqa: F401
+from .finance import OrganizationTaxRate, FinancialCategory, FixedExpense, FixedExpenseVersion  # noqa: F401
 from .order import Order, OrderItem, OrderProductItem, Payment  # noqa: F401
 from .commission import CommissionSettlement, CommissionAdjustment  # noqa: F401
 from .product import Product, StockLevel  # noqa: F401
@@ -56,6 +57,10 @@ __all__ = [
     "CashRegister",
     "CashMovement",
     "CashRegisterConfig",
+    "OrganizationTaxRate",
+    "FinancialCategory",
+    "FixedExpense",
+    "FixedExpenseVersion",
     "Order",
     "OrderItem",
     "OrderProductItem",

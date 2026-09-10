@@ -105,7 +105,8 @@ def register_movement(
 ) -> CashRegisterDetail:
     cash_register_service.register_movement(
         session, actor, register_id, payload.type, payload.amount, payload.description,
-        category=payload.category, method=payload.method,
+        category=payload.category, financial_category_id=payload.financial_category_id,
+        fixed_expense_id=payload.fixed_expense_id, method=payload.method,
     )
     summary = cash_register_service.get_register_summary(session, actor, register_id)
     return _to_detail(summary)
