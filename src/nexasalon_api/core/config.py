@@ -184,6 +184,17 @@ class Settings(BaseSettings):
     customer_refresh_cookie_secure: bool = True
     customer_refresh_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
 
+    # Item de performance ("Fase B", B1 — baseline/instrumentação):
+    # liga o header padrão `Server-Timing` (visível na aba Network do
+    # navegador, NUNCA no corpo da resposta) com duração total,
+    # tempo gasto em queries reais no Postgres e quantidade de queries
+    # desta request — só números agregados, nunca SQL/params/dados
+    # pessoais/tokens/connection string (ver `ServerTimingMiddleware`,
+    # `main.py`). `False` por padrão em qualquer ambiente, inclusive
+    # produção, até uma decisão explícita de ligar temporariamente pra
+    # diagnóstico.
+    server_timing_enabled: bool = False
+
     # --- Rate limiting (endpoints sensíveis de auth) ---
     rate_limit_enabled: bool = True
     rate_limit_login_max_attempts: int = 10

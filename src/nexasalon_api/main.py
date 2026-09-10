@@ -1,4 +1,5 @@
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -13,7 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from nexasalon_api.api.v1.router import api_v1_router
 from nexasalon_api.core.config import settings
-from nexasalon_api.core.db import SessionLocal, engine
+from nexasalon_api.core.db import SessionLocal, engine, query_stats_var
 from nexasalon_api.core.exceptions import DomainError
 from nexasalon_api.core.logging import configure_logging
 
@@ -58,7 +59,43 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class ServerTimingMiddleware(BaseHTTPMiddleware):
+    """Item de performance ("Fase B", B1 — baseline/instrumentação):
+    header HTTP padrão `Server-Timing` (aba Network do navegador, NUNCA
+    no corpo da resposta) com 3 números agregados desta request —
+    duração total, tempo gasto em queries reais no Postgres (soma de
+    todos os round-trips, via `core/db.py::query_stats_var`) e tempo
+    fora do banco (`total - db`, cobre serialização/lógica/rede
+    intermediária). NUNCA registra SQL, parâmetros, dados pessoais,
+    tokens, senhas ou a connection string — só os 3 números e a
+    contagem de queries. Só ativo com `NEXASALON_SERVER_TIMING_ENABLED=
+    true` (default `False` em qualquer ambiente) — desligado, o
+    middleware nem seta o `ContextVar`, então os listeners de
+    `before/after_cursor_execute` são só um `if is None: return`."""
+
+    async def dispatch(self, request: Request, call_next):
+        if not settings.server_timing_enabled:
+            return await call_next(request)
+        stats = {"db_time": 0.0, "query_count": 0}
+        token = query_stats_var.set(stats)
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+        finally:
+            query_stats_var.reset(token)
+        total = time.perf_counter() - start
+        db_time = stats["db_time"]
+        app_time = max(total - db_time, 0.0)
+        response.headers["Server-Timing"] = (
+            f"total;dur={total * 1000:.1f}, "
+            f'db;dur={db_time * 1000:.1f};desc="{stats["query_count"]} queries", '
+            f"app;dur={app_time * 1000:.1f}"
+        )
+        return response
+
+
 app.add_middleware(RequestIdMiddleware)
+app.add_middleware(ServerTimingMiddleware)
 
 # CORS: allowlist explícita (nunca "*"), obrigatória porque
 # `allow_credentials=True` é o que permite o browser enviar o cookie
