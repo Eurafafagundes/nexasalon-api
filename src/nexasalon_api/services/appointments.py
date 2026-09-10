@@ -324,6 +324,72 @@ def _build_all_item_snapshots(
     return snapshots
 
 
+@dataclass
+class AvailabilityCheckResult:
+    """Resultado de `check_item_availability` — espelha
+    `schemas/agenda.py::AvailabilityCheckRead` campo a campo (a rota só
+    faz `AvailabilityCheckRead(**dataclasses.asdict(result))`, sem
+    tradução nenhuma no meio)."""
+
+    available: bool
+    reason: str | None = None
+    message: str | None = None
+    professional_name: str | None = None
+    window_end: str | None = None
+    computed_end: str | None = None
+    duration_minutes: int | None = None
+
+
+def check_item_availability(
+    session: Session,
+    organization_id: uuid.UUID,
+    *,
+    branch_id: uuid.UUID,
+    professional_id: uuid.UUID,
+    service_id: uuid.UUID,
+    start_at: datetime,
+    duration_override: int | None,
+) -> AvailabilityCheckResult:
+    """Diagnóstico de disponibilidade de UM horário específico
+    (profissional+serviço+início+duração), sem criar nada — item
+    "mensagens específicas de indisponibilidade" do Novo Agendamento.
+
+    Reaproveita `_build_item_snapshot` — a MESMA validação usada por
+    `create_appointment` (jornada/horário de funcionamento/bloqueio/
+    conflito) — só traduz a exceção que ela levantaria (ou o
+    `has_conflict` que ela devolveria) num resultado estruturado, em
+    vez de propagar/persistir. Nunca uma segunda regra de
+    disponibilidade: se a validação real algum dia mudar, este
+    diagnóstico muda junto automaticamente, porque é a MESMA função.
+    100% leitura — `_build_item_snapshot` não faz nenhum `session.add`/
+    `flush`, só `.get()`/`.list_overlapping()`/`.list_conflicts()`."""
+    item_in = AppointmentItemCreate(
+        professional_id=professional_id, service_id=service_id, start_at=start_at, duration_override=duration_override,
+    )
+    try:
+        snapshot = _build_item_snapshot(
+            session, organization_id, branch_id, item_in, exclude_appointment_id=None, siblings=[],
+        )
+    except (NotFoundError, ValidationDomainError) as exc:
+        details = exc.details if isinstance(exc.details, dict) else {}
+        return AvailabilityCheckResult(
+            available=False,
+            reason=details.get("reason"),
+            message=str(exc),
+            professional_name=details.get("professional_name"),
+            window_end=details.get("window_end"),
+            computed_end=details.get("computed_end"),
+            duration_minutes=details.get("duration_minutes"),
+        )
+    if snapshot.has_conflict:
+        return AvailabilityCheckResult(
+            available=False,
+            reason="conflict",
+            message="Profissional já tem um atendimento nesse horário. Escolha outro horário.",
+        )
+    return AvailabilityCheckResult(available=True)
+
+
 def _resolve_force_overlap(actor: ActorContext, requested: bool) -> bool:
     """`force_overlap=true` exige a permission `agenda.force_overlap`.
 

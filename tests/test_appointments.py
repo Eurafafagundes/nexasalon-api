@@ -1638,3 +1638,154 @@ def test_reason_business_hours_quando_jornada_da_profissional_cobre_mas_estabele
     assert "estabelecimento" in message.lower()
     assert "Ianka" not in message  # não confunde: aqui o problema NUNCA é a jornada dela
     assert "17:00" in message
+
+
+# ---------------------------------------------------------------------------
+# `check_item_availability` — item "mensagens específicas de
+# indisponibilidade" (rodada UX): diagnóstico de UM horário específico
+# sem criar nada, reaproveitando 100% a mesma validação de
+# `create_appointment` (`_build_item_snapshot`). Cobre os 4 reasons +
+# disponível + duração menor voltando a caber.
+# ---------------------------------------------------------------------------
+
+
+def test_check_availability_professional_hours_cenario_real(org_session):
+    """Teste 1 do pedido: 16:00 + 150min com Ianka até 18:00 -> reason
+    professional_hours, com os números exatos do cenário relatado."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+
+    result = appointments.check_item_availability(
+        session, org_id, branch_id=branch.id, professional_id=ianka.id, service_id=manutencao.id,
+        start_at=_dt(16, 0), duration_override=None,
+    )
+
+    assert result.available is False
+    assert result.reason == "professional_hours"
+    assert result.professional_name == "Ianka Borges"
+    assert result.window_end == "18:00"
+    assert result.computed_end == "18:30"
+    assert result.duration_minutes == 150
+
+
+def test_check_availability_business_hours(org_session):
+    """Teste 2 do pedido: horário fora do funcionamento do salão."""
+    from nexasalon_api.models.organization import BusinessHours
+
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(
+        session, org_id, working_hours_start=time(0, 0), working_hours_end=time(23, 59)
+    )
+    for weekday in range(7):
+        session.add(
+            BusinessHours(
+                organization_id=org_id, weekday=weekday, is_open=True,
+                start_time=time(9, 0), end_time=time(17, 0),
+            )
+        )
+    session.flush()
+
+    result = appointments.check_item_availability(
+        session, org_id, branch_id=branch.id, professional_id=ianka.id, service_id=manutencao.id,
+        start_at=_dt(16, 0), duration_override=None,
+    )
+
+    assert result.available is False
+    assert result.reason == "business_hours"
+    assert result.window_end == "17:00"
+    assert result.computed_end == "18:30"
+
+
+def test_check_availability_schedule_block(org_session):
+    """Teste 4 do pedido: horário bloqueado na agenda."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+    session.add(
+        ScheduleBlock(
+            organization_id=org_id, scope=ScheduleBlockScope.PROFESSIONAL, professional_id=ianka.id,
+            block_type=ScheduleBlockType.LUNCH, title="Almoço", start_at=_dt(12, 0), end_at=_dt(13, 0),
+        )
+    )
+    session.flush()
+
+    result = appointments.check_item_availability(
+        session, org_id, branch_id=branch.id, professional_id=ianka.id, service_id=manutencao.id,
+        start_at=_dt(12, 0), duration_override=30,
+    )
+
+    assert result.available is False
+    assert result.reason == "schedule_block"
+
+
+def test_check_availability_conflict(org_session):
+    """Teste 3 do pedido: horário já ocupado por outro atendimento."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+    appointments.create_appointment(
+        session, _actor(session, org_id),
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(9, 0), duration_override=60)],
+        ),
+    )
+
+    result = appointments.check_item_availability(
+        session, org_id, branch_id=branch.id, professional_id=ianka.id, service_id=manutencao.id,
+        start_at=_dt(9, 30), duration_override=30,
+    )
+
+    assert result.available is False
+    assert result.reason == "conflict"
+
+
+def test_check_availability_disponivel(org_session):
+    """Horário genuinamente livre -> available=True, sem reason."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+
+    result = appointments.check_item_availability(
+        session, org_id, branch_id=branch.id, professional_id=ianka.id, service_id=manutencao.id,
+        start_at=_dt(9, 0), duration_override=None,
+    )
+
+    assert result.available is True
+    assert result.reason is None
+
+
+def test_check_availability_duracao_menor_volta_a_caber(org_session):
+    """Teste 5 do pedido: 16:00+150min recusado, mas 16:00+30min (mesmo
+    horário de início, duração menor) volta a caber — prova que o
+    `duration_override` é levado em conta de verdade no diagnóstico."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+
+    recusado = appointments.check_item_availability(
+        session, org_id, branch_id=branch.id, professional_id=ianka.id, service_id=manutencao.id,
+        start_at=_dt(16, 0), duration_override=None,
+    )
+    aceito = appointments.check_item_availability(
+        session, org_id, branch_id=branch.id, professional_id=ianka.id, service_id=manutencao.id,
+        start_at=_dt(16, 0), duration_override=30,
+    )
+
+    assert recusado.available is False
+    assert aceito.available is True
+
+
+def test_check_availability_motivo_generico_sem_reason_especifico(org_session):
+    """Teste 6 do pedido: motivo fora dos 4 reasons estruturados (ex.:
+    profissional inativo) -> `available=False`, `reason=None` — a UI
+    cai no fallback genérico nesse caso, nunca inventa um dos 4."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+    ianka.is_active = False
+    session.flush()
+
+    result = appointments.check_item_availability(
+        session, org_id, branch_id=branch.id, professional_id=ianka.id, service_id=manutencao.id,
+        start_at=_dt(9, 0), duration_override=None,
+    )
+
+    assert result.available is False
+    assert result.reason is None
+    assert result.message  # ainda tem uma mensagem humana, só não um dos 4 reasons.

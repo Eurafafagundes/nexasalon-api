@@ -14,9 +14,10 @@ from nexasalon_api.repositories import (
     organization_repo,
     working_hours_repo,
 )
-from nexasalon_api.schemas.agenda import AgendaItemRead, AvailabilitySlotRead
+from nexasalon_api.schemas.agenda import AgendaItemRead, AvailabilityCheckRead, AvailabilitySlotRead
 from nexasalon_api.schemas.professional import ProfessionalRead, WorkingHourRead
 from nexasalon_api.services import agenda as agenda_service
+from nexasalon_api.services import appointments as appointments_service
 from nexasalon_api.services import availability as availability_service
 
 router = APIRouter(prefix="/agenda", tags=["agenda"])
@@ -147,3 +148,44 @@ def get_availability(
         duration_override_minutes=duration_override_minutes,
     )
     return [AvailabilitySlotRead(start_at=s.start_at, end_at=s.end_at) for s in slots]
+
+
+@router.get(
+    "/availability-check",
+    response_model=AvailabilityCheckRead,
+    summary="Diagnóstico de disponibilidade de um horário específico (motivo estruturado)",
+)
+def get_availability_check(
+    branch_id: uuid.UUID,
+    professional_id: uuid.UUID,
+    service_id: uuid.UUID,
+    start_at: datetime,
+    duration_override_minutes: int | None = Query(
+        None, gt=0, le=1440,
+        description="Mesmo campo de `duration_override` do Novo Agendamento — verifica o horário pra ESTA duração.",
+    ),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view_availability),
+) -> AvailabilityCheckRead:
+    """Item "mensagens específicas de indisponibilidade" — usado pelo
+    `TimePicker` só no momento em que um horário JÁ selecionado deixa
+    de aparecer na lista de `GET /availability` (nunca chamado pra
+    cada slot da lista, um-a-um) — pra descobrir o MOTIVO real
+    (jornada da profissional, horário de funcionamento, bloqueio,
+    conflito) em vez de uma mensagem genérica. Reaproveita 100% a
+    mesma validação de `create_appointment`
+    (`services/appointments.py::check_item_availability` ->
+    `_build_item_snapshot`), nunca uma segunda regra."""
+    result = appointments_service.check_item_availability(
+        session, actor.organization_id, branch_id=branch_id, professional_id=professional_id,
+        service_id=service_id, start_at=start_at, duration_override=duration_override_minutes,
+    )
+    return AvailabilityCheckRead(
+        available=result.available,
+        reason=result.reason,
+        message=result.message,
+        professional_name=result.professional_name,
+        window_end=result.window_end,
+        computed_end=result.computed_end,
+        duration_minutes=result.duration_minutes,
+    )
