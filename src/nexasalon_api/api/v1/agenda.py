@@ -133,11 +133,17 @@ def get_availability(
     service_id: uuid.UUID,
     date: date_type,
     slot_minutes: int = Query(15, description="Granularidade da grade de horários oferecidos (15 ou 30)."),
+    duration_override_minutes: int | None = Query(
+        None, gt=0, le=1440,
+        description="Recalcula os horários pra uma duração diferente da do catálogo (item \"duração editável por "
+        "serviço\" do Novo Agendamento) — omitido/`None` usa a duração efetiva normal do serviço.",
+    ),
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_view_availability),
 ) -> list[AvailabilitySlotRead]:
     slots = availability_service.compute_availability(
         session, actor.organization_id, branch_id=branch_id, professional_id=professional_id,
         service_id=service_id, target_date=date, slot_minutes=slot_minutes,
+        duration_override_minutes=duration_override_minutes,
     )
     return [AvailabilitySlotRead(start_at=s.start_at, end_at=s.end_at) for s in slots]

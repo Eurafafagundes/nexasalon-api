@@ -210,6 +210,7 @@ def compute_availability(
     slot_minutes: int = 15,
     earliest_start: datetime | None = None,
     latest_start: datetime | None = None,
+    duration_override_minutes: int | None = None,
 ) -> list[AvailabilitySlot]:
     """`earliest_start`/`latest_start` (ambos `None` por padrão — sem
     nenhuma restrição extra, comportamento IDÊNTICO ao de antes desta
@@ -221,7 +222,13 @@ def compute_availability(
     nenhuma restrição de "agora"/antecedência aqui (a recepção pode
     legitimamente agendar num horário que já passou, ex. registrar um
     atendimento feito sem hora marcada — essa é uma decisão de produto
-    já existente, não alterada por esta correção)."""
+    já existente, não alterada por esta correção).
+
+    `duration_override_minutes` (item "duração editável por serviço no
+    Novo Agendamento") recalcula os slots pra uma duração DIFERENTE da
+    do catálogo — MESMO motor (`_generate_slots`/`_subtract_busy`),
+    nunca uma segunda conta em duplicado no frontend. `None` (padrão) =
+    comportamento idêntico a antes: usa `effective_duration_and_price`."""
     if slot_minutes not in ALLOWED_SLOT_MINUTES:
         raise ValidationDomainError("slot_minutes deve ser 15 ou 30.")
 
@@ -245,6 +252,8 @@ def compute_availability(
         raise ValidationDomainError("Este profissional não executa este serviço.")
 
     duration_minutes, _price = effective_duration_and_price(service, professional_service)
+    if duration_override_minutes is not None:
+        duration_minutes = duration_override_minutes
     tz = effective_timezone(session, organization_id, branch_id)
 
     windows = effective_working_windows_utc(session, organization_id, professional_id, target_date, tz)

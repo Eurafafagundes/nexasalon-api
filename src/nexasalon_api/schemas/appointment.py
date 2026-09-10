@@ -10,21 +10,30 @@ from nexasalon_api.models.enums import AppointmentSource, AppointmentStatus
 
 class AppointmentItemCreate(BaseModel):
     """Entrada do cliente por item: profissional, serviço, início e
-    (opcional) `price_override`. Fim e duração continuam SEMPRE
-    calculados no servidor (nunca aceitos do cliente). `price_override`
-    é a ÚNICA exceção deliberada — evolução do Novo Agendamento, item
-    "valor editável por serviço": quando informado, substitui o preço
-    efetivo do catálogo (`Service.default_price` /
-    `ProfessionalService.price_override`) SÓ para este item, sem
-    escrever de volta em nenhum dos dois. Mesmo desenho de
-    `OrderItem.price` (camada 3 da cadeia de preço, ver docstring de
-    `models/order.py`) — reaproveita o padrão de snapshot já existente,
-    não cria um preço "duplicado" novo."""
+    (opcionais) `price_override`/`duration_override`. Fim continua
+    SEMPRE calculado no servidor (nunca aceito do cliente) — a partir da
+    duração efetiva, catálogo ou `duration_override`. `price_override` e
+    `duration_override` são as ÚNICAS exceções deliberadas — evolução do
+    Novo Agendamento, itens "valor editável por serviço" e "duração
+    editável por serviço": quando informados, substituem o preço/duração
+    efetivos do catálogo (`Service.default_price`/`default_duration_minutes`
+    ou `ProfessionalService.price_override`/`duration_override_minutes`)
+    SÓ para este item, sem escrever de volta em nenhum dos dois. Mesmo
+    desenho de `OrderItem.price`/`duration_minutes` (camada 3 da cadeia,
+    ver docstring de `models/order.py`) e o MESMO campo/validação já
+    usados por `AppointmentItemUpdate.duration_override` (edição pós-
+    criação) — reaproveita o padrão de snapshot já existente, não cria
+    um valor "duplicado" novo. A duração efetiva (override ou catálogo)
+    continua 100% validada contra jornada/horário de funcionamento/
+    bloqueio/conflito no servidor — um `duration_override` que ainda
+    ultrapasse a jornada é recusado do mesmo jeito que a duração padrão
+    seria."""
 
     professional_id: uuid.UUID
     service_id: uuid.UUID
     start_at: datetime
     price_override: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    duration_override: int | None = Field(default=None, gt=0, le=1440)
 
     @field_validator("start_at")
     @classmethod

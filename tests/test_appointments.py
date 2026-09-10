@@ -308,6 +308,7 @@ def test_horario_fora_da_jornada_gera_erro(org_session):
     assert "T20:00:00" not in message
     assert "+00:00" not in message
     assert "-03:00" not in message
+    assert exc_info.value.details["reason"] == "professional_hours"
 
 
 def test_horario_fora_da_jornada_sem_jornada_cadastrada_usa_mensagem_generica(org_session):
@@ -334,6 +335,7 @@ def test_horario_fora_da_jornada_sem_jornada_cadastrada_usa_mensagem_generica(or
     message = str(exc_info.value)
     assert message == "Este horário está fora da jornada de trabalho do profissional. Escolha outro horário."
     assert "T14:00:00" not in message
+    assert exc_info.value.details["reason"] == "professional_hours"
 
 
 def test_conflito_com_schedule_block_gera_erro(org_session):
@@ -352,8 +354,9 @@ def test_conflito_com_schedule_block_gera_erro(org_session):
         branch_id=branch.id, client_id=client.id,
         items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 30))],
     )
-    with pytest.raises(ValidationDomainError):
+    with pytest.raises(ValidationDomainError) as exc_info:
         appointments.create_appointment(session, actor, data)
+    assert exc_info.value.details["reason"] == "schedule_block"
 
 
 def test_conflito_com_agendamento_existente_gera_409(org_session):
@@ -379,6 +382,7 @@ def test_conflito_com_agendamento_existente_gera_409(org_session):
     message = str(exc_info.value)
     assert message == "Profissional já tem um atendimento nesse horário. Escolha outro horário."
     assert "T14:30:00" not in message
+    assert exc_info.value.details["reason"] == "conflict"
 
 
 def test_force_overlap_sem_permissao_gera_403_mesmo_sem_conflito_real(org_session):
@@ -1355,3 +1359,282 @@ def test_update_notes_nao_afeta_order_observation_ja_existente(org_session):
 
     session.refresh(order)
     assert order.observation == "Observação original da visita."
+
+
+# ---------------------------------------------------------------------------
+# Duração editável por serviço (Novo Agendamento) + mensagens/reasons
+# específicos de indisponibilidade. Cenário real relatado: "MANUTENÇÃO 3
+# TELAS COM ESCOVA" (150min) com Ianka Borges (jornada até 18:00) às
+# 16:00 -> 16:00+150min=18:30 > 18:00 -> recusado. `duration_override`
+# reaproveita o MESMO campo/validação (`gt=0, le=1440`) já usado por
+# `AppointmentItemUpdate.duration_override` (edição pós-criação) —
+# nunca duplica a checagem de jornada/bloqueio/conflito, que continua
+# 100% em `_assert_within_working_hours`/`_assert_no_schedule_block`/
+# `appointment_item_repo.list_conflicts`.
+# ---------------------------------------------------------------------------
+
+
+def _setup_manutencao_ianka(session, org_id, *, working_hours_start=time(9, 0), working_hours_end=time(18, 0)):
+    branch = _branch(session, org_id)
+    ianka = _professional(session, org_id, branch.id, name="Ianka Borges")
+    manutencao = _service(session, org_id, name="Manutenção 3 telas com escova", duration=150, price=150)
+    _link(session, ianka.id, manutencao.id)
+    _working_hours(session, org_id, ianka.id, _OUR_THURSDAY, working_hours_start, working_hours_end)
+    client = _client(session, org_id)
+    session.flush()
+    return branch, ianka, manutencao, client
+
+
+def test_servico_150min_as_16h_com_jornada_ate_18h_e_recusado(org_session):
+    """Teste 1 do pedido: reproduz o cenário real relatado — recusado,
+    com mensagem específica (não genérica) e `reason` estruturado."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(16, 0))],
+    )
+    with pytest.raises(ValidationDomainError) as exc_info:
+        appointments.create_appointment(session, actor, data)
+
+    exc = exc_info.value
+    message = str(exc)
+    assert exc.details["reason"] == "professional_hours"
+    assert "Ianka Borges" in message
+    assert "18:00" in message  # fim real da jornada
+    assert "18:30" in message  # fim calculado (16:00 + 150min)
+    assert "150 min" in message
+    assert "Esse horário não está mais disponível" not in message  # nunca mais o texto genérico antigo
+
+
+def test_duration_override_120min_permite_16h(org_session):
+    """Teste 2 do pedido: override pra 120min -> 16:00+120min=18:00,
+    cabe exatamente na jornada (fim inclusive) -> aceito."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[
+            AppointmentItemCreate(
+                professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(16, 0), duration_override=120,
+            )
+        ],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    assert appt.items[0].duration_minutes == 120
+    assert appt.items[0].end_at == _dt(18, 0)
+    # preço continua vindo do catálogo normalmente — override é só de duração.
+    assert appt.items[0].price == Decimal("150.00")
+
+
+def test_duration_override_nao_altera_duracao_padrao_do_service(org_session):
+    """Teste 3 do pedido: `Service.default_duration_minutes` nunca é
+    escrito por um `duration_override` — mesmo padrão de
+    `price_override`/`Service.default_price`."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[
+            AppointmentItemCreate(
+                professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(9, 0), duration_override=90,
+            )
+        ],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    assert appt.items[0].duration_minutes == 90
+    session.refresh(manutencao)
+    assert manutencao.default_duration_minutes == 150
+
+
+def test_duration_override_persiste_e_e_recarregado(org_session):
+    """Teste 4 do pedido: reload/edição do agendamento preserva o
+    override (é um snapshot persistido em `AppointmentItem.duration_minutes`,
+    nunca recalculado do catálogo depois de criado)."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[
+            AppointmentItemCreate(
+                professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(9, 0), duration_override=45,
+            )
+        ],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    appointment_id = appt.id
+    session.flush()
+    session.expire_all()
+
+    reloaded = appointments.get_appointment(session, actor, appointment_id)
+    assert reloaded.items[0].duration_minutes == 45
+
+
+def test_duration_override_que_ainda_ultrapassa_jornada_continua_recusado(org_session):
+    """Teste 5 do pedido: 130min ainda estoura 18:00 (16:00+130=18:10) —
+    override não é um passe livre, continua 100% validado."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[
+            AppointmentItemCreate(
+                professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(16, 0), duration_override=130,
+            )
+        ],
+    )
+    with pytest.raises(ValidationDomainError) as exc_info:
+        appointments.create_appointment(session, actor, data)
+    exc = exc_info.value
+    assert exc.details["reason"] == "professional_hours"
+    assert "18:10" in str(exc)
+
+
+def test_duration_override_ainda_respeita_conflito_com_outro_agendamento(org_session):
+    """Teste 6 do pedido: encurtar a duração não permite invadir um
+    horário já ocupado por outro agendamento do mesmo profissional."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+
+    first = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appointments.create_appointment(session, actor, first)
+
+    # 13:50 + 20min (override) = 13:50-14:10, invade os 14:00-15:00 do
+    # primeiro atendimento mesmo com duração bem mais curta.
+    second = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[
+            AppointmentItemCreate(
+                professional_id=prof.id, service_id=service.id, start_at=_dt(13, 50), duration_override=20,
+            )
+        ],
+    )
+    with pytest.raises(ConflictError) as exc_info:
+        appointments.create_appointment(session, actor, second)
+    assert exc_info.value.details["reason"] == "conflict"
+
+
+def test_duration_override_preservado_no_reagendamento_via_put(org_session):
+    """Teste "Reagendamento" do pedido: Service=150, Appointment=120 —
+    reagendar (PUT/`replace_appointment`) SÓ muda data/horário; a
+    duração precisa continuar 120, nunca reverter silenciosamente pro
+    catálogo. `replace_appointment` reconstrói os itens do zero via
+    `AppointmentItemCreate` (mesmo código de `create_appointment`) — o
+    chamador (frontend, `appointment-detail-drawer.tsx::draftFromItem`)
+    é responsável por reenviar `duration_override` explicitamente; este
+    teste prova que, quando ele faz isso (como já corrigido no
+    frontend), o backend preserva corretamente, sem recalcular do
+    catálogo por baixo."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+    actor = _actor(session, org_id)
+
+    created = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[
+                AppointmentItemCreate(
+                    professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(9, 0), duration_override=120,
+                )
+            ],
+        ),
+    )
+    assert created.items[0].duration_minutes == 120
+
+    replace_data = AppointmentReplace(
+        branch_id=branch.id, client_id=client.id,
+        items=[
+            AppointmentItemCreate(
+                professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(10, 0), duration_override=120,
+            )
+        ],
+    )
+    updated = appointments.replace_appointment(session, actor, created.id, replace_data)
+
+    assert updated.items[0].duration_minutes == 120  # NUNCA volta pra 150 silenciosamente.
+    assert updated.items[0].start_at == _dt(10, 0)
+    session.refresh(manutencao)
+    assert manutencao.default_duration_minutes == 150  # catálogo continua intocado.
+
+
+def test_duration_override_encurtada_ainda_respeita_bloqueio_de_agenda(org_session):
+    """Teste 9 do pedido ("bloqueios continuam respeitados") combinado
+    com duration_override: encurtar a duração não permite invadir um
+    ScheduleBlock existente."""
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(session, org_id)
+    session.add(
+        ScheduleBlock(
+            organization_id=org_id, scope=ScheduleBlockScope.PROFESSIONAL, professional_id=ianka.id,
+            block_type=ScheduleBlockType.LUNCH, title="Almoço", start_at=_dt(12, 0), end_at=_dt(13, 0),
+        )
+    )
+    session.flush()
+    actor = _actor(session, org_id)
+
+    # 11:50 + 20min (override) = 11:50-12:10, invade o bloqueio 12:00-13:00
+    # mesmo com duração bem mais curta que os 150min do catálogo.
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[
+            AppointmentItemCreate(
+                professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(11, 50), duration_override=20,
+            )
+        ],
+    )
+    with pytest.raises(ValidationDomainError) as exc_info:
+        appointments.create_appointment(session, actor, data)
+    assert exc_info.value.details["reason"] == "schedule_block"
+
+
+def test_reason_business_hours_quando_jornada_da_profissional_cobre_mas_estabelecimento_nao(org_session):
+    """Item explícito do pedido: diferenciar "ultrapassa jornada da
+    profissional" de "ultrapassa horário do estabelecimento". Jornada
+    da Ianka cobre o dia inteiro (00:00-23:59); quem recusa 16:00+150min
+    é o horário de FUNCIONAMENTO (fecha às 17:00) — a mensagem e o
+    `reason` precisam apontar pro estabelecimento, nunca pra jornada da
+    profissional (que nem chega a ser o problema aqui)."""
+    from nexasalon_api.models.organization import BusinessHours
+
+    session, org_id = org_session
+    branch, ianka, manutencao, client = _setup_manutencao_ianka(
+        session, org_id, working_hours_start=time(0, 0), working_hours_end=time(23, 59)
+    )
+    for weekday in range(7):
+        session.add(
+            BusinessHours(
+                organization_id=org_id, weekday=weekday, is_open=True,
+                start_time=time(9, 0), end_time=time(17, 0),
+            )
+        )
+    session.flush()
+    actor = _actor(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(16, 0))],
+    )
+    with pytest.raises(ValidationDomainError) as exc_info:
+        appointments.create_appointment(session, actor, data)
+
+    exc = exc_info.value
+    message = str(exc)
+    assert exc.details["reason"] == "business_hours"
+    assert "estabelecimento" in message.lower()
+    assert "Ianka" not in message  # não confunde: aqui o problema NUNCA é a jornada dela
+    assert "17:00" in message

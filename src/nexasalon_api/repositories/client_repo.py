@@ -89,15 +89,20 @@ def list_all(
     if search:
         # Campo único (item "não quero seletor Nome/CPF/Telefone"): o
         # texto digitado é comparado ao nome (ilike, texto livre) e,
-        # quando contém algum dígito, também ao telefone/CPF já
+        # quando contém algum dígito, também a telefone/whatsapp/CPF já
         # NORMALIZADOS no banco (só dígitos) — "11 99999-0000",
         # "11999990000" e "111.444.777-35" encontram o cliente sem
-        # precisar de nenhum modo de busca separado.
+        # precisar de nenhum modo de busca separado. `whatsapp` entrou
+        # aqui porque um cadastro manual comum preenche só esse campo
+        # (ver docstring de `get_by_phone`) — sem ele, um cliente sem
+        # `phone` preenchido era invisível pra busca por número, mesmo
+        # com o WhatsApp certo cadastrado.
         conditions = [Client.name.ilike(f"%{search}%")]
         digits = _DIGITS.sub("", search)
         if digits:
             digit_pattern = f"%{digits}%"
             conditions.append(Client.phone.ilike(digit_pattern))
+            conditions.append(Client.whatsapp.ilike(digit_pattern))
             conditions.append(Client.cpf.ilike(digit_pattern))
         stmt = stmt.where(or_(*conditions))
     return list(session.scalars(stmt.order_by(Client.name)).all())

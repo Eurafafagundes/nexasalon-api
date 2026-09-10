@@ -36,6 +36,73 @@ def test_buscar_por_nome_e_telefone(client_as, org_a_actor):
     assert any(cl["phone"] == "11999990000" for cl in resp.json())
 
 
+# ---------------------------------------------------------------------
+# Busca de cliente por telefone/whatsapp no "Novo agendamento" (bug
+# real relatado: buscar pelo nome funcionava, pelo telefone não) —
+# `client_repo.list_all` é a MESMA função usada por `/clients` (aqui) e
+# `/clients/lookup` (autocomplete da Agenda, `client-picker.tsx`), sem
+# nenhuma lógica de busca duplicada entre os dois endpoints.
+# ---------------------------------------------------------------------
+
+
+def test_busca_por_telefone_formatado(client_as, org_a_actor):
+    """Teste 11 do pedido — "(61) 99999-9999" encontra o cliente cujo
+    telefone foi salvo (já normalizado, só dígitos) como "61999999999"."""
+    c = client_as(org_a_actor)
+    c.post("/api/v1/clients", json={"name": "Cliente Telefone", "phone": "61999999999"})
+
+    resp = c.get("/api/v1/clients", params={"search": "(61) 99999-9999"})
+    assert resp.status_code == 200
+    assert [cl["name"] for cl in resp.json()] == ["Cliente Telefone"]
+
+
+def test_busca_por_telefone_sem_mascara(client_as, org_a_actor):
+    """Teste 12 do pedido."""
+    c = client_as(org_a_actor)
+    c.post("/api/v1/clients", json={"name": "Cliente Telefone", "phone": "61999999999"})
+
+    resp = c.get("/api/v1/clients", params={"search": "61999999999"})
+    assert resp.status_code == 200
+    assert [cl["name"] for cl in resp.json()] == ["Cliente Telefone"]
+
+    # Variante "61 99999-9999" (espaço, sem parênteses/traço) — mesmo
+    # valor normalizado, precisa convergir pro mesmo resultado.
+    resp2 = c.get("/api/v1/clients", params={"search": "61 99999-9999"})
+    assert [cl["name"] for cl in resp2.json()] == ["Cliente Telefone"]
+
+
+def test_busca_por_whatsapp(client_as, org_a_actor):
+    """Teste 13 do pedido — bug real corrigido: um cliente sem `phone`
+    preenchido (só `whatsapp`, cadastro manual comum) era invisível pra
+    busca por número antes desta correção (`client_repo.list_all` só
+    olhava `phone`/`cpf`, nunca `whatsapp`)."""
+    c = client_as(org_a_actor)
+    c.post("/api/v1/clients", json={"name": "Cliente Só WhatsApp", "whatsapp": "(61) 98888-7777"})
+
+    resp = c.get("/api/v1/clients", params={"search": "61988887777"})
+    assert resp.status_code == 200
+    assert [cl["name"] for cl in resp.json()] == ["Cliente Só WhatsApp"]
+
+    resp2 = c.get("/api/v1/clients", params={"search": "(61) 98888-7777"})
+    assert [cl["name"] for cl in resp2.json()] == ["Cliente Só WhatsApp"]
+
+
+def test_busca_por_telefone_de_cliente_de_outra_organizacao_nunca_aparece(client_as, org_a_actor, org_b_actor):
+    """Teste 14 do pedido — isolamento por organização continua valendo
+    pra busca por telefone/whatsapp, não só pra busca por nome."""
+    c_a = client_as(org_a_actor)
+    c_a.post("/api/v1/clients", json={"name": "Cliente Org A", "phone": "61999999999", "whatsapp": "61988887777"})
+
+    c_b = client_as(org_b_actor)
+    c_b.post("/api/v1/clients", json={"name": "Cliente Org B"})
+
+    resp_phone = c_b.get("/api/v1/clients", params={"search": "61999999999"})
+    assert resp_phone.json() == []
+
+    resp_whatsapp = c_b.get("/api/v1/clients", params={"search": "61988887777"})
+    assert resp_whatsapp.json() == []
+
+
 def test_busca_em_campo_unico_tambem_encontra_por_cpf(client_as, org_a_actor):
     """Item "busca de cliente por nome/telefone/CPF num único campo,
     sem seletor" — digitar um CPF (formatado ou só dígitos) encontra o

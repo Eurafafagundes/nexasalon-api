@@ -92,29 +92,102 @@ class _ItemSnapshot:
     has_conflict: bool
 
 
-def _working_hours_error_message(windows: list[tuple[datetime, datetime]], tz: ZoneInfo) -> str:
-    """Mensagem SEMPRE humana pro usuário final — bug real corrigido
-    (mostrava `start_at.isoformat()` cru, ex.:
-    "...2026-09-04T11:00:00+00:00)", timestamp ISO com timezone,
-    ilegível pra quem usa o balcão). Enriquece com a jornada real
-    quando ela é conhecida (`windows` não vazio — o caso comum: o
-    profissional atende NAQUELE dia, só não nesse horário específico);
-    cai pro texto genérico quando não há jornada nenhuma cadastrada
-    pro dia (nada de horário pra mostrar). Detalhe técnico (o instante
-    exato solicitado) não é necessário aqui — quem chama já sabe qual
-    horário pediu; a mensagem só precisa dizer O QUE atende."""
-    if not windows:
-        return "Este horário está fora da jornada de trabalho do profissional. Escolha outro horário."
-    ranges = " e ".join(
+def _format_windows(windows: list[tuple[datetime, datetime]], tz: ZoneInfo) -> str:
+    return " e ".join(
         f"{w_start.astimezone(tz).strftime('%H:%M')} às {w_end.astimezone(tz).strftime('%H:%M')}"
         for w_start, w_end in windows
     )
-    return f"Este profissional não atende nesse horário. Horário de atendimento: {ranges}."
+
+
+def _containing_window(
+    windows: list[tuple[datetime, datetime]], start_at: datetime
+) -> tuple[datetime, datetime] | None:
+    """A janela cujo INÍCIO já cobre `start_at` (ainda que o FIM não
+    cubra) — sinal de que o problema é a DURAÇÃO estourando o fim da
+    janela, não o horário de início escolhido em si. `None` quando
+    `start_at` já cai fora de toda janela (início inválido, não duração)."""
+    return next((w for w in windows if w[0] <= start_at < w[1]), None)
+
+
+def _professional_hours_rejection(
+    windows: list[tuple[datetime, datetime]], tz: ZoneInfo, start_at: datetime, end_at: datetime, professional_name: str,
+) -> tuple[str, dict]:
+    """Jornada do PRÓPRIO profissional (`working_windows_utc`, sem o
+    recorte do horário de funcionamento) não comporta `[start_at,
+    end_at)` — usado quando nem a jornada individual, isolada, cobriria
+    o horário (então não adianta culpar o estabelecimento)."""
+    containing = _containing_window(windows, start_at)
+    if containing is not None:
+        # Bug real relatado: serviço longo (ex. 150min) além do fim da
+        # jornada (ex. 18h) mostrava só "não está mais disponível", sem
+        # dizer PORQUÊ — parecia bug. Mensagem específica com os números
+        # que o usuário já vê na tela (duração escolhida, fim real).
+        window_end = containing[1].astimezone(tz).strftime("%H:%M")
+        computed_end = end_at.astimezone(tz).strftime("%H:%M")
+        duration_minutes = int((end_at - start_at).total_seconds() // 60)
+        message = (
+            f"Este serviço termina após o horário de atendimento da profissional. {professional_name} atende até "
+            f"{window_end} e, com duração de {duration_minutes} min, este atendimento terminaria às {computed_end}. "
+            "Ajuste o horário de início ou a duração do atendimento."
+        )
+        return message, {
+            "reason": "professional_hours", "professional_name": professional_name,
+            "window_end": window_end, "computed_end": computed_end, "duration_minutes": duration_minutes,
+        }
+    if not windows:
+        # Mensagem/formato IDÊNTICOS ao texto original (pré-existente) —
+        # sem jornada nenhuma cadastrada pro dia, não há horário pra
+        # mostrar; só ganha o `reason` estruturado, nunca muda de texto.
+        return (
+            "Este horário está fora da jornada de trabalho do profissional. Escolha outro horário.",
+            {"reason": "professional_hours"},
+        )
+    ranges = _format_windows(windows, tz)
+    # Mesmo texto original — só ganha `reason` estruturado.
+    return (
+        f"Este profissional não atende nesse horário. Horário de atendimento: {ranges}.",
+        {"reason": "professional_hours", "windows": ranges},
+    )
+
+
+def _business_hours_rejection(
+    windows: list[tuple[datetime, datetime]], tz: ZoneInfo, start_at: datetime, end_at: datetime,
+) -> tuple[str, dict]:
+    """A jornada do profissional, ISOLADA, comportaria `[start_at,
+    end_at)` — quem está recusando é o horário de funcionamento do
+    ESTABELECIMENTO (`windows` aqui já é `effective_working_windows_utc`,
+    a jornada recortada por `business_hours`). Nunca confundir com a
+    jornada do profissional na mensagem (item explícito do pedido:
+    diferenciar as duas causas)."""
+    containing = _containing_window(windows, start_at)
+    if containing is not None:
+        window_end = containing[1].astimezone(tz).strftime("%H:%M")
+        computed_end = end_at.astimezone(tz).strftime("%H:%M")
+        duration_minutes = int((end_at - start_at).total_seconds() // 60)
+        message = (
+            f"Este serviço termina após o horário de atendimento do estabelecimento. O estabelecimento atende até "
+            f"{window_end} e, com duração de {duration_minutes} min, este atendimento terminaria às {computed_end}. "
+            "Ajuste o horário de início ou a duração do atendimento."
+        )
+        return message, {
+            "reason": "business_hours", "window_end": window_end, "computed_end": computed_end,
+            "duration_minutes": duration_minutes,
+        }
+    if not windows:
+        return (
+            "O estabelecimento está fechado neste dia. Escolha outra data.",
+            {"reason": "business_hours"},
+        )
+    ranges = _format_windows(windows, tz)
+    return (
+        f"Fora do horário de funcionamento do estabelecimento. Horário de atendimento: {ranges}.",
+        {"reason": "business_hours", "windows": ranges},
+    )
 
 
 def _assert_within_working_hours(
     session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID, professional_id: uuid.UUID,
-    start_at: datetime, end_at: datetime,
+    professional_name: str, start_at: datetime, end_at: datetime,
 ) -> None:
     """Reaproveita `effective_working_windows_utc` (jornada do
     profissional JÁ recortada pelo horário de funcionamento do
@@ -122,12 +195,32 @@ def _assert_within_working_hours(
     por `compute_availability`, nunca uma segunda checagem. Isso garante
     que nem a Agenda interna consegue criar um agendamento fora do
     horário de funcionamento, mesmo que o profissional tenha jornada
-    cadastrada naquele dia."""
+    cadastrada naquele dia.
+
+    Item "mensagens específicas de indisponibilidade": quando a janela
+    efetiva recusa o horário, recalcula a jornada do profissional
+    ISOLADA (`working_windows_utc`, já pública, sem alterar
+    `availability.py`) só pra decidir QUAL camada é a responsável —
+    cabe na jornada isolada = quem recusou foi o horário de
+    funcionamento (`business_hours`); não cabe nem isolada = a própria
+    jornada do profissional (`professional_hours`). Nunca duas fontes
+    de verdade: a decisão de ACEITAR/RECUSAR continua vindo 100% de
+    `effective_working_windows_utc`, igual sempre foi — isto só
+    enriquece a MENSAGEM do que já foi recusado."""
     tz = availability.effective_timezone(session, organization_id, branch_id)
     local_date = start_at.astimezone(tz).date()
-    windows = availability.effective_working_windows_utc(session, organization_id, professional_id, local_date, tz)
-    if not any(w_start <= start_at and end_at <= w_end for w_start, w_end in windows):
-        raise ValidationDomainError(_working_hours_error_message(windows, tz))
+    effective_windows = availability.effective_working_windows_utc(
+        session, organization_id, professional_id, local_date, tz
+    )
+    if any(w_start <= start_at and end_at <= w_end for w_start, w_end in effective_windows):
+        return
+    professional_windows = availability.working_windows_utc(session, organization_id, professional_id, local_date, tz)
+    fits_professional_alone = any(w_start <= start_at and end_at <= w_end for w_start, w_end in professional_windows)
+    if fits_professional_alone:
+        message, details = _business_hours_rejection(effective_windows, tz, start_at, end_at)
+    else:
+        message, details = _professional_hours_rejection(professional_windows, tz, start_at, end_at, professional_name)
+    raise ValidationDomainError(message, details)
 
 
 def _assert_no_schedule_block(
@@ -139,7 +232,9 @@ def _assert_no_schedule_block(
         range_start=start_at, range_end=end_at,
     )
     if blocks:
-        raise ValidationDomainError("Horário coincide com um bloqueio de agenda do profissional/unidade.")
+        raise ValidationDomainError(
+            "Horário coincide com um bloqueio de agenda do profissional/unidade.", {"reason": "schedule_block"}
+        )
 
 
 def _build_item_snapshot(
@@ -172,16 +267,22 @@ def _build_item_snapshot(
         raise ValidationDomainError("Este profissional não executa este serviço.")
 
     duration_minutes, catalog_price = availability.effective_duration_and_price(service, professional_service)
-    # `price_override` (item "valor editável por serviço") substitui só
-    # o PREÇO efetivo deste item — nunca a duração, e nunca escreve de
-    # volta em `Service.default_price`/`ProfessionalService.price_override`.
-    # Mesmo padrão de snapshot já usado por `OrderItem.price` (ver
-    # docstring de `AppointmentItemCreate`).
+    # `price_override`/`duration_override` (itens "valor editável por
+    # serviço"/"duração editável por serviço") substituem só o
+    # PREÇO/DURAÇÃO efetivos deste item — nunca escrevem de volta em
+    # `Service.default_price`/`default_duration_minutes` nem em
+    # `ProfessionalService.price_override`/`duration_override_minutes`.
+    # Mesmo padrão de snapshot já usado por `OrderItem.price`/
+    # `duration_minutes` (ver docstring de `AppointmentItemCreate`).
     price = item_in.price_override if item_in.price_override is not None else catalog_price
+    if item_in.duration_override is not None:
+        duration_minutes = item_in.duration_override
     start_at = item_in.start_at
     end_at = start_at + timedelta(minutes=duration_minutes)
 
-    _assert_within_working_hours(session, organization_id, branch_id, item_in.professional_id, start_at, end_at)
+    _assert_within_working_hours(
+        session, organization_id, branch_id, item_in.professional_id, professional.name, start_at, end_at
+    )
     _assert_no_schedule_block(session, organization_id, branch_id, item_in.professional_id, start_at, end_at)
 
     db_conflicts = appointment_item_repo.list_conflicts(
@@ -254,7 +355,10 @@ def _apply_conflict_policy(snapshots: list[_ItemSnapshot], effective_force_overl
                 # (`snapshot.start_at.isoformat()`) — o usuário já está
                 # olhando pro horário que acabou de escolher, não
                 # precisa dele repetido tecnicamente na mensagem.
-                raise ConflictError("Profissional já tem um atendimento nesse horário. Escolha outro horário.")
+                raise ConflictError(
+                    "Profissional já tem um atendimento nesse horário. Escolha outro horário.",
+                    {"reason": "conflict"},
+                )
             any_forced = True
     return any_forced
 
@@ -1162,6 +1266,14 @@ def update_appointment_item(
         )
         if professional_service is None or not professional_service.is_active:
             raise ValidationDomainError("Este profissional não executa este serviço.")
+        target_professional_name = professional.name
+    else:
+        # Não trocou de profissional — busca só pelo NOME (usado nas
+        # mensagens específicas de `_assert_within_working_hours` abaixo),
+        # sem repetir as checagens de ativo/unidade/vínculo acima (o item
+        # já existe com este profissional, então elas já passaram antes).
+        existing_professional = professional_repo.get(session, organization_id, target_professional_id)
+        target_professional_name = existing_professional.name if existing_professional else "O profissional"
 
     # Já existe uma Comanda ATIVA linkada? Guarda financeira ANTES de
     # tocar em qualquer coisa — nunca aplica a mudança pra só depois
@@ -1174,7 +1286,10 @@ def update_appointment_item(
             "silenciosamente. Use o fluxo financeiro de estorno/reversão."
         )
 
-    _assert_within_working_hours(session, organization_id, appointment.branch_id, target_professional_id, target_start_at, target_end_at)
+    _assert_within_working_hours(
+        session, organization_id, appointment.branch_id, target_professional_id, target_professional_name,
+        target_start_at, target_end_at,
+    )
     _assert_no_schedule_block(session, organization_id, appointment.branch_id, target_professional_id, target_start_at, target_end_at)
 
     sibling_conflict = any(
@@ -1196,7 +1311,10 @@ def update_appointment_item(
             # Bug real corrigido: mesma mensagem humana de
             # `_apply_conflict_policy` (sem ISO cru) — o usuário já
             # está olhando pro horário que acabou de escolher.
-            raise ConflictError("Profissional já tem um atendimento nesse horário. Escolha outro horário.")
+            raise ConflictError(
+                "Profissional já tem um atendimento nesse horário. Escolha outro horário.",
+                {"reason": "conflict"},
+            )
         any_forced = True
     _maybe_allow_overlap(session, any_forced)
 
@@ -1369,7 +1487,11 @@ def _validate_reschedule_slot(
     `exclude_appointment_id=appointment_id` garante que o PRÓPRIO
     horário atual do agendamento nunca conta como conflito contra ele
     mesmo (item explícito do pedido)."""
-    _assert_within_working_hours(session, organization_id, branch_id, professional_id, start_at, end_at)
+    professional = professional_repo.get(session, organization_id, professional_id)
+    professional_name = professional.name if professional else "O profissional"
+    _assert_within_working_hours(
+        session, organization_id, branch_id, professional_id, professional_name, start_at, end_at
+    )
     _assert_no_schedule_block(session, organization_id, branch_id, professional_id, start_at, end_at)
     conflicts = appointment_item_repo.list_conflicts(
         session, organization_id, professional_id=professional_id, start_at=start_at, end_at=end_at,
@@ -1379,7 +1501,9 @@ def _validate_reschedule_slot(
         # Bug real corrigido: mesma razão das outras mensagens de
         # conflito neste arquivo — sem ISO cru, a cliente já está
         # olhando pro horário que acabou de escolher no reagendamento.
-        raise ConflictError("Este horário acabou de ficar indisponível. Escolha outro horário.")
+        raise ConflictError(
+            "Este horário acabou de ficar indisponível. Escolha outro horário.", {"reason": "conflict"}
+        )
 
 
 def reschedule_by_customer(
