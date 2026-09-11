@@ -1,6 +1,7 @@
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from enum import Enum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -45,3 +46,58 @@ class EffectiveTaxRateRead(BaseModel):
     competence_month: date
     tax_rate: Decimal | None
     source_competence_month: date | None
+
+
+class TaxRateHistoryStatus(str, Enum):
+    """Nunca inclui "vigente" — o histórico paginado (`GET /tax-rates/
+    history`) exclui explicitamente a linha vigente (ver
+    `services/tax_rates.py::list_history`), então toda linha aqui é uma
+    de duas coisas:
+
+      - ENCERRADA: `competence_month` já é passado (ou já foi superada
+        por uma competência mais recente que hoje) — tem
+        `effective_until` sempre preenchido (a MESMA competência vigia
+        até o mês anterior ao início da próxima versão cronológica).
+      - PROGRAMADA: `competence_month` ainda é futuro em relação a
+        hoje — nunca é tratada como "encerrada" só porque uma versão
+        AINDA MAIS futura já foi cadastrada depois dela; o status
+        reflete a relação com HOJE, não com a última versão cadastrada."""
+
+    ENCERRADA = "encerrada"
+    PROGRAMADA = "programada"
+
+
+class TaxRateHistoryRow(BaseModel):
+    id: uuid.UUID
+    competence_month: date
+    tax_rate: Decimal
+    # Último mês em que esta versão vigorou — mês imediatamente anterior
+    # ao `competence_month` da PRÓXIMA versão na sequência cronológica
+    # completa (que pode ser a vigente, outra encerrada ou outra
+    # programada). `None` só é possível pra uma linha PROGRAMADA que
+    # ainda não tem nenhuma versão mais recente cadastrada depois dela
+    # (vigência em aberto, "a partir de X").
+    effective_until: date | None
+    status: TaxRateHistoryStatus
+
+
+class TaxRateHistoryPage(BaseModel):
+    """Página do histórico (nunca inclui a vigente — ver
+    `TaxRateHistoryStatus`). `page` no retorno é o valor REALMENTE usado
+    (já ajustado/clampado pro intervalo válido se o `page` pedido tiver
+    ficado fora de alcance após alguma mudança nos dados — nunca um
+    erro nesse caso; histórico vazio sempre devolve `page=1`,
+    `total_pages=0`, nunca `page=0`).
+
+    `has_programmed` é calculado sobre o CONJUNTO COMPLETO (não só a
+    página atual) — existe pra permitir que a UI rotule o card
+    corretamente ("Ver histórico e programadas" vs. "Ver histórico de
+    alíquotas") mesmo quando a página exibida no momento não tiver
+    nenhuma linha `programada` (ela pode estar numa página diferente)."""
+
+    items: list[TaxRateHistoryRow]
+    page: int
+    page_size: int
+    total: int
+    has_programmed: bool
+    total_pages: int

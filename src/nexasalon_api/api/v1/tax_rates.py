@@ -8,12 +8,17 @@ CONFIGURAÇÃO (provisão gerencial), nunca gera lançamento de caixa/
 pagamento — ver docstring de `services/tax_rates.py`."""
 from datetime import date
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from nexasalon_api.api.deps import get_db, require_permission
 from nexasalon_api.core.actor import ActorContext
-from nexasalon_api.schemas.tax_rate import EffectiveTaxRateRead, TaxRateRead, TaxRateSet
+from nexasalon_api.schemas.tax_rate import (
+    EffectiveTaxRateRead,
+    TaxRateHistoryPage,
+    TaxRateRead,
+    TaxRateSet,
+)
 from nexasalon_api.services import tax_rates as tax_rates_service
 
 router = APIRouter(prefix="/tax-rates", tags=["tax-rates"])
@@ -46,6 +51,17 @@ def get_effective_tax_rate(
         tax_rate=effective.tax_rate if effective is not None else None,
         source_competence_month=effective.competence_month if effective is not None else None,
     )
+
+
+@router.get(
+    "/history", response_model=TaxRateHistoryPage, summary="Histórico paginado de alíquotas (exclui a vigente)"
+)
+def get_tax_rate_history(
+    page: int = Query(1, ge=1),
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_view),
+) -> TaxRateHistoryPage:
+    return tax_rates_service.list_history(session, actor.organization_id, page)
 
 
 @router.put("", response_model=TaxRateRead, summary="Criar ou editar a alíquota de uma competência")

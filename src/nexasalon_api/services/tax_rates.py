@@ -4,6 +4,7 @@ model em `models/finance.py`). Usada exclusivamente pelo painel
 "Resultado disponível" (Dashboard) para provisionar (nunca pagar/
 lançar) imposto: `faturamento_aplicavel × alíquota_da_competência`.
 """
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -16,7 +17,14 @@ from nexasalon_api.core.exceptions import ConflictError
 from nexasalon_api.models.enums import AuditAction
 from nexasalon_api.models.finance import OrganizationTaxRate
 from nexasalon_api.repositories import audit_log_repo, tax_rate_repo, user_repo
-from nexasalon_api.schemas.tax_rate import TaxRateSet
+from nexasalon_api.schemas.tax_rate import (
+    TaxRateHistoryPage,
+    TaxRateHistoryRow,
+    TaxRateHistoryStatus,
+    TaxRateSet,
+)
+
+HISTORY_PAGE_SIZE = 12
 
 
 def _current_competence_month() -> date:
@@ -30,6 +38,81 @@ def _resolve_user_name(session: Session, user_id: uuid.UUID) -> str:
 
 def list_rates(session: Session, organization_id: uuid.UUID) -> list[OrganizationTaxRate]:
     return tax_rate_repo.list_all(session, organization_id)
+
+
+def _month_before(month: date) -> date:
+    if month.month == 1:
+        return date(month.year - 1, 12, 1)
+    return date(month.year, month.month - 1, 1)
+
+
+def list_history(session: Session, organization_id: uuid.UUID, page: int) -> TaxRateHistoryPage:
+    """Histórico paginado (Configurações > Preferências > Alíquota de
+    Imposto — card "Ver histórico") — EXCLUI a vigente (ver
+    `TaxRateHistoryStatus`) e SEMPRE ordena da competência mais recente
+    pra mais antiga, no máximo `HISTORY_PAGE_SIZE` linhas por página.
+
+    A vigência (`effective_until`) de cada linha só pode ser calculada
+    corretamente com o conjunto COMPLETO ordenado (o fim de uma versão
+    é o início da PRÓXIMA — que pode estar numa página diferente) —
+    por isso o cálculo acontece aqui, sobre todas as linhas, e só DEPOIS
+    disso a lista é fatiada pra paginação. Nunca calculado no frontend."""
+    current_month = _current_competence_month()
+    # `list_all` já vem desc; construímos a ordem asc (mais antiga
+    # primeiro) pra achar a vigente e o "próximo" de cada linha com um
+    # único passe, sem reconsultar o banco.
+    ascending = list(reversed(tax_rate_repo.list_all(session, organization_id)))
+
+    vigente_id: uuid.UUID | None = None
+    for rate in ascending:
+        if rate.competence_month <= current_month:
+            vigente_id = rate.id  # a última (mais recente) <= hoje vence as anteriores.
+
+    rows: list[TaxRateHistoryRow] = []
+    for index, rate in enumerate(ascending):
+        if rate.id == vigente_id:
+            continue
+        next_rate = ascending[index + 1] if index + 1 < len(ascending) else None
+        effective_until = _month_before(next_rate.competence_month) if next_rate is not None else None
+        status = (
+            TaxRateHistoryStatus.PROGRAMADA
+            if rate.competence_month > current_month
+            else TaxRateHistoryStatus.ENCERRADA
+        )
+        rows.append(
+            TaxRateHistoryRow(
+                id=rate.id,
+                competence_month=rate.competence_month,
+                tax_rate=rate.tax_rate,
+                effective_until=effective_until,
+                status=status,
+            )
+        )
+
+    rows.sort(key=lambda row: row.competence_month, reverse=True)
+
+    total = len(rows)
+    total_pages = math.ceil(total / HISTORY_PAGE_SIZE) if total > 0 else 0
+    # Nunca erro por página fora de alcance (ex.: usuário estava na
+    # página 2, um registro foi reclassificado/excluído e só sobrou 1
+    # página) — clampa pro intervalo válido e devolve o `page` REAL usado.
+    resolved_page = min(max(page, 1), total_pages) if total_pages > 0 else 1
+    start = (resolved_page - 1) * HISTORY_PAGE_SIZE
+    page_items = rows[start : start + HISTORY_PAGE_SIZE]
+    # Sobre o conjunto COMPLETO, não só a página atual — uma linha
+    # "programada" pode estar em outra página, mas o rótulo do card
+    # ("histórico" vs. "histórico e programadas") precisa refletir o
+    # total, não só o que está visível agora.
+    has_programmed = any(row.status == TaxRateHistoryStatus.PROGRAMADA for row in rows)
+
+    return TaxRateHistoryPage(
+        items=page_items,
+        page=resolved_page,
+        page_size=HISTORY_PAGE_SIZE,
+        total=total,
+        total_pages=total_pages,
+        has_programmed=has_programmed,
+    )
 
 
 def get_effective_rate(
