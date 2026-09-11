@@ -1,22 +1,30 @@
-"""Etapa N3 — Taxas de Pagamento. Fonte ÚNICA da fórmula de taxa/líquido,
-usada tanto por `close_order` quanto por `close_orders_consolidated`
-(`services/orders.py`) — nunca duas implementações da mesma conta.
+"""Etapa N3 (+ N3.1, Pix) — Taxas de Pagamento. Fonte ÚNICA da fórmula
+de taxa/líquido, usada tanto por `close_order` quanto por
+`close_orders_consolidated` (`services/orders.py`) — nunca duas
+implementações da mesma conta, e Pix passa pelo MESMO pipeline que
+cartão (nunca um cálculo paralelo).
 
 Regra central (item explícito do pedido): "cartão sem taxa NÃO
-significa taxa zero". Três estados possíveis, sempre gravados de forma
+significa taxa zero". Estados possíveis, sempre gravados de forma
 EXPLÍCITA em `Payment.fee_status` no momento da criação — nunca inferido
 só pela nulidade dos snapshots (ver `models/enums.py::PaymentFeeStatus`
 pro raciocínio completo):
 
-  1. NOT_APPLICABLE — Pix/Dinheiro/outros não-cartão: taxa = R$ 0,00,
-     líquido = bruto, sempre, sem precisar de nenhuma regra cadastrada.
-  2. CALCULATED — débito/crédito com uma `PaymentFeeRule` ATIVA
-     correspondente (organização + forma + bandeira + parcelas):
-     percentual/valor/líquido REAIS, congelados como snapshot.
+  1. NOT_APPLICABLE — Dinheiro/outros não-cartão-e-não-Pix: taxa =
+     R$ 0,00, líquido = bruto, sempre, sem precisar de nenhuma regra
+     cadastrada. Pix SEM nenhuma `PaymentFeeRule` ativa correspondente
+     TAMBÉM cai aqui — item explícito do pedido "se não existir taxa de
+     Pix configurada, o comportamento deve continuar equivalente ao
+     atual" (nunca UNCONFIGURED só por não ter sido configurado; Pix é
+     opt-in, ao contrário de cartão).
+  2. CALCULATED — débito/crédito/Pix com uma `PaymentFeeRule` ATIVA
+     correspondente (organização + forma [+ bandeira/parcelas pra
+     cartão] ): percentual/valor/líquido REAIS, congelados como
+     snapshot.
   3. UNCONFIGURED — débito/crédito SEM regra correspondente: os 3
      snapshots ficam `None` de propósito — o pagamento continua válido,
      só o líquido fica desconhecido (nunca 0%, nunca o bruto disfarçado
-     de líquido)."""
+     de líquido). Pix NUNCA fica UNCONFIGURED (ver item 1)."""
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -56,7 +64,24 @@ def resolve_fee(
     exclusivamente sobre o valor do Payment, nunca sobre o total da
     comanda" — pagamento dividido: cada lançamento resolve sua própria
     regra e tem seus próprios snapshots)."""
-    if method not in _CARD_METHODS:
+    if method == PaymentMethod.PIX:
+        # Pix é opt-in: SEM regra ativa, o comportamento é IDÊNTICO ao
+        # de antes desta feature (NOT_APPLICABLE, nunca UNCONFIGURED —
+        # item explícito do pedido). `card_brand`/`installments` nunca
+        # entram na busca pra Pix (sempre o sentinela interno, 1x — ver
+        # `services/payment_fee_rules.py::_stored_card_brand`).
+        rule = payment_fee_rule_repo.find_matching(
+            session, organization_id, method=method, card_brand=CardBrand.NOT_APPLICABLE, installments=1
+        )
+        if rule is None:
+            return FeeResolution(
+                payment_fee_rule_id=None,
+                fee_percent_snapshot=None,
+                fee_amount_snapshot=None,
+                net_amount_snapshot=None,
+                fee_status=PaymentFeeStatus.NOT_APPLICABLE,
+            )
+    elif method not in _CARD_METHODS:
         return FeeResolution(
             payment_fee_rule_id=None,
             fee_percent_snapshot=None,
@@ -64,23 +89,23 @@ def resolve_fee(
             net_amount_snapshot=None,
             fee_status=PaymentFeeStatus.NOT_APPLICABLE,
         )
+    else:
+        # Débito: parcelas sempre 1 (coerente com o cadastro de regras —
+        # ver `models/order.py::PaymentFeeRule`). Crédito sem parcelas
+        # informadas = à vista (1x).
+        normalized_installments = 1 if method == PaymentMethod.DEBIT else (installments or 1)
 
-    # Débito: parcelas sempre 1 (coerente com o cadastro de regras —
-    # ver `models/order.py::PaymentFeeRule`). Crédito sem parcelas
-    # informadas = à vista (1x).
-    normalized_installments = 1 if method == PaymentMethod.DEBIT else (installments or 1)
-
-    rule = payment_fee_rule_repo.find_matching(
-        session, organization_id, method=method, card_brand=card_brand, installments=normalized_installments
-    )
-    if rule is None:
-        return FeeResolution(
-            payment_fee_rule_id=None,
-            fee_percent_snapshot=None,
-            fee_amount_snapshot=None,
-            net_amount_snapshot=None,
-            fee_status=PaymentFeeStatus.UNCONFIGURED,
+        rule = payment_fee_rule_repo.find_matching(
+            session, organization_id, method=method, card_brand=card_brand, installments=normalized_installments
         )
+        if rule is None:
+            return FeeResolution(
+                payment_fee_rule_id=None,
+                fee_percent_snapshot=None,
+                fee_amount_snapshot=None,
+                net_amount_snapshot=None,
+                fee_status=PaymentFeeStatus.UNCONFIGURED,
+            )
 
     # Decimal em toda a conta (nunca float) — arredondamento pra 2 casas
     # segue a MESMA convenção já adotada no projeto (`.quantize(Decimal("0.01"))`,
@@ -100,12 +125,15 @@ def resolve_fee(
 
 def derive_fee_status(payment: Payment) -> PaymentFeeStatus:
     """Leitura (Extrato) — para pagamentos criados DEPOIS da migration
-    0034, `payment.fee_status` já vem preenchido explicitamente (usar
-    direto). Para pagamentos HISTÓRICOS (antes da coluna existir,
-    `fee_status IS NULL`), deriva só o suficiente pra não classificar
-    errado: método de cartão sem informação de taxa é "desconhecida"
-    (nunca 0%); método sem incidência continua sem incidência mesmo sem
-    o dado explícito (Pix/Dinheiro nunca tiveram taxa, elo ou não)."""
+    0034 (ou DEPOIS de 0050/0051, no caso de Pix), `payment.fee_status`
+    já vem preenchido explicitamente (usar direto). Para pagamentos
+    HISTÓRICOS (`fee_status IS NULL` — antes da coluna existir, ou Pix
+    de antes da Etapa N3.1 existir), deriva só o suficiente pra não
+    classificar errado: método de cartão sem informação de taxa é
+    "desconhecida" (nunca 0%); Pix/Dinheiro continuam sem incidência
+    mesmo sem o dado explícito — eram literalmente sempre sem taxa
+    nessas competências, então `NOT_APPLICABLE` é o valor correto, não
+    uma aproximação."""
     if payment.fee_status is not None:
         return payment.fee_status
     if payment.method in _CARD_METHODS:

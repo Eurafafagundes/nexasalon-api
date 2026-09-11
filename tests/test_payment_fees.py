@@ -148,9 +148,14 @@ def _open_register(session, actor, initial_amount=Decimal("0")):
     return cash_register.open_register(session, actor, branch_id, initial_amount, None)
 
 
-def _create_rule(session, org_id, *, method, card_brand, installments=1, fee_percent):
+def _create_rule(session, org_id, *, method, card_brand, installments=1, fee_percent, actor=None):
+    # A maioria dos testes deste arquivo só quer UMA regra cadastrada,
+    # sem se importar com quem criou — cria um ator descartável quando
+    # o chamador não passa um (evita repetir `_actor(...)` em toda
+    # chamada só pra satisfazer o `user_id` do AuditLog).
+    actor = actor or _actor(session, org_id)
     return payment_fee_rules.create_rule(
-        session, org_id,
+        session, actor,
         PaymentFeeRuleCreate(method=method, card_brand=card_brand, installments=installments, fee_percent=fee_percent),
     )
 
@@ -178,6 +183,163 @@ def test_pix_taxa_zero_liquido_igual_ao_bruto(org_session):
     assert payment.fee_percent_snapshot is None
     assert payment.fee_amount_snapshot is None
     assert payment.net_amount_snapshot is None  # NOT_APPLICABLE não grava snapshot numérico — é sempre derivável.
+
+
+def test_pix_com_regra_ativa_calcula_taxa_e_liquido(org_session):
+    """Etapa N3.1 — Pix passa pelo MESMO pipeline canônico que cartão
+    (`resolve_fee`): com uma `PaymentFeeRule` ativa correspondente,
+    `fee_status=CALCULATED` e os 3 snapshots são preenchidos com o
+    valor real, exatamente como débito/crédito."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    _create_rule(session, org_id, method=PaymentMethod.PIX, card_brand=None, fee_percent=Decimal("0.99"))
+    appt, _branch, client = _finished_appointment(session, org_id, actor, price=Decimal("1000.00"))
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("1000.00"), cash_register_id=register.id)]),
+    )
+    session.refresh(order)
+    payment = order.payments[0]
+
+    assert payment.fee_status == PaymentFeeStatus.CALCULATED
+    assert payment.fee_percent_snapshot == Decimal("0.99")
+    assert payment.fee_amount_snapshot == Decimal("9.90")
+    assert payment.net_amount_snapshot == Decimal("990.10")
+    assert payment.payment_fee_rule_id is not None
+    assert payment.card_brand is None  # Pix nunca carrega bandeira no Payment, mesmo com regra ativa.
+
+
+def test_pix_com_regra_inativa_volta_a_ser_nao_aplicavel_nunca_uma_taxa_desconhecida(org_session):
+    """Diferente de débito/crédito (regra ausente/inativa = UNCONFIGURED,
+    "taxa desconhecida"): Pix sem regra ATIVA correspondente continua
+    `NOT_APPLICABLE` — item explícito do pedido "se não existir taxa de
+    Pix configurada, o comportamento deve continuar equivalente ao
+    atual" (Pix é opt-in, nunca gera um estado "desconhecido")."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    rule = _create_rule(session, org_id, method=PaymentMethod.PIX, card_brand=None, fee_percent=Decimal("0.99"))
+    payment_fee_rules.set_rule_active(session, actor, rule.id, False)
+    appt, _branch, client = _finished_appointment(session, org_id, actor, price=Decimal("200.00"))
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("200.00"), cash_register_id=register.id)]),
+    )
+    session.refresh(order)
+    payment = order.payments[0]
+
+    assert payment.fee_status == PaymentFeeStatus.NOT_APPLICABLE
+    assert payment.fee_amount_snapshot is None
+    assert payment.net_amount_snapshot is None
+
+
+def test_alterar_regra_de_pix_nao_modifica_snapshot_de_venda_antiga(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    rule = _create_rule(session, org_id, method=PaymentMethod.PIX, card_brand=None, fee_percent=Decimal("0.99"))
+
+    appt_old, _b1, _c1 = _finished_appointment(session, org_id, actor, price=Decimal("1000.00"), client_name="Venda Antiga Pix")
+    order_old = orders.create_order(session, actor, appt_old.id)
+    register_old = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order_old.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("1000.00"), cash_register_id=register_old.id)]),
+    )
+    session.refresh(order_old)
+    assert order_old.payments[0].fee_percent_snapshot == Decimal("0.99")
+
+    payment_fee_rules.update_rule(session, actor, rule.id, PaymentFeeRuleUpdate(fee_percent=Decimal("1.50")))
+    session.refresh(order_old)
+
+    # Venda antiga permanece congelada em 0,99% — nunca recalculada.
+    assert order_old.payments[0].fee_percent_snapshot == Decimal("0.99")
+    assert order_old.payments[0].fee_amount_snapshot == Decimal("9.90")
+
+
+def test_pix_rejeita_bandeira_na_regra(org_session):
+    with pytest.raises(ValueError, match="não aceita bandeira"):
+        PaymentFeeRuleCreate(method=PaymentMethod.PIX, card_brand=CardBrand.VISA, fee_percent=Decimal("0.99"))
+
+
+def test_pix_rejeita_parcelamento_na_regra(org_session):
+    with pytest.raises(ValueError, match="sempre à vista"):
+        PaymentFeeRuleCreate(method=PaymentMethod.PIX, card_brand=None, installments=2, fee_percent=Decimal("0.99"))
+
+
+def test_regra_de_pix_de_uma_organizacao_nunca_e_usada_por_outra():
+    org_a_id = uuid.uuid4()
+    org_b_id = uuid.uuid4()
+
+    with SessionLocal() as session_a:
+        session_a.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_a_id)})
+        session_a.add(Organization(id=org_a_id, name="Org A Pix", slug=f"org-a-pix-{org_a_id.hex[:8]}"))
+        session_a.flush()
+        actor_a = _actor(session_a, org_a_id)
+        _create_rule(session_a, org_a_id, method=PaymentMethod.PIX, card_brand=None, fee_percent=Decimal("0.99"), actor=actor_a)
+        appt_a, _b, _c = _finished_appointment(session_a, org_a_id, actor_a, price=Decimal("100.00"))
+        order_a = orders.create_order(session_a, actor_a, appt_a.id)
+        register_a = _open_register(session_a, actor_a)
+        orders.close_order(
+            session_a, actor_a, order_a.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("100.00"), cash_register_id=register_a.id)]),
+        )
+        session_a.refresh(order_a)
+        assert order_a.payments[0].fee_status == PaymentFeeStatus.CALCULATED
+        session_a.commit()  # precisa persistir de verdade — ver raciocínio do teste equivalente de cartão acima.
+
+    with SessionLocal() as session_b:
+        session_b.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_b_id)})
+        session_b.add(Organization(id=org_b_id, name="Org B Pix", slug=f"org-b-pix-{org_b_id.hex[:8]}"))
+        session_b.flush()
+        actor_b = _actor(session_b, org_b_id)
+        # NENHUMA regra de Pix cadastrada na Org B.
+        appt_b, _b2, _c2 = _finished_appointment(session_b, org_b_id, actor_b, price=Decimal("100.00"))
+        order_b = orders.create_order(session_b, actor_b, appt_b.id)
+        register_b = _open_register(session_b, actor_b)
+        orders.close_order(
+            session_b, actor_b, order_b.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("100.00"), cash_register_id=register_b.id)]),
+        )
+        session_b.refresh(order_b)
+        # A regra da Org A NUNCA vaza pra Org B — continua NOT_APPLICABLE (nunca herda taxa alheia).
+        assert order_b.payments[0].fee_status == PaymentFeeStatus.NOT_APPLICABLE
+        assert order_b.payments[0].fee_amount_snapshot is None
+        session_b.rollback()
+
+
+def test_criar_regra_de_pix_duplicada_na_mesma_organizacao_e_recusado(org_session):
+    session, org_id = org_session
+    _create_rule(session, org_id, method=PaymentMethod.PIX, card_brand=None, fee_percent=Decimal("0.99"))
+    with pytest.raises(ConflictError):
+        _create_rule(session, org_id, method=PaymentMethod.PIX, card_brand=None, fee_percent=Decimal("1.20"))
+
+
+def test_debito_e_credito_continuam_inalterados_apos_pix_entrar_no_pipeline(org_session):
+    """Regressão: débito e crédito não podem ter mudado de comportamento
+    só porque Pix passou a ser um método elegível a taxa."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    _create_rule(session, org_id, method=PaymentMethod.DEBIT, card_brand=CardBrand.VISA, installments=1, fee_percent=Decimal("1.39"))
+    appt, _branch, client = _finished_appointment(session, org_id, actor, price=Decimal("1000.00"))
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[
+            PaymentCreate(method=PaymentMethod.DEBIT, amount=Decimal("1000.00"), card_brand=CardBrand.VISA, cash_register_id=register.id)
+        ]),
+    )
+    session.refresh(order)
+    payment = order.payments[0]
+    assert payment.fee_status == PaymentFeeStatus.CALCULATED
+    assert payment.fee_percent_snapshot == Decimal("1.39")
+    assert payment.fee_amount_snapshot == Decimal("13.90")
 
 
 def test_dinheiro_taxa_zero_liquido_igual_ao_bruto(org_session):
@@ -443,7 +605,7 @@ def test_alterar_regra_nao_modifica_snapshot_de_venda_antiga(org_session):
     assert old_fee == Decimal("2.99")
 
     # Configuração muda amanhã: 2,99% -> 3,20%.
-    payment_fee_rules.update_rule(session, org_id, rule.id, PaymentFeeRuleUpdate(fee_percent=Decimal("3.20")))
+    payment_fee_rules.update_rule(session, actor, rule.id, PaymentFeeRuleUpdate(fee_percent=Decimal("3.20")))
     session.refresh(order_old)
 
     # A venda ANTIGA continua com o snapshot de 2,99% — nunca recalculada.
@@ -455,7 +617,7 @@ def test_nova_venda_usa_a_nova_taxa_apos_alteracao_da_regra(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)
     rule = _create_rule(session, org_id, method=PaymentMethod.CREDIT, card_brand=CardBrand.VISA, installments=1, fee_percent=Decimal("2.99"))
-    payment_fee_rules.update_rule(session, org_id, rule.id, PaymentFeeRuleUpdate(fee_percent=Decimal("3.20")))
+    payment_fee_rules.update_rule(session, actor, rule.id, PaymentFeeRuleUpdate(fee_percent=Decimal("3.20")))
 
     appt_new, _b2, _c2 = _finished_appointment(session, org_id, actor, price=Decimal("1000.00"), client_name="Venda Nova")
     order_new = orders.create_order(session, actor, appt_new.id)

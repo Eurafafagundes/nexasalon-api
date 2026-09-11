@@ -1057,6 +1057,39 @@ def test_fee_summary_periodo_so_com_pix_sem_taxa(org_session):
     assert summary.has_unconfigured_fee is False
 
 
+def test_fee_summary_pix_com_taxa_calculada(org_session):
+    """Etapa N3.1 — Pix com regra ativa entra em `known_fee_total`
+    exatamente como débito/crédito: `_revenue_fee_summary` consome o
+    snapshot já congelado no `Payment` (`fee_status=calculated`), nunca
+    recalcula a partir da configuração atual nem trata Pix como caso
+    especial (mesmo mecanismo genérico de `breakdown_for_display`)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 8, 10, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("600")}],
+        payments=[{
+            "method": PaymentMethod.PIX, "amount": Decimal("600"),
+            "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("0.99"),
+            "fee_amount_snapshot": Decimal("5.94"), "net_amount_snapshot": Decimal("594.06"),
+        }],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("600")
+    assert summary.known_fee_total == Decimal("5.94")
+    assert summary.known_net_revenue == Decimal("594.06")
+    assert summary.unconfigured_card_amount == Decimal("0")
+    assert summary.has_unconfigured_fee is False
+
+
 def test_fee_summary_periodo_so_com_dinheiro_sem_taxa(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)

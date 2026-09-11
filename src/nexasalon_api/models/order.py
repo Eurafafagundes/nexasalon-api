@@ -384,12 +384,22 @@ class Payment(Base, UUIDPKMixin, TimestampMixin):
 class PaymentFeeRule(Base, UUIDPKMixin, TimestampMixin):
     """Etapa N3 — Taxas de Pagamento (Configurações > Taxas de
     Pagamento): cada organização cadastra a taxa percentual cobrada
-    pela adquirente/máquina por (forma, bandeira, parcelas). Só
-    débito/crédito fazem sentido aqui — Pix/Dinheiro nunca têm
-    incidência de taxa nesta etapa (ver `services/payment_fees.py`).
+    pela adquirente/máquina por (forma, bandeira, parcelas). Débito,
+    crédito e Pix fazem sentido aqui — Dinheiro nunca tem incidência de
+    taxa nesta etapa (ver `services/payment_fees.py`).
+
+    Pix (migration 0050/0051) usa `card_brand=CardBrand.NOT_APPLICABLE`
+    (nunca `NULL`) como sentinela — não tem bandeira de verdade, mas
+    manter a coluna `NOT NULL` preserva a unicidade lógica
+    `(organization, method, card_brand, installments)` simples SEM
+    reabrir a mesma brecha de `NULL <> NULL` em `UNIQUE` já documentada
+    abaixo pra `installments` (evita duas regras de Pix "duplicadas").
+    O sentinela é só um detalhe interno: a API nunca aceita nem expõe
+    `not_applicable` como bandeira (`schemas/payment_fee_rule.py`
+    converte de/para `None` na borda).
 
     `installments` é sempre um inteiro explícito (nunca `NULL`) — pra
-    débito é normalizado pra `1` (mesmo raciocínio de "parcelas deve ser
+    débito e Pix é normalizado pra `1` (mesmo raciocínio de "parcelas deve ser
     tratado coerentemente como 1"), o que também mantém a unicidade
     lógica `(organization, method, card_brand, installments)` simples
     (Postgres trata `NULL <> NULL` em `UNIQUE`, o que abriria brecha
@@ -402,7 +412,12 @@ class PaymentFeeRule(Base, UUIDPKMixin, TimestampMixin):
     __tablename__ = "payment_fee_rules"
     __table_args__ = (
         UniqueConstraint("organization_id", "method", "card_brand", "installments"),
-        CheckConstraint("method = 'debit' OR method = 'credit'", name="method_is_card"),
+        CheckConstraint("method IN ('debit', 'credit', 'pix')", name="method_is_card_or_pix"),
+        CheckConstraint(
+            "(method IN ('debit', 'credit') AND card_brand <> 'not_applicable') OR "
+            "(method = 'pix' AND card_brand = 'not_applicable')",
+            name="card_brand_matches_method",
+        ),
         CheckConstraint("installments >= 1", name="installments_positive"),
         CheckConstraint("fee_percent >= 0", name="fee_percent_not_negative"),
     )

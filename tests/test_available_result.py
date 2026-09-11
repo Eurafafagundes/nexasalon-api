@@ -247,6 +247,63 @@ def test_formula_completa_com_todos_os_componentes(org_session):
     assert result.single_tax_rate == Decimal("6.00")
 
 
+def test_pix_com_taxa_configurada_e_deduzido_uma_unica_vez_no_resultado_disponivel(org_session):
+    """Etapa N3.1 — taxa de Pix entra em `payment_fees` do "Resultado
+    disponível" exatamente como taxa de cartão: mesma fonte
+    (`known_fee_total`, lida do snapshot já congelado no `Payment`) que
+    já alimenta `revenue_fee_summary` — nunca um segundo cálculo, nunca
+    deduzida duas vezes."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("1000.00"),
+        payment_method=PaymentMethod.PIX,
+        fee_status=PaymentFeeStatus.CALCULATED, fee_percent_snapshot=Decimal("0.99"),
+        fee_amount_snapshot=Decimal("9.90"), net_amount_snapshot=Decimal("990.10"),
+    )
+
+    overview = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    )
+    result = overview.available_result
+    assert result.payment_fees == Decimal("9.90")
+    assert result.available_result == Decimal("990.10")  # 1000 - 9.90, taxa deduzida uma única vez.
+
+
+def test_pix_sem_taxa_configurada_nao_deduz_nada_no_resultado_disponivel(org_session):
+    """Pix sem regra (comportamento padrão, ainda o mais comum) continua
+    `NOT_APPLICABLE` — `payment_fees` fica 0, igual a antes desta
+    feature existir."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("500.00"), payment_method=PaymentMethod.PIX,
+    )
+
+    overview = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    )
+    result = overview.available_result
+    assert result.payment_fees == Decimal("0")
+    assert result.available_result == Decimal("500.00")
+
+
 def test_periodo_com_duas_competencias_aplica_a_aliquota_de_cada_uma(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)

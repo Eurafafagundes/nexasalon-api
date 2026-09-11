@@ -759,7 +759,7 @@ def test_taxa_de_pagamento_continua_vinda_so_do_payment_com_produto_no_total(org
     orders.add_product_item(session, actor, order.id, OrderProductItemCreate(product_id=product.id, quantity=Decimal("1")))
     register = _open_register(session, actor)
     payment_fee_rules.create_rule(
-        session, org_id,
+        session, actor,
         PaymentFeeRuleCreate(method=PaymentMethod.CREDIT, card_brand=CardBrand.VISA, installments=1, fee_percent=Decimal("2.99")),
     )
     orders.close_order(

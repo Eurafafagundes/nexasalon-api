@@ -146,6 +146,14 @@ class CardBrand(str, Enum):
     AMEX = "amex"
     HIPERCARD = "hipercard"
     OTHER = "other"
+    # Sentinela interno de `PaymentFeeRule.card_brand` pra linhas de Pix
+    # (que não tem bandeira de verdade) — nunca aceito nem exposto pela
+    # API como valor de bandeira; existe só pra manter a coluna `NOT
+    # NULL` e a unicidade lógica `(organization, method, card_brand,
+    # installments)` simples, sem reabrir a brecha de `NULL <> NULL` em
+    # `UNIQUE` (ver docstring de `models/order.py::PaymentFeeRule`).
+    # NUNCA usado em `Payment.card_brand` (esse continua `NULL` pra Pix).
+    NOT_APPLICABLE = "not_applicable"
 
 
 class PaymentFeeStatus(str, Enum):

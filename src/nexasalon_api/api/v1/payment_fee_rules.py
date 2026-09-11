@@ -41,7 +41,7 @@ def create_payment_fee_rule(
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_manage),
 ) -> PaymentFeeRuleRead:
-    rule = payment_fee_rules_service.create_rule(session, actor.organization_id, payload)
+    rule = payment_fee_rules_service.create_rule(session, actor, payload)
     return PaymentFeeRuleRead.model_validate(rule)
 
 
@@ -52,7 +52,7 @@ def update_payment_fee_rule(
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_manage),
 ) -> PaymentFeeRuleRead:
-    rule = payment_fee_rules_service.update_rule(session, actor.organization_id, rule_id, payload)
+    rule = payment_fee_rules_service.update_rule(session, actor, rule_id, payload)
     return PaymentFeeRuleRead.model_validate(rule)
 
 
@@ -62,7 +62,7 @@ def activate_payment_fee_rule(
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_manage),
 ) -> PaymentFeeRuleRead:
-    rule = payment_fee_rules_service.set_rule_active(session, actor.organization_id, rule_id, True)
+    rule = payment_fee_rules_service.set_rule_active(session, actor, rule_id, True)
     return PaymentFeeRuleRead.model_validate(rule)
 
 
@@ -72,5 +72,5 @@ def deactivate_payment_fee_rule(
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_manage),
 ) -> PaymentFeeRuleRead:
-    rule = payment_fee_rules_service.set_rule_active(session, actor.organization_id, rule_id, False)
+    rule = payment_fee_rules_service.set_rule_active(session, actor, rule_id, False)
     return PaymentFeeRuleRead.model_validate(rule)
