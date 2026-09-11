@@ -40,7 +40,7 @@ from nexasalon_api.schemas.order import (
     OrderObservationUpdate,
     PaymentCreate,
 )
-from nexasalon_api.services import appointments, cash_register, orders
+from nexasalon_api.services import appointments, cash_register, order_totals, orders
 
 _ALL_AGENDA_PERMS = frozenset(
     {"agenda.view_own", "agenda.view_all", "agenda.create", "agenda.edit", "agenda.cancel"}
@@ -169,6 +169,37 @@ def _scheduled_appointment_with_one_service(session, org_id, actor):
     )
     appt = appointments.create_appointment(session, actor, data)
     assert appt.status == AppointmentStatus.SCHEDULED
+    return appt, branch, prof, client
+
+
+def _finished_appointment_with_three_services(session, org_id, actor):
+    """Mesma ideia de `_finished_appointment_with_two_services`, com 3
+    serviços — valores espelham EXATAMENTE o exemplo do bug report
+    (Serviço A R$260, B R$150, C R$410), pra reproduzir o cenário real
+    relatado (editar A e B pra R$0, manter C em R$410)."""
+    branch = _branch(session, org_id)
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    prof = _professional(session, org_id, branch.id)
+    a = _service(session, org_id, name="Serviço A", duration=60, price=Decimal("260.00"))
+    b = _service(session, org_id, name="Serviço B", duration=45, price=Decimal("150.00"))
+    c = _service(session, org_id, name="Serviço C", duration=90, price=Decimal("410.00"))
+    _link(session, prof.id, a.id)
+    _link(session, prof.id, b.id)
+    _link(session, prof.id, c.id)
+    _working_hours(session, org_id, prof.id, _THURSDAY, time(9, 0), time(20, 0))
+    client = _client(session, org_id)
+
+    data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[
+            AppointmentItemCreate(professional_id=prof.id, service_id=a.id, start_at=_dt(9, 0)),
+            AppointmentItemCreate(professional_id=prof.id, service_id=b.id, start_at=_dt(10, 30)),
+            AppointmentItemCreate(professional_id=prof.id, service_id=c.id, start_at=_dt(12, 0)),
+        ],
+    )
+    appt = appointments.create_appointment(session, actor, data)
+    appt.status = AppointmentStatus.FINISHED
+    session.flush()
     return appt, branch, prof, client
 
 
@@ -887,3 +918,522 @@ def test_comanda_cancelada_nao_aparece_como_a_comanda_ativa_do_agendamento(org_s
 
     orders.cancel_order(session, actor, order.id, OrderCancel(reason="teste"))
     assert orders.get_order_by_appointment(session, actor, appt.id) is None
+
+
+# ---------------------------------------------------------------------
+# Investigacao -- edicao manual de valor de item da comanda pode ser
+# ZERO (bug report: valor 0 "some" apos editar outro item + Fidelidade
+# nao aceita R$ 0). Reproduz o exemplo do bug report: Servico A R$260,
+# B R$150, C R$410 -> A=0, B=0, C=410.
+# ---------------------------------------------------------------------
+
+
+def test_item_preco_zero_persiste_sem_fallback_para_catalogo(org_session):
+    """Preco catalogo 260, override na comanda 0 -- item deve ficar 0,
+    NUNCA reverter pro catalogo (bug classico price-or-catalog, onde 0
+    e falsy e cai no fallback)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))
+
+    updated = orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+
+    updated_item = next(i for i in updated.items if i.id == item_a.id)
+    assert updated_item.price == Decimal("0.00")
+    from nexasalon_api.repositories import service_repo
+
+    service = service_repo.get(session, org_id, item_a.service_id)
+    assert service.default_price == Decimal("260.00")  # catalogo intocado.
+
+
+def test_tres_itens_zero_zero_quatrocentos_dez_total_correto(org_session):
+    """Cenario do bug report: A=0, B=0, C=410 -> total=410 (nunca 820,
+    nunca 260, nunca qualquer soma que trate 0 como ausencia de
+    override)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))
+    item_b = next(i for i in order.items if i.price == Decimal("150.00"))
+    item_c = next(i for i in order.items if i.price == Decimal("410.00"))
+
+    orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    orders.update_item_price(session, actor, order.id, item_b.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    updated = orders.update_item_price(session, actor, order.id, item_c.id, OrderItemPriceUpdate(price=Decimal("410.00")))
+
+    prices = {i.id: i.price for i in updated.items}
+    assert prices[item_a.id] == Decimal("0.00")
+    assert prices[item_b.id] == Decimal("0.00")
+    assert prices[item_c.id] == Decimal("410.00")
+    assert order_totals.order_total(updated) == Decimal("410.00")
+
+
+def test_reeditar_um_item_nao_reseta_nem_afeta_os_demais(org_session):
+    """Depois de A=0, B=0, C=410 ja salvos, reeditar SO o B nao pode
+    alterar A nem C -- cada PATCH escreve exclusivamente no item alvo."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))
+    item_b = next(i for i in order.items if i.price == Decimal("150.00"))
+    item_c = next(i for i in order.items if i.price == Decimal("410.00"))
+    orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    orders.update_item_price(session, actor, order.id, item_b.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    orders.update_item_price(session, actor, order.id, item_c.id, OrderItemPriceUpdate(price=Decimal("410.00")))
+
+    reedited = orders.update_item_price(session, actor, order.id, item_b.id, OrderItemPriceUpdate(price=Decimal("75.00")))
+
+    prices = {i.id: i.price for i in reedited.items}
+    assert prices[item_a.id] == Decimal("0.00")  # intocado.
+    assert prices[item_b.id] == Decimal("75.00")  # so este mudou.
+    assert prices[item_c.id] == Decimal("410.00")  # intocado.
+    assert order_totals.order_total(reedited) == Decimal("485.00")
+
+
+@pytest.mark.parametrize(
+    "de, para",
+    [
+        (Decimal("260.00"), Decimal("410.00")),  # sobe.
+        (Decimal("410.00"), Decimal("0.00")),  # zera.
+        (Decimal("0.00"), Decimal("410.00")),  # sai de zero.
+    ],
+)
+def test_transicoes_de_preco_incluindo_zero_funcionam_nos_dois_sentidos(org_session, de, para):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item = next(i for i in order.items if i.price == Decimal("260.00"))
+    if de != Decimal("260.00"):
+        orders.update_item_price(session, actor, order.id, item.id, OrderItemPriceUpdate(price=de))
+
+    updated = orders.update_item_price(session, actor, order.id, item.id, OrderItemPriceUpdate(price=para))
+
+    updated_item = next(i for i in updated.items if i.id == item.id)
+    assert updated_item.price == para
+
+
+def test_produtos_da_comanda_continuam_funcionando_junto_com_itens_zerados(org_session):
+    """Item de servico zerado nao pode quebrar o total de PRODUTO --
+    order_totals.order_total_breakdown soma as duas parcelas
+    independentemente."""
+    from nexasalon_api.models.enums import ProductUnit
+    from nexasalon_api.models.product import Product
+    from nexasalon_api.schemas.order import OrderProductItemCreate
+    from nexasalon_api.services import orders as orders_service
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, branch, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))
+    orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+
+    product = Product(
+        organization_id=org_id, name="Shampoo", unit=ProductUnit.UNIT, sale_price=Decimal("30.00"),
+        cost_price=Decimal("10.00"), is_active=True, for_sale=True,
+    )
+    session.add(product)
+    session.flush()
+    from nexasalon_api.repositories import stock_level_repo
+
+    level = stock_level_repo.lock_or_create(session, org_id, product.id, branch.id)
+    level.quantity_on_hand = Decimal("10")
+    session.flush()
+
+    updated = orders_service.add_product_item(
+        session, actor, order.id, OrderProductItemCreate(product_id=product.id, quantity=Decimal("1")),
+    )
+
+    breakdown = order_totals.order_total_breakdown(updated)
+    assert breakdown.services_total == Decimal("560.00")  # 0 + 150 + 410
+    assert breakdown.products_total == Decimal("30.00")
+    assert breakdown.total == Decimal("590.00")
+
+
+def test_comanda_fechada_nao_sofre_alteracao_indevida_apos_fechamento(org_session):
+    """Reforca que o TOTAL de uma comanda fechada com item zerado
+    permanece estavel (nunca recalculado/exposto diferente depois do
+    fechamento), e que uma tentativa de editar depois de fechada nao
+    altera nada."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))
+    item_b = next(i for i in order.items if i.price == Decimal("150.00"))
+    orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    orders.update_item_price(session, actor, order.id, item_b.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    register = _open_register(session, actor)
+
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("410.00"), cash_register_id=register.id)]),
+    )
+
+    assert order_totals.order_total(closed) == Decimal("410.00")
+    with pytest.raises(ValidationDomainError):
+        orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("999.00")))
+    reloaded = orders.get_order(session, actor, order.id)
+    assert order_totals.order_total(reloaded) == Decimal("410.00")
+
+
+# ---------------------------------------------------------------------
+# Investigacao -- Fidelidade e overpayment.
+#
+# FIDELIDADE: mapeado no codigo (`models/enums.py::PaymentMethod`) --
+# "Cartao Fidelidade" (LOYALTY_CARD) e SO MAIS UM METODO de pagamento,
+# no mesmo nivel de Pix/Dinheiro/Voucher/Permuta. Nao existe pontuacao,
+# resgate, desconto nem regra de elegibilidade modelada em lugar
+# nenhum do dominio -- e so um rotulo que o atendente escolhe na hora
+# de registrar o pagamento. A causa raiz de "Fidelidade nao aceita R$0"
+# NUNCA foi uma regra especifica de Fidelidade: era o schema/CHECK
+# genericos de Payment.amount, que valiam pra TODOS os metodos.
+#
+# ARQUITETURA ESCOLHIDA (revisada apos analise): Payment.amount
+# continua exigindo > 0 SEMPRE -- um Payment representa dinheiro que
+# de fato mudou de mao, entao um "Payment de R$0" (de qualquer metodo,
+# Fidelidade incluso) nao corresponde a nenhum evento real e seria
+# ruido em Caixa/Extrato/Dashboard/relatorios ("Pix R$0,00" na tela).
+# Uma comanda com total R$0 (cortesia/gratuita) fecha com
+# `payments=[]` -- nenhum Payment artificial. A migration 0052 (que
+# relaxava `amount` pra `>=0`) foi REMOVIDA por nao ser mais
+# necessaria -- nao ha mais nenhum caso legitimo de Payment.amount=0.
+#
+# OVERPAYMENT: enquanto o Nexa nao modela troco/credito/estorno,
+# nenhum pagamento pode ultrapassar o SALDO da comanda (total menos o
+# que ja foi processado nesta mesma chamada de fechamento) -- nem a
+# soma agregada, nem uma linha individual isolada.
+# ---------------------------------------------------------------------
+
+
+def test_payment_amount_zero_continua_rejeitado_pelo_schema_qualquer_metodo(org_session):
+    """Fidelidade nao e caso especial -- amount=0 e rejeitado pro
+    MESMO motivo em qualquer metodo (Payment representa dinheiro real)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    register = _open_register(session, actor)
+
+    with pytest.raises(ValueError):
+        PaymentCreate(method=PaymentMethod.LOYALTY_CARD, amount=Decimal("0.00"), cash_register_id=register.id)
+    with pytest.raises(ValueError):
+        PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("0.00"), cash_register_id=register.id)
+
+
+def test_payment_amount_negativo_continua_rejeitado_pelo_schema(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    register = _open_register(session, actor)
+
+    with pytest.raises(ValueError):
+        PaymentCreate(method=PaymentMethod.LOYALTY_CARD, amount=Decimal("-10.00"), cash_register_id=register.id)
+
+
+def test_fechar_comanda_totalmente_gratuita_com_lista_de_pagamentos_vazia_sem_payment_artificial(org_session):
+    """Alternativa A (escolhida): comanda 100% gratuita fecha com
+    `payments=[]` -- NENHUM Payment de R$0 criado pra nenhum metodo,
+    nem Fidelidade. Quem quiser registrar o MOTIVO da cortesia usa o
+    campo de Observacao da comanda (ja existente, ja auditado), nunca
+    um Payment fabricado."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    for item in order.items:
+        orders.update_item_price(session, actor, order.id, item.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    register = _open_register(session, actor)
+
+    closed = orders.close_order(session, actor, order.id, OrderClose(payments=[]))
+
+    assert closed.status == OrderStatus.CLOSED
+    assert order_totals.order_total(closed) == Decimal("0.00")
+    assert closed.payments == []  # nenhum Payment criado -- nenhuma linha "R$0" pra Caixa/Extrato/Dashboard.
+    session.refresh(appt)
+    assert appt.status == AppointmentStatus.PAID
+
+
+def test_comissao_percentual_em_item_zerado_e_zero_mas_comissao_fixa_continua_integral(org_session):
+    """Documenta (nao altera) a regra atual de comissao pra item R$0:
+    PERCENTUAL -> comissao 0 (proporcional ao valor vendido). FIXA ->
+    comissao INTEGRAL, porque `resolve_commission` pro tipo FIXED
+    ignora `price` inteiramente. Pode ser correto de proposito -- numa
+    cortesia o profissional trabalhou igual, entao uma comissao fixa
+    (que remunera o TRABALHO, nao um percentual da venda) continuar
+    integral e uma decisao de negocio legitima, nao um bug. Esta rodada
+    so CONFIRMA que o comportamento e intencional; a decisao de manter
+    ou mudar fica separada, com o usuario."""
+    from nexasalon_api.models.enums import CommissionType
+    from nexasalon_api.models.service import ProfessionalService
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, _branch, prof, _client = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))  # servico A.
+    item_b = next(i for i in order.items if i.price == Decimal("150.00"))  # servico B.
+    session.query(ProfessionalService).filter_by(professional_id=prof.id, service_id=item_a.service_id).update(
+        {"commission_type": CommissionType.PERCENTAGE, "commission_value": Decimal("30.00")}
+    )
+    session.query(ProfessionalService).filter_by(professional_id=prof.id, service_id=item_b.service_id).update(
+        {"commission_type": CommissionType.FIXED, "commission_value": Decimal("20.00")}
+    )
+    session.flush()
+    orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    orders.update_item_price(session, actor, order.id, item_b.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    orders.update_item_price(
+        session, actor, order.id, next(i for i in order.items if i.price == Decimal("410.00")).id,
+        OrderItemPriceUpdate(price=Decimal("0.00")),
+    )
+    register = _open_register(session, actor)
+
+    closed = orders.close_order(session, actor, order.id, OrderClose(payments=[]))
+
+    closed_a = next(i for i in closed.items if i.id == item_a.id)
+    closed_b = next(i for i in closed.items if i.id == item_b.id)
+    assert closed_a.commission_amount_snapshot == Decimal("0.00")  # percentual: 0% de 0 = 0, proporcional.
+    assert closed_b.commission_amount_snapshot == Decimal("20.00")  # fixa: integral, mesmo com item a R$0 (intencional).
+    assert register.id  # caixa aberto continua exigido mesmo sem nenhum Payment (pre-requisito operacional).
+
+
+# --- Overpayment: saldo = total - pagamentos ja processados; nenhum ---
+# --- lancamento pode ultrapassar o saldo no momento em que e aplicado.
+
+
+def test_overpayment_total_260_pagamento_410_e_rejeitado(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    corte = next(i for i in order.items if i.price == Decimal("100.00"))
+    coloracao = next(i for i in order.items if i.price == Decimal("280.00"))
+    orders.update_item_price(session, actor, order.id, corte.id, OrderItemPriceUpdate(price=Decimal("60.00")))
+    orders.update_item_price(session, actor, order.id, coloracao.id, OrderItemPriceUpdate(price=Decimal("200.00")))
+    # total agora = 260.
+    register = _open_register(session, actor)
+
+    with pytest.raises(ValidationDomainError, match="não pode ser maior que o saldo"):
+        orders.close_order(
+            session, actor, order.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("410.00"), cash_register_id=register.id)]),
+        )
+    reloaded = orders.get_order(session, actor, order.id)
+    assert reloaded.status == OrderStatus.OPEN  # nada foi persistido -- nenhum Payment criado, comanda continua aberta.
+    assert reloaded.payments == []
+
+
+def test_overpayment_total_410_pagamento_410_e_permitido(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))
+    item_b = next(i for i in order.items if i.price == Decimal("150.00"))
+    orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    orders.update_item_price(session, actor, order.id, item_b.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    # total agora = 410 (0 + 0 + 410).
+    register = _open_register(session, actor)
+
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("410.00"), cash_register_id=register.id)]),
+    )
+
+    assert closed.status == OrderStatus.CLOSED
+    assert closed.payments[0].amount == Decimal("410.00")
+
+
+def test_overpayment_total_410_pago_200_mais_210_e_permitido(org_session):
+    """Dois lancamentos na MESMA chamada de fechamento (pagamento
+    dividido) -- 200 + 210 = 410 exato, cada entrada respeitando o
+    saldo remanescente no momento em que e aplicada."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))
+    item_b = next(i for i in order.items if i.price == Decimal("150.00"))
+    orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    orders.update_item_price(session, actor, order.id, item_b.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    register = _open_register(session, actor)
+
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[
+            PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("200.00"), cash_register_id=register.id),
+            PaymentCreate(method=PaymentMethod.CASH, amount=Decimal("210.00"), cash_register_id=register.id),
+        ]),
+    )
+
+    assert closed.status == OrderStatus.CLOSED
+    assert len(closed.payments) == 2
+    assert sum((p.amount for p in closed.payments), Decimal("0")) == Decimal("410.00")
+
+
+def test_overpayment_total_410_pago_200_mais_211_e_rejeitado(org_session):
+    """O segundo lancamento (211) ultrapassa o saldo remanescente
+    (410-200=210) -- rejeitado ALI, mesmo a soma agregada (411) sendo
+    só R$1 acima do total. Nenhum Payment fica persistido, nem o
+    primeiro de 200 (fechamento é atômico)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))
+    item_b = next(i for i in order.items if i.price == Decimal("150.00"))
+    orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    orders.update_item_price(session, actor, order.id, item_b.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    register = _open_register(session, actor)
+
+    with pytest.raises(ValidationDomainError, match="não pode ser maior que o saldo"):
+        orders.close_order(
+            session, actor, order.id,
+            OrderClose(payments=[
+                PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("200.00"), cash_register_id=register.id),
+                PaymentCreate(method=PaymentMethod.CASH, amount=Decimal("211.00"), cash_register_id=register.id),
+            ]),
+        )
+    reloaded = orders.get_order(session, actor, order.id)
+    assert reloaded.status == OrderStatus.OPEN
+    assert reloaded.payments == []  # atômico -- nem o primeiro lançamento (200) ficou.
+
+
+def test_pagamento_menor_que_o_total_continua_bloqueado(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)  # total = 820.
+    register = _open_register(session, actor)
+
+    with pytest.raises(ValidationDomainError):
+        orders.close_order(
+            session, actor, order.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.CASH, amount=Decimal("500.00"), cash_register_id=register.id)]),
+        )
+
+
+def test_edicao_de_item_apos_tentativa_de_fechamento_rejeitada_por_saldo_continua_permitida(org_session):
+    """Como o fechamento é atômico (nenhum Payment persiste numa
+    tentativa rejeitada), o item continua ABERTO e editável depois de
+    uma tentativa de overpayment recusada -- "editar item aumentando
+    total depois de pagamento parcial" não tem estado parcial real
+    pra corromper: a tentativa rejeitada nunca chegou a existir."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))
+    register = _open_register(session, actor)
+
+    with pytest.raises(ValidationDomainError):
+        orders.close_order(
+            session, actor, order.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("9999.00"), cash_register_id=register.id)]),
+        )
+
+    # Item continua editável -- a tentativa recusada não deixou rastro.
+    updated = orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("300.00")))
+    assert next(i for i in updated.items if i.id == item_a.id).price == Decimal("300.00")
+
+
+def test_reduzir_total_abaixo_do_ja_fechado_nunca_e_possivel_edicao_bloqueada_apos_fechar(org_session):
+    """"Reduzir o total abaixo do já pago" nunca acontece silenciosamente
+    porque, uma vez que o fechamento TEM SUCESSO (Payment(s) persistidos,
+    status=CLOSED), editar QUALQUER item passa a ser bloqueado
+    incondicionalmente (`update_order_item` já recusa `status != OPEN`)
+    -- nunca um caminho que deixe total < pago numa comanda fechada."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))
+    register = _open_register(session, actor)
+
+    total = order_totals.order_total(order)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+
+    with pytest.raises(ValidationDomainError):
+        orders.update_item_price(session, actor, order.id, item_a.id, OrderItemPriceUpdate(price=Decimal("1.00")))
+
+
+def test_concorrencia_dois_fechamentos_no_mesmo_pedido_sao_serializados_pelo_lock_da_order(org_session):
+    """Documenta (via o mecanismo já existente, não um novo) por que
+    dois fechamentos "simultâneos" nunca conseguem juntos ultrapassar o
+    saldo: `_get_order_for_update_or_404` trava a linha da Order
+    (`SELECT ... FOR UPDATE`) ANTES do cálculo de saldo, e todo o
+    fechamento (validação + criação de Payment + status=CLOSED)
+    acontece na MESMA transação enquanto o lock é mantido. Uma segunda
+    chamada pro MESMO order_id bloqueia até a primeira commitar, e aí
+    lê `status=CLOSED` já persistido -- nunca chega a reavaliar saldo
+    contra um estado obsoleto. Este teste simula o efeito (2ª chamada
+    depois da 1ª já ter commitado, mesma coisa que o lock garante sob
+    concorrência real) -- não abre threads de verdade porque a sessão
+    de teste é síncrona, mas o comportamento observável é idêntico."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    total = order_totals.order_total(order)
+
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+
+    # Segunda tentativa de fechamento (ex.: retry de rede) -- rejeitada
+    # por status, nunca chega a criar um segundo Payment nem a somar
+    # saldo duas vezes.
+    with pytest.raises(ConflictError):
+        orders.close_order(
+            session, actor, order.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+        )
+    reloaded = orders.get_order(session, actor, order.id)
+    assert len(reloaded.payments) == 1  # nunca duplicou.
+
+
+def test_overpayment_consolidado_tambem_e_rejeitado(org_session):
+    """Mesma regra no fechamento consolidado (N comandas de uma vez) --
+    `close_orders_consolidated` não tinha mais o bloco de "sobra vira
+    Payment extra na última comanda" (removido nesta rodada)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt1, branch, prof, client = _finished_appointment_with_two_services(session, org_id, actor)
+    register = _open_register(session, actor)
+    order1 = orders.create_order(session, actor, appt1.id)
+
+    svc = _service(session, org_id, name="Escova", duration=30, price=Decimal("80.00"))
+    _link(session, prof.id, svc.id)
+    appt2 = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=svc.id, start_at=_dt(14, 0))],
+        ),
+    )
+    appt2.status = AppointmentStatus.FINISHED
+    session.flush()
+    order2 = orders.create_order(session, actor, appt2.id)
+    # total consolidado = 380 (100+280) + 80 = 460.
+
+    from nexasalon_api.schemas.order import ConsolidatedOrderClose
+
+    with pytest.raises(ValidationDomainError, match="não pode ser maior que o saldo"):
+        orders.close_orders_consolidated(
+            session, actor, order1.id,
+            ConsolidatedOrderClose(
+                order_ids=[order1.id, order2.id],
+                payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("500.00"), cash_register_id=register.id)],
+            ),
+        )
+    session.refresh(order1)
+    session.refresh(order2)
+    assert order1.status == OrderStatus.OPEN
+    assert order2.status == OrderStatus.OPEN

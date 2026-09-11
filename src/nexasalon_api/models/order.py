@@ -312,6 +312,13 @@ class Payment(Base, UUIDPKMixin, TimestampMixin):
     `models/cash_register.py`)."""
 
     __tablename__ = "payments"
+    # `amount > 0` sempre — Payment representa dinheiro que de fato
+    # mudou de mão; um valor 0 não corresponde a nenhum evento real
+    # (nem Pix, nem Fidelidade — "Cartão Fidelidade" é só mais um
+    # PaymentMethod, sem semântica de resgate/desconto própria, ver
+    # docstring de `PaymentMethod.LOYALTY_CARD`). Uma comanda com total
+    # 0 (cortesia/gratuita) fecha com `payments=[]` — nunca um Payment
+    # artificial de R$0 só pra "existir" (ver `OrderClose.payments`).
     __table_args__ = (CheckConstraint("amount > 0", name="amount_positive"),)
 
     organization_id: Mapped[uuid.UUID] = mapped_column(

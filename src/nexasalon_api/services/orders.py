@@ -863,10 +863,24 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
 
     order_totals_breakdown = order_totals.order_total_breakdown(order)
     total = order_totals_breakdown.total
-    paid_total = sum((p.amount for p in data.payments), Decimal("0"))
-    if paid_total < total:
+    # Etapa "Overpayment" — enquanto o Nexa não modela troco/crédito/
+    # estorno, nenhum lançamento pode ultrapassar o SALDO da comanda no
+    # momento em que é aplicado (nunca só a soma agregada no final —
+    # um lançamento isolado que já estoura o saldo é recusado ali
+    # mesmo, mesmo que um lançamento seguinte "compensasse" a soma).
+    # `data.payments` é processada em ORDEM (a mesma semântica de fila
+    # que `close_orders_consolidated` já usa pra dividir entre
+    # comandas) — cada entrada consome do MESMO saldo que a anterior
+    # deixou. Uma comanda com total 0 fecha com `payments=[]` (saldo
+    # nunca fica positivo, loop nem executa).
+    saldo = total
+    for payment_in in data.payments:
+        if payment_in.amount > saldo:
+            raise ValidationDomainError("O valor do pagamento não pode ser maior que o saldo da comanda.")
+        saldo -= payment_in.amount
+    if saldo > 0:
         raise ValidationDomainError(
-            f"Valor pago (R$ {paid_total}) é menor que o total da comanda (R$ {total})."
+            f"Valor pago (R$ {total - saldo}) é menor que o total da comanda (R$ {total})."
         )
 
     # Valida TODOS os caixas informados antes de criar qualquer
@@ -989,7 +1003,9 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
         action=AuditAction.UPDATE,
         old_values={"status": "open"},
         new_values={
-            "status": "closed", "change_type": "close_order", "paid_total": str(paid_total),
+            # Chegar aqui só é possível com `saldo == 0` (ver checagem
+            # acima) — total é sempre o valor efetivamente pago.
+            "status": "closed", "change_type": "close_order", "paid_total": str(total),
             "services_total": str(order_totals_breakdown.services_total),
             "products_total": str(order_totals_breakdown.products_total),
         },
@@ -1021,9 +1037,11 @@ def close_orders_consolidated(
     fecha exato numa fronteira de comanda é DIVIDIDO em duas linhas de
     `Payment` (mesmo método/caixa/bandeira, valor reduzido em cada) — a
     soma por método continua batendo com o que a cliente de fato pagou.
-    Sobra da fila (pagou a mais) vira `Payment` extra na ÚLTIMA comanda
-    processada — mesmo comportamento de troco que `close_order` já
-    permite pra uma comanda só."""
+
+    Overpayment (pagar a mais que o total consolidado) é RECUSADO —
+    enquanto o Nexa não modela troco/crédito/estorno, `paid_total` tem
+    que bater EXATO com `grand_total` (nunca só `>=`). Uma comanda com
+    total 0 dentro do lote simplesmente não consome nada da fila."""
     organization_id = actor.organization_id
 
     order_ids: list[uuid.UUID] = list(dict.fromkeys(data.order_ids))
@@ -1059,6 +1077,8 @@ def close_orders_consolidated(
     grand_total = sum(totals.values(), Decimal("0"))
 
     paid_total = sum((p.amount for p in data.payments), Decimal("0"))
+    if paid_total > grand_total:
+        raise ValidationDomainError("O valor do pagamento não pode ser maior que o saldo da comanda.")
     if paid_total < grand_total:
         raise ValidationDomainError(
             f"Valor pago (R$ {paid_total}) é menor que o total consolidado (R$ {grand_total})."
@@ -1149,14 +1169,9 @@ def close_orders_consolidated(
             if entry["amount"] <= 0:
                 queue.pop(0)
 
-    # Troco/sobra (pagou a mais que o total consolidado) — vira Payment
-    # extra na ÚLTIMA comanda, mesmo comportamento que `close_order` já
-    # permite pra uma comanda só.
-    if queue:
-        last_order = orders_by_number[-1]
-        for entry in queue:
-            if entry["amount"] > 0:
-                _create_payment(last_order, entry, entry["amount"])
+    # Nunca sobra nada na fila aqui — `paid_total == grand_total` já foi
+    # validado acima (overpayment é recusado antes de chegar neste
+    # ponto), então a distribuição consome a fila inteira exatamente.
 
     # Etapa C2 — mesma resolução de comissão de `close_order`, item por
     # item, em CADA comanda do lote (nunca duas implementações).

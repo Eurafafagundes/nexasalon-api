@@ -132,6 +132,13 @@ class PaymentMethod(str, Enum):
     CASH = "cash"
     DEBIT = "debit"
     CREDIT = "credit"
+    # "Cartão Fidelidade" — é só mais um MÉTODO de pagamento (mesmo
+    # nível de Pix/Dinheiro/Voucher/Permuta), nunca um benefício/
+    # desconto/serviço à parte. Não existe pontuação, resgate nem
+    # regra de elegibilidade modelada em lugar nenhum do domínio — é
+    # um rótulo que o atendente escolhe manualmente, igual aos demais.
+    # `Payment.amount` continua exigindo > 0 pra qualquer método,
+    # LOYALTY_CARD incluso (ver docstring de `Payment`).
     LOYALTY_CARD = "loyalty_card"
     VOUCHER = "voucher"
     BARTER = "barter"  # Permuta

@@ -106,6 +106,10 @@ OrderItemPriceUpdate = OrderItemUpdate
 
 class PaymentCreate(BaseModel):
     method: PaymentMethod
+    # `gt=0` — Payment representa dinheiro que de fato mudou de mão;
+    # ver docstring de `models/order.py::Payment`. Uma comanda gratuita
+    # (total 0) fecha com `OrderClose.payments=[]`, nunca com um
+    # lançamento artificial de R$0 (nem Fidelidade, nem nenhum método).
     amount: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
     # Obrigatório sempre (item "Caixa Diário") — pagamento nunca é
     # criado sem um caixa aberto explicitamente selecionado. Validado
@@ -239,9 +243,15 @@ class OrderClose(BaseModel):
     """`payments` é uma LISTA — mesmo com a UI desta primeira versão só
     criando um lançamento por fechamento, o domínio já suporta
     pagamento misto (ex.: parte Pix + parte Crédito) sem precisar de
-    outra migration depois."""
+    outra migration depois.
 
-    payments: list[PaymentCreate] = Field(min_length=1)
+    Lista VAZIA é aceita (nunca `min_length=1`) — é o único jeito
+    correto de fechar uma comanda com total R$0 (cortesia/gratuita):
+    nenhum Payment artificial só pra satisfazer um mínimo (ver
+    `services/orders.py::close_order` — soma 0 de uma lista vazia
+    nunca deixa saldo positivo em aberto quando o total já é 0)."""
+
+    payments: list[PaymentCreate] = Field(default_factory=list)
 
 
 class ConsolidatedOrderClose(BaseModel):
@@ -255,7 +265,9 @@ class ConsolidatedOrderClose(BaseModel):
     `services/orders.py::close_orders_consolidated`)."""
 
     order_ids: list[uuid.UUID] = Field(min_length=1)
-    payments: list[PaymentCreate] = Field(min_length=1)
+    # Lista VAZIA aceita, mesmo raciocínio de `OrderClose.payments`
+    # (lote onde a soma de todas as comandas dá R$0).
+    payments: list[PaymentCreate] = Field(default_factory=list)
 
 
 class OrderItemRead(BaseModel):
