@@ -6,6 +6,7 @@ travas financeiras (caixa fechado / comissão já liquidada), cascata
 Order -> Appointment no cancelamento, idempotência e isolamento de
 tenant."""
 import uuid
+from decimal import Decimal
 
 from sqlalchemy import text
 
@@ -248,6 +249,131 @@ def test_reopen_caixa_aberto_resumo_deixa_de_contar_pagamento_revertido(client_a
     # consultável), só não soma mais.
     assert len(summary_after["payments"]) == 1
     assert summary_after["payments"][0]["reversed_at"] is not None
+
+
+# ---------------------------------------------------------------------
+# Dashboard — refechamento com outra forma de pagamento não duplica
+# Recebido/Formas de pagamento/Comissão (bug real: `received_stmt`,
+# `_payment_methods` e `_revenue_fee_summary` em `services/dashboard.py`
+# somavam `Payment.amount` só filtrando `Order.status == CLOSED`, sem
+# excluir `reversed_at IS NOT NULL` — inofensivo enquanto a comanda
+# ficava `OPEN`, mas o Payment revertido antigo voltava a ser somado
+# junto do novo assim que a comanda era refechada).
+# ---------------------------------------------------------------------
+
+# Intervalo largo o bastante pra cobrir "agora" (`Order.closed_at` é
+# `datetime.now()` no momento do fechamento, nunca a data do
+# agendamento) independente de quando o teste roda de verdade — mesmo
+# padrão de `test_reopen_bloqueado_quando_comissao_ja_liquidada`.
+# `date_from` começa DEPOIS de `_START_A` (2026-08-13) de propósito:
+# limitação conhecida e pré-existente do Postgres embarcado do
+# `pgserver` usado nos testes (tzdata incompleto — `timezone(...)`
+# lança "America/Sao_Paulo not recognized" quando o heatmap do
+# Dashboard processa algum `Appointment.starts_at`; nunca acontece com
+# `Order.closed_at`, que nunca passa por `timezone()`). Excluir a data
+# do agendamento do período consultado evita o heatmap avaliar aquela
+# linha, sem esconder nenhum problema do fechamento/reabertura em si.
+_WIDE_RANGE = {"date_from": "2026-08-14T00:00:00-03:00", "date_to": "2030-12-31T23:59:59-03:00"}
+
+
+def test_reopen_refechar_com_outra_forma_de_pagamento_nao_duplica_recebido_nem_comissao(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    branch = c.post("/api/v1/branches", json={"name": "Matriz", "slug": f"matriz-{uuid.uuid4().hex[:6]}"}).json()
+    professional = c.post("/api/v1/professionals", json={"name": "Ianka"}).json()
+    service = c.post(
+        "/api/v1/services", json={"name": "Corte", "default_duration_minutes": 60, "default_price": "130.00"}
+    ).json()
+    assert c.put(
+        f"/api/v1/professionals/{professional['id']}/services",
+        json={"items": [{"service_id": service["id"], "commission_type": "percentage", "commission_value": "20"}]},
+    ).status_code == 200
+    assert c.put(
+        f"/api/v1/professionals/{professional['id']}/working-hours",
+        json={"items": [{"weekday": 4, "start_time": "09:00:00", "end_time": "20:00:00"}]},
+    ).status_code == 200
+    client = c.post("/api/v1/clients", json={"name": "Cliente Um"}).json()
+    appt = c.post(
+        "/api/v1/appointments",
+        json={
+            "branch_id": branch["id"], "client_id": client["id"],
+            "items": [{"professional_id": professional["id"], "service_id": service["id"], "start_at": _START_A}],
+        },
+    ).json()
+    for target in ["confirmed", "waiting", "in_progress", "finished"]:
+        assert c.patch(f"/api/v1/appointments/{appt['id']}/status", json={"status": target}).status_code == 200
+
+    # ESTADO 1 — fechada com Pix R$130, comissão R$26 (20% de 130).
+    order, register = _close_with_payment(c, appt, price="130.00")
+    pix_payment_id = order["payments"][0]["id"]
+
+    before = c.get("/api/v1/dashboard/overview", params=_WIDE_RANGE).json()
+    assert Decimal(before["kpis"]["revenue"]["value"]) == Decimal("130.00")
+    assert Decimal(before["financial_summary"]["received"]) == Decimal("130.00")
+    assert Decimal(before["financial_summary"]["commissions_calculated"]) == Decimal("26.00")
+    pix_before = next(r for r in before["payment_methods"] if r["bucket"] == "pix")
+    assert Decimal(pix_before["amount"]) == Decimal("130.00")
+
+    # ESTADO 2 — reabre: Pix antigo fica revertido, comanda volta OPEN.
+    reopened = c.post(
+        f"/api/v1/orders/{order['id']}/reopen", json={"reason": "Cliente pediu para trocar para Crédito"}
+    ).json()
+    assert reopened["status"] == "open"
+    reopened_payment = next(p for p in reopened["payments"] if p["id"] == pix_payment_id)
+    assert reopened_payment["reversed_at"] is not None
+    assert reopened_payment["amount"] == "130.00"  # histórico preservado, nunca apagado/editado.
+
+    # Enquanto OPEN: não entra em Recebido, Faturamento, comissão devida
+    # nem Formas de pagamento — a comanda inteira some do período.
+    during = c.get("/api/v1/dashboard/overview", params=_WIDE_RANGE).json()
+    assert Decimal(during["kpis"]["revenue"]["value"]) == Decimal("0")
+    assert Decimal(during["financial_summary"]["received"]) == Decimal("0")
+    assert Decimal(during["financial_summary"]["commissions_calculated"]) == Decimal("0")
+    assert not any(r["bucket"] == "pix" and Decimal(r["amount"]) > 0 for r in during["payment_methods"])
+
+    # ESTADO 3 — refecha com Crédito R$130 (mesmo caixa, ainda aberto).
+    reclosed = c.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={
+            "payments": [
+                {"method": "credit", "amount": "130.00", "cash_register_id": register["id"], "card_brand": "visa", "installments": 1}
+            ]
+        },
+    )
+    assert reclosed.status_code == 200, reclosed.text
+    reclosed_body = reclosed.json()
+    credit_payment_id = next(p["id"] for p in reclosed_body["payments"] if p["method"] == "credit")
+
+    after = c.get("/api/v1/dashboard/overview", params=_WIDE_RANGE).json()
+    # Faturamento continua R$130 (nunca 260 — nunca reduzido também).
+    assert Decimal(after["kpis"]["revenue"]["value"]) == Decimal("130.00")
+    # Recebido = R$130, nunca R$260 (Pix revertido não soma de novo).
+    assert Decimal(after["financial_summary"]["received"]) == Decimal("130.00")
+    # Comissão válida = R$26, existe uma única vez (nunca 52 = 26+26).
+    assert Decimal(after["financial_summary"]["commissions_calculated"]) == Decimal("26.00")
+
+    buckets = {r["bucket"]: Decimal(r["amount"]) for r in after["payment_methods"]}
+    assert buckets.get("pix", Decimal("0")) == Decimal("0")  # Pix válido = R$0.
+    assert buckets["credit"] == Decimal("130.00")  # Crédito válido = R$130.
+
+    # Taxas de pagamento — considera só o pagamento novo, não revertido
+    # (Pix sem regra é NOT_APPLICABLE, nunca contribui; Crédito sem
+    # regra cadastrada é UNCONFIGURED — R$130 uma única vez, nunca 260).
+    fee_summary = after["revenue_fee_summary"]
+    assert Decimal(fee_summary["gross_revenue"]) == Decimal("130.00")
+    assert Decimal(fee_summary["known_fee_total"]) == Decimal("0")
+    assert Decimal(fee_summary["unconfigured_card_amount"]) == Decimal("130.00")
+    assert fee_summary["has_unconfigured_fee"] is True
+
+    # O Pix antigo permanece só como histórico/reversão — nunca some da
+    # comanda, nunca reeditado além do marcador de reversão.
+    final_order = c.get(f"/api/v1/orders/{order['id']}").json()
+    assert final_order["status"] == "closed"
+    final_pix = next(p for p in final_order["payments"] if p["id"] == pix_payment_id)
+    assert final_pix["reversed_at"] is not None
+    assert final_pix["amount"] == "130.00"
+    final_credit = next(p for p in final_order["payments"] if p["id"] == credit_payment_id)
+    assert final_credit["reversed_at"] is None
+    assert final_credit["amount"] == "130.00"
 
 
 # ---------------------------------------------------------------------

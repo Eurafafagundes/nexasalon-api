@@ -409,6 +409,12 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
     # RECEBIDO por comanda — query SEPARADA (mesmo raciocínio acima).
     # Mesmo filtro de organização/unidade/status/data que as demais,
     # pra somar Payment só das comandas que também entram no Faturamento.
+    # `reversed_at IS NULL` exclui pagamento estornado por
+    # `reopen_order` (comanda reaberta e refechada com outra forma de
+    # pagamento) — sem este filtro, o Payment antigo revertido voltaria
+    # a somar junto com o novo assim que a Order virasse `CLOSED` de
+    # novo (mesmo raciocínio já aplicado em
+    # `cash_register.py::build_summary`).
     received_stmt = (
         select(Payment.order_id, func.coalesce(func.sum(Payment.amount), 0))
         .join(Order, Order.id == Payment.order_id)
@@ -417,6 +423,7 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
             Order.status == OrderStatus.CLOSED,
             Order.closed_at >= date_from,
             Order.closed_at < date_to,
+            Payment.reversed_at.is_(None),
         )
         .group_by(Payment.order_id)
     )
@@ -1062,6 +1069,10 @@ def _status_distribution(data: _PeriodData) -> list[StatusDistributionRow]:
 
 
 def _payment_methods(session: Session, filters: DashboardFilters) -> list[PaymentMethodRow]:
+    # `reversed_at IS NULL` — mesmo raciocínio de `received_stmt` em
+    # `_fetch_period_data`: exclui pagamento estornado por
+    # `reopen_order`, nunca somado de novo se a comanda for refechada
+    # com outra forma de pagamento.
     stmt = (
         select(Payment.method, func.sum(Payment.amount))
         .join(Order, Order.id == Payment.order_id)
@@ -1070,6 +1081,7 @@ def _payment_methods(session: Session, filters: DashboardFilters) -> list[Paymen
             Order.status == OrderStatus.CLOSED,
             Order.closed_at >= filters.date_from,
             Order.closed_at < filters.date_to,
+            Payment.reversed_at.is_(None),
         )
         .group_by(Payment.method)
     )
@@ -1106,7 +1118,11 @@ def _revenue_fee_summary(
     Reaproveita `services/payment_fees.py::breakdown_for_display` —
     MESMA função usada pelo Extrato — pra nunca duplicar a
     interpretação de `fee_status` (incl. o caso histórico
-    `fee_status IS NULL`, ver `derive_fee_status`)."""
+    `fee_status IS NULL`, ver `derive_fee_status`).
+
+    `reversed_at IS NULL` — mesmo raciocínio de `received_stmt`/
+    `_payment_methods`: pagamento estornado por `reopen_order` nunca
+    entra na taxa, mesmo se a comanda for refechada depois."""
     stmt = (
         select(Payment)
         .join(Order, Order.id == Payment.order_id)
@@ -1115,6 +1131,7 @@ def _revenue_fee_summary(
             Order.status == OrderStatus.CLOSED,
             Order.closed_at >= date_from,
             Order.closed_at < date_to,
+            Payment.reversed_at.is_(None),
         )
     )
     if filters.branch_id is not None:
