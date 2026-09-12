@@ -132,18 +132,45 @@ class PaymentMethod(str, Enum):
     CASH = "cash"
     DEBIT = "debit"
     CREDIT = "credit"
-    # "Cartão Fidelidade" — é só mais um MÉTODO de pagamento (mesmo
-    # nível de Pix/Dinheiro/Voucher/Permuta), nunca um benefício/
-    # desconto/serviço à parte. Não existe pontuação, resgate nem
-    # regra de elegibilidade modelada em lugar nenhum do domínio — é
-    # um rótulo que o atendente escolhe manualmente, igual aos demais.
-    # `Payment.amount` continua exigindo > 0 pra qualquer método,
-    # LOYALTY_CARD incluso (ver docstring de `Payment`).
+    # Continua existindo pra histórico e pro caso real de pagamento com
+    # saldo físico de cartão fidelidade — mas "dar um serviço de graça
+    # via Fidelidade" NÃO usa mais este valor (ver `OrderItem.
+    # benefit_type`/`BenefitType.LOYALTY`, migration 0052): um Payment
+    # sempre representa dinheiro que de fato mudou de mão
+    # (`Payment.amount` continua exigindo > 0 pra qualquer método,
+    # LOYALTY_CARD incluso — ver docstring de `Payment`), então um
+    # benefício sem cobrança nunca vira um Payment.
     LOYALTY_CARD = "loyalty_card"
+    # Voucher/Permuta: investigado (rodada "Benefício por Item") — sem
+    # nenhuma semântica financeira própria hoje (mesmo bucket "Outros"
+    # do dashboard, mesmo NOT_APPLICABLE de taxa que Fidelidade/
+    # Transferência/Boleto, mesmo comportamento de reopen) — tratados
+    # como formas financeiras reais (like Pix), nunca como benefício.
     VOUCHER = "voucher"
     BARTER = "barter"  # Permuta
     TRANSFER = "transfer"  # Transferência
     BANK_SLIP = "bank_slip"  # Boleto
+
+
+class BenefitType(str, Enum):
+    """Etapa "Benefício por Item" (migration 0052) — `OrderItem.
+    benefit_type`/`benefit_amount`. Representa uma REDUÇÃO do valor
+    cobrado do cliente SEM alterar `OrderItem.price` (que continua
+    sendo só o valor econômico/comercial do item — base de Faturamento
+    e de comissão, sempre). Nunca cria `Payment` nem `CashMovement`:
+    a diferença entre `price` e o valor efetivamente cobrado
+    (`price - benefit_amount`, ver `services/order_totals.py::
+    item_charged_amount`) simplesmente não precisa de nenhum
+    lançamento financeiro — é dinheiro que nunca existiu, não dinheiro
+    que "entrou e saiu".
+
+    LOYALTY: Cartão Fidelidade (resgate de benefício, cortesia
+    associada a programa de fidelidade da organização).
+    COURTESY: cortesia avulsa, sem vínculo com Fidelidade (ex.:
+    correção de erro do salão, gentileza pontual)."""
+
+    LOYALTY = "loyalty"
+    COURTESY = "courtesy"
 
 
 class CardBrand(str, Enum):

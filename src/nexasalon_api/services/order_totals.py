@@ -22,7 +22,7 @@ CONCEITOS" em `services/dashboard.py`); esta função nunca lê
 from dataclasses import dataclass
 from decimal import Decimal
 
-from nexasalon_api.models.order import Order
+from nexasalon_api.models.order import Order, OrderItem
 
 
 @dataclass(frozen=True)
@@ -41,4 +41,36 @@ def order_total_breakdown(order: Order) -> OrderTotalBreakdown:
 
 
 def order_total(order: Order) -> Decimal:
+    """Valor ECONÔMICO/vendido — sempre `OrderItem.price` intocado,
+    nunca reduzido por benefício (ver `item_charged_amount` abaixo pra
+    isso). É a base de Faturamento/Extrato/Dashboard e continua sendo
+    o ÚNICO significado desta função — "quanto foi vendido", não
+    "quanto falta pagar"."""
     return order_total_breakdown(order).total
+
+
+# --- Etapa "Benefício por Item" ---------------------------------------
+
+
+def item_charged_amount(item: OrderItem) -> Decimal:
+    """Valor efetivamente A COBRAR deste item — `price` menos o
+    benefício aplicado (`benefit_amount`, `None` = sem benefício).
+    DERIVADO, nunca persistido: `item.price` continua sendo só o valor
+    econômico (nunca alterado pra representar benefício, ver docstring
+    de `OrderItem` em `models/order.py`)."""
+    return item.price - (item.benefit_amount or Decimal("0"))
+
+
+def order_charged_total(order: Order) -> Decimal:
+    """Quanto esta comanda ainda precisa RECEBER pra fechar — soma de
+    `item_charged_amount` de cada serviço + produtos (produtos não têm
+    benefício nesta rodada, usa `unit_price` cheio). É o valor usado
+    em TODA validação de saldo/overpayment do fechamento
+    (`services/orders.py::close_order`/`close_orders_consolidated`) —
+    NUNCA `order_total()` (que é o valor econômico/vendido, usado só
+    por Faturamento/Extrato/Dashboard, nunca por "quanto falta pagar").
+    Uma comanda com benefício cobrindo tudo tem `order_charged_total
+    == 0` mesmo com `order_total() > 0` — fecha com `payments=[]`."""
+    services_charged = sum((item_charged_amount(item) for item in order.items), Decimal("0"))
+    products_total = order_total_breakdown(order).products_total
+    return services_charged + products_total

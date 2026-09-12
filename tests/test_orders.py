@@ -23,6 +23,7 @@ from nexasalon_api.models.audit import AuditLog
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import (
     AppointmentStatus,
+    BenefitType,
     CardBrand,
     OrderStatus,
     PaymentMethod,
@@ -36,8 +37,10 @@ from nexasalon_api.schemas.appointment import AppointmentCreate, AppointmentItem
 from nexasalon_api.schemas.order import (
     OrderCancel,
     OrderClose,
+    OrderItemBenefitUpdate,
     OrderItemPriceUpdate,
     OrderObservationUpdate,
+    OrderReopen,
     PaymentCreate,
 )
 from nexasalon_api.services import appointments, cash_register, order_totals, orders
@@ -1437,3 +1440,358 @@ def test_overpayment_consolidado_tambem_e_rejeitado(org_session):
     session.refresh(order2)
     assert order1.status == OrderStatus.OPEN
     assert order2.status == OrderStatus.OPEN
+
+
+# ---------------------------------------------------------------------
+# Benefício por Item (Cartão Fidelidade / Cortesia) -- rodada
+# "Refatoração do fechamento da comanda". `OrderItem.price` NUNCA muda
+# por causa de benefício (continua o valor econômico -- base de
+# Faturamento e de comissão). O valor a cobrar é DERIVADO
+# (`price - benefit_amount`, ver `order_totals.item_charged_amount`).
+# ---------------------------------------------------------------------
+
+
+def _link_percentage(session, prof_id, service_id, percent):
+    """`_finished_appointment_with_three_services` já cria o vínculo
+    `ProfessionalService` (sem comissão configurada) pra cada serviço —
+    esta helper ATUALIZA o vínculo existente (nunca cria um segundo,
+    que violaria a unicidade `(professional_id, service_id)`)."""
+    from nexasalon_api.models.enums import CommissionType
+
+    session.query(ProfessionalService).filter_by(professional_id=prof_id, service_id=service_id).update(
+        {"commission_type": CommissionType.PERCENTAGE, "commission_value": Decimal(percent)}
+    )
+    session.flush()
+
+
+def test_beneficio_fidelidade_integral_preserva_preco_zera_valor_a_cobrar_comissao_sobre_valor_cheio(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item_a = next(i for i in order.items if i.price == Decimal("260.00"))  # Manutenção.
+    for other in order.items:
+        if other.id != item_a.id:
+            orders.update_item_price(session, actor, order.id, other.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    _link_percentage(session, order.items[0].professional_id, item_a.service_id, "20.00")
+    register = _open_register(session, actor)
+
+    updated = orders.update_order_item_benefit(
+        session, actor, order.id, item_a.id,
+        OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00")),
+    )
+    updated_item = next(i for i in updated.items if i.id == item_a.id)
+    assert updated_item.price == Decimal("260.00")  # NUNCA alterado.
+    assert updated_item.benefit_type == BenefitType.LOYALTY
+    assert updated_item.benefit_amount == Decimal("260.00")
+    assert order_totals.item_charged_amount(updated_item) == Decimal("0.00")
+    assert order_totals.order_total(updated) == Decimal("260.00")  # econômico intocado.
+    assert order_totals.order_charged_total(updated) == Decimal("0.00")  # nada a cobrar.
+
+    closed = orders.close_order(session, actor, order.id, OrderClose(payments=[]))
+    assert closed.status == OrderStatus.CLOSED
+    assert closed.payments == []  # caixa recebe R$0 -- nenhum Payment criado.
+
+    closed_item = next(i for i in closed.items if i.id == item_a.id)
+    assert closed_item.commission_amount_snapshot == Decimal("52.00")  # 20% de 260, valor CHEIO.
+    assert closed_item.price == Decimal("260.00")  # histórico preserva o valor econômico.
+
+    # Reload -- semântica preservada.
+    reloaded = orders.get_order(session, actor, order.id)
+    reloaded_item = next(i for i in reloaded.items if i.id == item_a.id)
+    assert reloaded_item.benefit_type == BenefitType.LOYALTY
+    assert reloaded_item.benefit_amount == Decimal("260.00")
+    assert reloaded_item.commission_amount_snapshot == Decimal("52.00")
+
+
+def test_comanda_mista_exemplo_do_pedido_corte_pix_manutencao_fidelidade_escova_dinheiro(org_session):
+    """Cenário EXATO do pedido: Corte R$100 (Pix), Manutenção R$260
+    (Fidelidade integral), Escova R$80 (Dinheiro). Total econômico=440,
+    amount_due=180. Aceita 100+80=180 exato; nunca exige 440."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    # Reaproveita os 3 itens já existentes (260/150/410, ver
+    # `_finished_appointment_with_three_services`) ajustando pra bater
+    # com os valores exatos do exemplo do pedido: Corte=100, Manutenção
+    # fica no item que já nasce 260, Escova=80.
+    manutencao = next(i for i in order.items if i.price == Decimal("260.00"))
+    corte = next(i for i in order.items if i.price == Decimal("150.00"))
+    escova = next(i for i in order.items if i.price == Decimal("410.00"))
+    orders.update_item_price(session, actor, order.id, corte.id, OrderItemPriceUpdate(price=Decimal("100.00")))
+    orders.update_item_price(session, actor, order.id, escova.id, OrderItemPriceUpdate(price=Decimal("80.00")))
+    register = _open_register(session, actor)
+
+    orders.update_order_item_benefit(
+        session, actor, order.id, manutencao.id,
+        OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00")),
+    )
+    reloaded = orders.get_order(session, actor, order.id)
+    assert order_totals.order_total(reloaded) == Decimal("440.00")
+    assert order_totals.order_charged_total(reloaded) == Decimal("180.00")
+
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[
+            PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("100.00"), cash_register_id=register.id),
+            PaymentCreate(method=PaymentMethod.CASH, amount=Decimal("80.00"), cash_register_id=register.id),
+        ]),
+    )
+    assert closed.status == OrderStatus.CLOSED
+    assert sum((p.amount for p in closed.payments), Decimal("0")) == Decimal("180.00")
+
+
+def test_comanda_mista_pagamento_acima_do_saldo_e_rejeitado(org_session):
+    """Mesmo cenário 100/260(fidelidade)/80 -- tentar pagar 181 (saldo
+    é 180) é rejeitado, nunca aceita passar de R$180, nunca exige 440."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    manutencao = next(i for i in order.items if i.price == Decimal("260.00"))
+    escova = next(i for i in order.items if i.price == Decimal("150.00"))
+    terceiro = next(i for i in order.items if i.price == Decimal("410.00"))
+    orders.update_item_price(session, actor, order.id, escova.id, OrderItemPriceUpdate(price=Decimal("100.00")))
+    orders.update_item_price(session, actor, order.id, terceiro.id, OrderItemPriceUpdate(price=Decimal("80.00")))
+    orders.update_order_item_benefit(
+        session, actor, order.id, manutencao.id,
+        OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00")),
+    )
+    register = _open_register(session, actor)
+
+    with pytest.raises(ValidationDomainError, match="não pode ser maior que o saldo"):
+        orders.close_order(
+            session, actor, order.id,
+            OrderClose(payments=[PaymentCreate(method=PaymentMethod.CASH, amount=Decimal("181.00"), cash_register_id=register.id)]),
+        )
+
+    # R$180 exato (o saldo real) fecha sem erro -- nunca exige 440.
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.CASH, amount=Decimal("180.00"), cash_register_id=register.id)]),
+    )
+    assert closed.status == OrderStatus.CLOSED
+
+
+def test_beneficio_sobre_preco_editado_usa_preco_editado_nunca_preco_atual_do_catalogo(org_session):
+    """Serviço catálogo R$260, negociado nesta venda por R$230 (lápis) —
+    benefício sobre os R$230 negociados, comissão usa R$230, nunca 260
+    (catálogo) nem qualquer preço futuro."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item = next(i for i in order.items if i.price == Decimal("260.00"))
+    _link_percentage(session, item.professional_id, item.service_id, "20.00")
+    orders.update_item_price(session, actor, order.id, item.id, OrderItemPriceUpdate(price=Decimal("230.00")))
+    # Zera os outros 2 itens da comanda (fora do foco deste teste) --
+    # só o item negociado/beneficiado importa aqui.
+    for other in order.items:
+        if other.id != item.id:
+            orders.update_item_price(session, actor, order.id, other.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+
+    with pytest.raises(ValidationDomainError):
+        orders.update_order_item_benefit(
+            session, actor, order.id, item.id,
+            OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00")),
+        )  # 260 > 230 (preço negociado) -- rejeitado.
+
+    updated = orders.update_order_item_benefit(
+        session, actor, order.id, item.id,
+        OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("230.00")),
+    )
+    updated_item = next(i for i in updated.items if i.id == item.id)
+    assert updated_item.price == Decimal("230.00")
+    assert order_totals.item_charged_amount(updated_item) == Decimal("0.00")
+
+    # Serviço no catálogo muda depois -- não afeta o item já negociado.
+    service = service_repo.get(session, org_id, item.service_id)
+    service.default_price = Decimal("999.00")
+    session.flush()
+
+    register = _open_register(session, actor)
+    closed = orders.close_order(session, actor, order.id, OrderClose(payments=[]))
+    closed_item = next(i for i in closed.items if i.id == item.id)
+    assert closed_item.price == Decimal("230.00")  # nunca 260 (catálogo antigo) nem 999 (catálogo novo).
+    assert closed_item.commission_amount_snapshot == Decimal("46.00")  # 20% de 230, nunca de 260/999.
+
+
+def test_caixa_nao_soma_beneficio_fidelidade(org_session):
+    from nexasalon_api.services import cash_register
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    manutencao = next(i for i in order.items if i.price == Decimal("260.00"))
+    escova = next(i for i in order.items if i.price == Decimal("150.00"))
+    terceiro = next(i for i in order.items if i.price == Decimal("410.00"))
+    orders.update_item_price(session, actor, order.id, escova.id, OrderItemPriceUpdate(price=Decimal("100.00")))
+    orders.update_item_price(session, actor, order.id, terceiro.id, OrderItemPriceUpdate(price=Decimal("80.00")))
+    orders.update_order_item_benefit(
+        session, actor, order.id, manutencao.id,
+        OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00")),
+    )
+    register = _open_register(session, actor)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("180.00"), cash_register_id=register.id)]),
+    )
+
+    summary = cash_register.build_summary(session, org_id, register)
+    assert summary.total_revenue == Decimal("180.00")  # nunca 440 (econômico) nem 260 a mais.
+
+
+def test_reopen_preserva_beneficio_no_item(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item = next(i for i in order.items if i.price == Decimal("260.00"))
+    orders.update_order_item_benefit(
+        session, actor, order.id, item.id,
+        OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00")),
+    )
+    for other in order.items:
+        if other.id != item.id:
+            orders.update_item_price(session, actor, order.id, other.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    register = _open_register(session, actor)
+    orders.close_order(session, actor, order.id, OrderClose(payments=[]))
+
+    reopened = orders.reopen_order(session, actor, order.id, OrderReopen(reason="Corrigir item"))
+    assert reopened.status == OrderStatus.OPEN
+    reopened_item = next(i for i in reopened.items if i.id == item.id)
+    assert reopened_item.benefit_type == BenefitType.LOYALTY
+    assert reopened_item.benefit_amount == Decimal("260.00")
+    assert reopened_item.price == Decimal("260.00")
+
+    # Continua editável/removível normalmente com a comanda reaberta.
+    cleared = orders.update_order_item_benefit(
+        session, actor, order.id, item.id, OrderItemBenefitUpdate(benefit_type=None, benefit_amount=None),
+    )
+    cleared_item = next(i for i in cleared.items if i.id == item.id)
+    assert cleared_item.benefit_type is None
+    assert cleared_item.benefit_amount is None
+
+
+def test_beneficio_amount_maior_que_price_e_rejeitado(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item = next(i for i in order.items if i.price == Decimal("260.00"))
+
+    with pytest.raises(ValidationDomainError):
+        orders.update_order_item_benefit(
+            session, actor, order.id, item.id,
+            OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.01")),
+        )
+
+
+def test_beneficio_amount_negativo_e_rejeitado_pelo_schema(org_session):
+    with pytest.raises(ValueError):
+        OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("-1.00"))
+
+
+def test_beneficio_type_sem_amount_ou_vice_versa_e_rejeitado_pelo_schema(org_session):
+    with pytest.raises(ValueError):
+        OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=None)
+    with pytest.raises(ValueError):
+        OrderItemBenefitUpdate(benefit_type=None, benefit_amount=Decimal("10.00"))
+
+
+def test_beneficio_em_comanda_fechada_e_rejeitado(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item = next(i for i in order.items if i.price == Decimal("260.00"))
+    register = _open_register(session, actor)
+    total = order_totals.order_total(order)
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+
+    with pytest.raises(ValidationDomainError):
+        orders.update_order_item_benefit(
+            session, actor, order.id, item.id,
+            OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("100.00")),
+        )
+
+
+def test_aplicar_o_mesmo_beneficio_duas_vezes_e_idempotente_nao_duplica_audit_log(org_session):
+    from nexasalon_api.repositories import audit_log_repo
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item = next(i for i in order.items if i.price == Decimal("260.00"))
+
+    payload = OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00"))
+    orders.update_order_item_benefit(session, actor, order.id, item.id, payload)
+    orders.update_order_item_benefit(session, actor, order.id, item.id, payload)  # reenvio -- double click/retry.
+
+    logs = audit_log_repo.list_for_entity(session, org_id, "order_item", item.id)
+    benefit_logs = [log for log in logs if log.new_values.get("change_type") == "benefit_applied"]
+    assert len(benefit_logs) == 1  # não duplicou.
+
+
+def test_limpar_beneficio_volta_a_cobrar_valor_cheio(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item = next(i for i in order.items if i.price == Decimal("260.00"))
+    orders.update_order_item_benefit(
+        session, actor, order.id, item.id,
+        OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00")),
+    )
+
+    cleared = orders.update_order_item_benefit(
+        session, actor, order.id, item.id, OrderItemBenefitUpdate(benefit_type=None, benefit_amount=None),
+    )
+    cleared_item = next(i for i in cleared.items if i.id == item.id)
+    assert cleared_item.benefit_type is None
+    assert cleared_item.benefit_amount is None
+    assert order_totals.item_charged_amount(cleared_item) == Decimal("260.00")
+
+
+def test_beneficio_tipo_cortesia_funciona_igual_a_fidelidade(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item = next(i for i in order.items if i.price == Decimal("150.00"))
+
+    updated = orders.update_order_item_benefit(
+        session, actor, order.id, item.id,
+        OrderItemBenefitUpdate(benefit_type=BenefitType.COURTESY, benefit_amount=Decimal("150.00")),
+    )
+    updated_item = next(i for i in updated.items if i.id == item.id)
+    assert updated_item.benefit_type == BenefitType.COURTESY
+    assert order_totals.item_charged_amount(updated_item) == Decimal("0.00")
+
+
+def test_beneficio_isolamento_multi_tenant(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_three_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    item = next(i for i in order.items if i.price == Decimal("260.00"))
+
+    other_org_id = uuid.uuid4()
+    with SessionLocal() as other_session:
+        other_session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(other_org_id)})
+        other_session.add(Organization(id=other_org_id, name="Outra org", slug=f"outra-{other_org_id.hex[:8]}"))
+        other_session.flush()
+        other_actor = _actor(other_session, other_org_id)
+
+        with pytest.raises(NotFoundError):
+            orders.update_order_item_benefit(
+                other_session, other_actor, order.id, item.id,
+                OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("100.00")),
+            )
+        other_session.rollback()

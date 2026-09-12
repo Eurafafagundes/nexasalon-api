@@ -85,6 +85,7 @@ from nexasalon_api.schemas.order import (
     OrderCancel,
     OrderClose,
     OrderConsumptionCorrection,
+    OrderItemBenefitUpdate,
     OrderItemUpdate,
     OrderObservationUpdate,
     OrderProductItemCreate,
@@ -380,6 +381,58 @@ def update_order_item(
 # Nome anterior, mantido como alias — nenhuma rota nem teste externo
 # precisa saber que foi renomeado.
 update_item_price = update_order_item
+
+
+def update_order_item_benefit(
+    session: Session, actor: ActorContext, order_id: uuid.UUID, item_id: uuid.UUID, data: OrderItemBenefitUpdate
+) -> Order:
+    """Aplica ou limpa um benefício (Cartão Fidelidade/Cortesia) numa
+    linha de SERVIÇO — endpoint DEDICADO, nunca reaproveita
+    `update_order_item` (o lápis de preço): são ações conceitualmente
+    diferentes (ver docstring de `OrderItemBenefitUpdate`). NUNCA
+    altera `item.price` — o valor econômico do item permanece intocado
+    (base de Faturamento e de comissão, ver `services/orders.py::
+    close_order` e `services/order_totals.py::item_charged_amount`)."""
+    organization_id = actor.organization_id
+    order = _get_order_for_update_or_404(session, organization_id, order_id)
+    if order.status != OrderStatus.OPEN:
+        raise ValidationDomainError("Só é possível aplicar benefício numa linha de comanda aberta.")
+    item = next((i for i in order.items if i.id == item_id), None)
+    if item is None:
+        raise NotFoundError("Item da comanda não encontrado.")
+
+    if data.benefit_amount is not None and data.benefit_amount > item.price:
+        raise ValidationDomainError(
+            "O valor do benefício não pode ser maior que o valor do serviço."
+        )
+
+    old_type = item.benefit_type.value if item.benefit_type is not None else None
+    old_amount = str(item.benefit_amount) if item.benefit_amount is not None else None
+    if data.benefit_type == item.benefit_type and data.benefit_amount == item.benefit_amount:
+        return _reload(session, organization_id, order_id)  # nada mudou — sem auditoria redundante.
+
+    item.benefit_type = data.benefit_type
+    item.benefit_amount = data.benefit_amount
+    session.flush()
+
+    change_type = "benefit_applied" if data.benefit_type is not None else "benefit_cleared"
+    audit_log_repo.create(
+        session,
+        organization_id=organization_id,
+        user_id=actor.user_id,
+        entity_type="order_item",
+        entity_id=item.id,
+        action=AuditAction.UPDATE,
+        old_values={"benefit_type": old_type, "benefit_amount": old_amount},
+        new_values={
+            "benefit_type": data.benefit_type.value if data.benefit_type is not None else None,
+            "benefit_amount": str(data.benefit_amount) if data.benefit_amount is not None else None,
+            "change_type": change_type,
+            "order_id": str(order_id),
+            "price_at_application": str(item.price),
+        },
+    )
+    return _reload(session, organization_id, order_id)
 
 
 def update_observation(
@@ -862,7 +915,13 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
     cash_register_service.assert_operational_prerequisites(session, actor, order.branch_id, purpose="payment")
 
     order_totals_breakdown = order_totals.order_total_breakdown(order)
-    total = order_totals_breakdown.total
+    total = order_totals_breakdown.total  # econômico — nunca usado pra decidir quanto pagar, só pro AuditLog abaixo.
+    # Etapa "Benefício por Item" — "quanto falta pagar" é `amount_due`
+    # (soma de `price - benefit_amount` de cada item + produtos),
+    # NUNCA `total` (que é só o valor econômico/vendido, intocado por
+    # benefício — base de Faturamento). Uma comanda com benefício
+    # cobrindo tudo tem `amount_due == 0` mesmo com `total > 0`.
+    amount_due = order_totals.order_charged_total(order)
     # Etapa "Overpayment" — enquanto o Nexa não modela troco/crédito/
     # estorno, nenhum lançamento pode ultrapassar o SALDO da comanda no
     # momento em que é aplicado (nunca só a soma agregada no final —
@@ -871,16 +930,17 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
     # `data.payments` é processada em ORDEM (a mesma semântica de fila
     # que `close_orders_consolidated` já usa pra dividir entre
     # comandas) — cada entrada consome do MESMO saldo que a anterior
-    # deixou. Uma comanda com total 0 fecha com `payments=[]` (saldo
-    # nunca fica positivo, loop nem executa).
-    saldo = total
+    # deixou. Uma comanda com `amount_due <= 0` (total genuinamente 0,
+    # OU benefício cobrindo tudo) fecha com `payments=[]` (saldo nunca
+    # fica positivo, loop nem executa).
+    saldo = amount_due
     for payment_in in data.payments:
         if payment_in.amount > saldo:
             raise ValidationDomainError("O valor do pagamento não pode ser maior que o saldo da comanda.")
         saldo -= payment_in.amount
     if saldo > 0:
         raise ValidationDomainError(
-            f"Valor pago (R$ {total - saldo}) é menor que o total da comanda (R$ {total})."
+            f"Valor pago (R$ {amount_due - saldo}) é menor que o total da comanda (R$ {amount_due})."
         )
 
     # Valida TODOS os caixas informados antes de criar qualquer
@@ -1003,9 +1063,15 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
         action=AuditAction.UPDATE,
         old_values={"status": "open"},
         new_values={
-            # Chegar aqui só é possível com `saldo == 0` (ver checagem
-            # acima) — total é sempre o valor efetivamente pago.
-            "status": "closed", "change_type": "close_order", "paid_total": str(total),
+            # `total` = valor econômico/vendido (nunca reduzido por
+            # benefício); `amount_due` = o que de fato precisava ser
+            # pago (chegar aqui só é possível com `saldo == 0`, então
+            # `amount_due` é sempre o valor efetivamente pago);
+            # `benefit_total` = diferença entre os dois, só pra deixar
+            # explícito no registro de auditoria que benefício não é a
+            # mesma coisa que "pagamento menor por erro/desconto".
+            "status": "closed", "change_type": "close_order",
+            "total": str(total), "amount_due": str(amount_due), "benefit_total": str(total - amount_due),
             "services_total": str(order_totals_breakdown.services_total),
             "products_total": str(order_totals_breakdown.products_total),
         },
@@ -1073,7 +1139,13 @@ def close_orders_consolidated(
 
     orders_by_number = sorted(orders, key=lambda o: o.order_number)
 
-    totals: dict[uuid.UUID, Decimal] = {order.id: order_totals.order_total(order) for order in orders_by_number}
+    # Etapa "Benefício por Item" — `order_charged_total` (não
+    # `order_total`), mesmo raciocínio de `close_order`: "quanto falta
+    # pagar" é o valor pós-benefício, nunca o valor econômico. Uma
+    # comanda do lote com benefício cobrindo tudo consome 0 da fila.
+    totals: dict[uuid.UUID, Decimal] = {
+        order.id: order_totals.order_charged_total(order) for order in orders_by_number
+    }
     grand_total = sum(totals.values(), Decimal("0"))
 
     paid_total = sum((p.amount for p in data.payments), Decimal("0"))

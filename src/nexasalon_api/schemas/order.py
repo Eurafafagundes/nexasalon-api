@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from nexasalon_api.core.client_privacy import mask_receipt_contact
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import (
+    BenefitType,
     CardBrand,
     OrderProductItemKind,
     OrderStatus,
@@ -102,6 +103,30 @@ class OrderItemUpdate(BaseModel):
 # (`PATCH /orders/{id}/items/{item_id}` aceitando `{"price": ...}`)
 # nunca mudou, `duration_minutes` é aditivo.
 OrderItemPriceUpdate = OrderItemUpdate
+
+
+class OrderItemBenefitUpdate(BaseModel):
+    """`PATCH /orders/{id}/items/{item_id}/benefit` — endpoint
+    DEDICADO, nunca reaproveita `OrderItemUpdate` (o lápis de preço):
+    são ações conceitualmente diferentes. Editar `price` é uma
+    alteração comercial real do valor do item (ex.: negociou R$230 em
+    vez de R$260 de catálogo). Aplicar um benefício NUNCA toca em
+    `price` — reduz o valor cobrado preservando o valor econômico
+    (base de Faturamento e comissão), ver `services/order_totals.py::
+    item_charged_amount`.
+
+    `benefit_type=None` limpa o benefício (os dois campos voltam a
+    NULL) — os dois vêm juntos: ou os dois `None` (limpar), ou os dois
+    preenchidos (aplicar)."""
+
+    benefit_type: BenefitType | None = None
+    benefit_amount: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+
+    @model_validator(mode="after")
+    def _check_both_or_neither(self) -> "OrderItemBenefitUpdate":
+        if (self.benefit_type is None) != (self.benefit_amount is None):
+            raise ValueError("Informe benefit_type e benefit_amount juntos, ou nenhum dos dois (pra limpar).")
+        return self
 
 
 class PaymentCreate(BaseModel):
@@ -282,8 +307,36 @@ class OrderItemRead(BaseModel):
     price: Decimal
     service_name: str
     professional_name: str
+    # Etapa "Benefício por Item" — `price` acima NUNCA muda por causa
+    # de benefício (continua o valor econômico/base de comissão).
+    # `benefit_type`/`benefit_amount` são `None` quando não há
+    # benefício aplicado. `charged_amount` é DERIVADO (nunca no
+    # frontend): `price - (benefit_amount or 0)`, ver
+    # `services/order_totals.py::item_charged_amount`.
+    benefit_type: BenefitType | None
+    benefit_amount: Decimal | None
+    charged_amount: Decimal
     created_at: datetime
     updated_at: datetime
+
+    @classmethod
+    def from_item(cls, item) -> "OrderItemRead":
+        return cls(
+            id=item.id,
+            order_id=item.order_id,
+            appointment_item_id=item.appointment_item_id,
+            service_id=item.service_id,
+            professional_id=item.professional_id,
+            duration_minutes=item.duration_minutes,
+            price=item.price,
+            service_name=item.service_name,
+            professional_name=item.professional_name,
+            benefit_type=item.benefit_type,
+            benefit_amount=item.benefit_amount,
+            charged_amount=order_totals.item_charged_amount(item),
+            created_at=item.created_at,
+            updated_at=item.updated_at,
+        )
 
 
 class PaymentRead(BaseModel):
@@ -346,6 +399,15 @@ class OrderRead(BaseModel):
     status: OrderStatus
     subtotal: Decimal
     total: Decimal
+    # Etapa "Benefício por Item" — `total`/`subtotal` acima continuam
+    # 100% econômicos (nunca reduzidos por benefício — é a base de
+    # Faturamento). `amount_due` é o valor que REALMENTE falta pagar
+    # pra fechar (ver `services/order_totals.py::order_charged_total`)
+    # — pode ser menor que `total` quando algum item tem benefício.
+    # `total_benefit_amount` é só a soma dos benefícios pra exibição
+    # (0 quando nenhum item tem benefício — nunca aparece como "—").
+    amount_due: Decimal
+    total_benefit_amount: Decimal
     items: list[OrderItemRead]
     product_items: list[OrderProductItemRead]
     payments: list[PaymentRead]
@@ -363,6 +425,9 @@ class OrderRead(BaseModel):
     @classmethod
     def from_order(cls, order: Order) -> "OrderRead":
         subtotal = order_totals.order_total(order)
+        total_benefit_amount = sum(
+            (item.benefit_amount for item in order.items if item.benefit_amount is not None), Decimal("0")
+        )
         return cls(
             id=order.id,
             organization_id=order.organization_id,
@@ -373,7 +438,9 @@ class OrderRead(BaseModel):
             status=order.status,
             subtotal=subtotal,
             total=subtotal,
-            items=[OrderItemRead.model_validate(item) for item in order.items],
+            amount_due=order_totals.order_charged_total(order),
+            total_benefit_amount=total_benefit_amount,
+            items=[OrderItemRead.from_item(item) for item in order.items],
             product_items=[OrderProductItemRead.model_validate(item) for item in order.product_items],
             payments=[PaymentRead.model_validate(payment) for payment in order.payments],
             observation=order.observation,

@@ -167,6 +167,57 @@ def test_permissao_orders_edit_price_e_exigida(client_as, org_a_actor):
     assert resp.status_code == 403
 
 
+def test_beneficio_fidelidade_via_api_reduz_valor_a_cobrar_preserva_preco_economico(client_as, org_a_actor):
+    """Cenário completo via HTTP real: aplicar Cartão Fidelidade num
+    item não altera `price` (valor econômico), reduz `amount_due`
+    (valor a cobrar), e a comanda fecha com `payments=[]`."""
+    c = client_as(org_a_actor)
+    appt = _setup_finished_appointment(c)  # 1 serviço, preço "150.00" (ver _setup_finished_appointment).
+    _open_register_for(c, appt["branch_id"])
+    order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
+    item_id = order["items"][0]["id"]
+    assert order["total"] == "150.00"
+    assert order["amount_due"] == "150.00"
+
+    applied = c.patch(
+        f"/api/v1/orders/{order['id']}/items/{item_id}/benefit",
+        json={"benefit_type": "loyalty", "benefit_amount": "150.00"},
+    )
+    assert applied.status_code == 200, applied.text
+    body = applied.json()
+    assert body["total"] == "150.00"  # valor econômico intocado.
+    assert body["amount_due"] == "0.00"  # nada a cobrar.
+    assert body["total_benefit_amount"] == "150.00"
+    item = body["items"][0]
+    assert item["price"] == "150.00"  # NUNCA zerado.
+    assert item["benefit_type"] == "loyalty"
+    assert item["benefit_amount"] == "150.00"
+    assert item["charged_amount"] == "0.00"
+
+    closed = c.post(f"/api/v1/orders/{order['id']}/close", json={"payments": []})
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["status"] == "closed"
+    assert closed.json()["payments"] == []
+
+    register_id = c.get(f"/api/v1/orders/{order['id']}").json()  # sanity: comanda continua consultável fechada.
+    assert register_id["status"] == "closed"
+
+
+def test_permissao_orders_edit_price_e_exigida_para_beneficio(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    appt = _setup_finished_appointment(c)
+    _open_register_for(c, appt["branch_id"])
+    order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
+    item_id = order["items"][0]["id"]
+
+    restricted = _restricted_actor(org_a_actor, permissions={"orders.view", "orders.manage"})
+    resp = client_as(restricted).patch(
+        f"/api/v1/orders/{order['id']}/items/{item_id}/benefit",
+        json={"benefit_type": "loyalty", "benefit_amount": "1.00"},
+    )
+    assert resp.status_code == 403
+
+
 def test_role_generico_sem_payments_register_e_bloqueado_no_fechamento(client_as, org_a_actor):
     """Checagem básica da dependency `require_permission("payments.
     register")` na rota — `orders.view` sozinho (sem `payments.

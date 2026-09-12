@@ -284,6 +284,14 @@ class _OrderRow:
     closed_at: datetime
     total: Decimal  # FATURAMENTO desta comanda — soma de `OrderItem.price`, nunca `Payment`.
     received: Decimal  # RECEBIDO desta comanda — soma de `Payment.amount`, granularidade separada (ver docstring do módulo).
+    # BENEFÍCIOS CONCEDIDOS desta comanda — soma de `OrderItem.
+    # benefit_amount` (Cartão Fidelidade + Cortesia; Voucher/Permuta NÃO
+    # entram aqui, continuam Payment real). Sempre <= `total` por
+    # construção (CheckConstraint no banco). Granularidade separada de
+    # `received` — nunca a mesma soma: um item pode ter benefício SEM
+    # nenhum Payment relacionado (a diferença é dinheiro que nunca
+    # existiu, não dinheiro que entrou e saiu).
+    benefit: Decimal
 
 
 @dataclass
@@ -364,14 +372,38 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
         )
         .group_by(OrderProductItem.order_id)
     )
+    # BENEFÍCIOS CONCEDIDOS (Etapa "Resultado Disponível — Benefícios") —
+    # MESMOS filtros de organização/unidade/status/data de `services_stmt`
+    # acima (mesma população de comandas válidas, nunca uma query
+    # solta) — soma `OrderItem.benefit_amount` (histórico já
+    # snapshotado no fechamento, nunca recalculado a partir do preço
+    # atual do catálogo). `SUM` ignora NULL nativamente (itens sem
+    # benefício não contribuem, sem precisar de `WHERE` extra);
+    # `coalesce` só cobre o caso de a comanda não ter NENHUM item com
+    # benefício (grupo vazio).
+    benefits_stmt = (
+        select(OrderItem.order_id, func.coalesce(func.sum(OrderItem.benefit_amount), 0))
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Order.status == OrderStatus.CLOSED,
+            Order.closed_at >= date_from,
+            Order.closed_at < date_to,
+        )
+        .group_by(OrderItem.order_id)
+    )
     if filters.branch_id is not None:
         services_stmt = services_stmt.where(Order.branch_id == filters.branch_id)
         products_stmt = products_stmt.where(Order.branch_id == filters.branch_id)
+        benefits_stmt = benefits_stmt.where(Order.branch_id == filters.branch_id)
     services_by_order: dict[uuid.UUID, Decimal] = {
         row[0]: Decimal(row[1]) for row in session.execute(services_stmt).all()
     }
     products_by_order: dict[uuid.UUID, Decimal] = {
         row[0]: Decimal(row[1]) for row in session.execute(products_stmt).all()
+    }
+    benefits_by_order: dict[uuid.UUID, Decimal] = {
+        row[0]: Decimal(row[1]) for row in session.execute(benefits_stmt).all()
     }
 
     # RECEBIDO por comanda — query SEPARADA (mesmo raciocínio acima).
@@ -399,6 +431,7 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
             order_id=row[0], client_id=row[1], closed_at=row[2],
             total=services_by_order.get(row[0], Decimal("0")) + products_by_order.get(row[0], Decimal("0")),
             received=received_by_order.get(row[0], Decimal("0")),
+            benefit=benefits_by_order.get(row[0], Decimal("0")),
         )
         for row in session.execute(base_order_stmt).all()
     ]
@@ -604,6 +637,16 @@ def _received(data: _PeriodData) -> Decimal:
     por comanda aparecem em `_revenue_reconciliation_totals`, nunca
     escondidas aqui."""
     return sum((row.received for row in data.orders), Decimal("0"))
+
+
+def _benefits_granted(data: _PeriodData) -> Decimal:
+    """BENEFÍCIOS CONCEDIDOS — soma de `OrderItem.benefit_amount`
+    (Cartão Fidelidade + Cortesia) das mesmas comandas fechadas do
+    período (MESMA população de `_revenue`/`_received`, populada em
+    `_fetch_period_data`). Usado SÓ pelo painel "Resultado disponível"
+    (`_available_result`) — nunca redefine `_revenue`
+    (Faturamento Bruto continua o valor econômico cheio, intocado)."""
+    return sum((row.benefit for row in data.orders), Decimal("0"))
 
 
 def _revenue_reconciliation_totals(data: _PeriodData) -> tuple[Decimal, Decimal]:
@@ -1140,6 +1183,7 @@ def _empty_available_result() -> AvailableResultSummary:
     return AvailableResultSummary(
         available=False,
         gross_revenue=None,
+        benefits_granted=None,
         taxes_provisioned=None,
         tax_breakdown=[],
         has_multiple_tax_rates=False,
@@ -1252,8 +1296,18 @@ def _available_result(
         },
     )
 
+    # Etapa "Resultado Disponível — Benefícios": Cartão Fidelidade e
+    # Cortesia reduzem o valor DISPONÍVEL (esse dinheiro não entrou),
+    # mesmo o Faturamento Bruto (`gross_revenue`, acima) continuando
+    # intocado — nunca redefine `kpis.revenue`/`_revenue()`. Mesma
+    # população de comandas de `data` (já filtrada por organização/
+    # unidade/período/status=CLOSED em `_fetch_period_data`), snapshot
+    # histórico (`OrderItem.benefit_amount`), nunca preço de catálogo.
+    benefits_granted = _benefits_granted(data)
+
     available_result = (
         gross_revenue
+        - benefits_granted
         - taxes_provisioned
         - commissions
         - known_fee_total
@@ -1268,6 +1322,7 @@ def _available_result(
     return AvailableResultSummary(
         available=True,
         gross_revenue=gross_revenue,
+        benefits_granted=benefits_granted,
         taxes_provisioned=taxes_provisioned,
         tax_breakdown=tax_breakdown,
         has_multiple_tax_rates=has_multiple_tax_rates,

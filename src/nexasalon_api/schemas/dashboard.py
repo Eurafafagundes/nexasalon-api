@@ -329,7 +329,17 @@ class AvailableResultSummary(BaseModel):
     uma fonte de verdade já existente:
 
       - `gross_revenue`: idêntico a `kpis.revenue.value` (nunca uma
-        segunda soma de faturamento).
+        segunda soma de faturamento) — continua o valor ECONÔMICO
+        vendido (`OrderItem.price`), nunca reduzido por benefício.
+      - `benefits_granted` (Etapa "Benefício por Item"): soma de
+        `OrderItem.benefit_amount` (Cartão Fidelidade + Cortesia) das
+        mesmas comandas fechadas do período — snapshot histórico,
+        nunca recalculado a partir do preço atual do catálogo. Reduz
+        o Resultado Disponível porque esse valor nunca virou dinheiro
+        (nunca gera `Payment`/entrada de caixa), mas NÃO reduz
+        `gross_revenue`/`kpis.revenue` (Faturamento Bruto continua
+        contando o valor econômico cheio). Voucher/Permuta NUNCA
+        entram aqui — continuam `Payment` real, sem nenhuma redução.
       - `taxes_provisioned`: PROVISÃO gerencial (faturamento aplicável
         × alíquota vigente EM CADA COMPETÊNCIA tocada pelo período —
         ver `tax_breakdown`) — nunca um lançamento de caixa/pagamento
@@ -371,13 +381,15 @@ class AvailableResultSummary(BaseModel):
         deixado sem categoria) — NUNCA somado a `variable_costs` nem
         `fixed_costs`; o frontend deve avisar quando > 0.
 
-    `available_result = gross_revenue - taxes_provisioned - commissions
-    - payment_fees - variable_costs - fixed_costs - legacy_fixed_costs`.
-    `linked_fixed_payments` não participa da fórmula. `available_percent`
-    é `None` quando `gross_revenue == 0` (nunca divisão por zero)."""
+    `available_result = gross_revenue - benefits_granted -
+    taxes_provisioned - commissions - payment_fees - variable_costs -
+    fixed_costs - legacy_fixed_costs`. `linked_fixed_payments` não
+    participa da fórmula. `available_percent` é `None` quando
+    `gross_revenue == 0` (nunca divisão por zero)."""
 
     available: bool  # False quando o ator não tem permissão de Comissões — todo o resto do payload é None.
     gross_revenue: Decimal | None
+    benefits_granted: Decimal | None
     taxes_provisioned: Decimal | None
     tax_breakdown: list[TaxCompetenceBreakdownRow]
     has_multiple_tax_rates: bool

@@ -51,6 +51,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, TimestampMixin, UUIDPKMixin
 from .enums import (
+    BenefitType,
     CardBrand,
     CommissionStatus,
     CommissionType,
@@ -176,6 +177,17 @@ class OrderItem(Base, UUIDPKMixin, TimestampMixin):
             "commission_settlement_id IS NULL OR commission_status = 'calculated'",
             name="commission_settlement_id_requires_calculated",
         ),
+        # Etapa "Benefício por Item" (migration 0052) — os dois campos
+        # vêm juntos (NULL+NULL = sem benefício, ou ambos preenchidos)
+        # e o valor do benefício nunca pode exceder o valor econômico
+        # do item (`price`) — nunca "cobrar" um benefício maior que o
+        # próprio serviço.
+        CheckConstraint(
+            "(benefit_type IS NULL AND benefit_amount IS NULL) OR "
+            "(benefit_type IS NOT NULL AND benefit_amount IS NOT NULL "
+            "AND benefit_amount >= 0 AND benefit_amount <= price)",
+            name="benefit_requires_type_and_amount_within_price",
+        ),
     )
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
@@ -205,6 +217,20 @@ class OrderItem(Base, UUIDPKMixin, TimestampMixin):
     # no histórico do cliente/Extrato, o que quebraria a auditoria.
     service_name: Mapped[str] = mapped_column(String(255), nullable=False)
     professional_name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # --- Etapa "Benefício por Item" (migration 0052) ---
+    # `price` acima NUNCA é alterado pra representar um benefício —
+    # continua sendo só o valor econômico/comercial do item (base de
+    # Faturamento e de comissão, sempre — ver `services/orders.py::
+    # close_order`, que resolve comissão com `price=item.price`
+    # intocado). O valor efetivamente cobrado do cliente é DERIVADO,
+    # nunca persistido: `price - (benefit_amount or 0)` (ver
+    # `services/order_totals.py::item_charged_amount`). NULLABLE sem
+    # backfill, mesmo raciocínio dos snapshots de comissão/taxa acima —
+    # `OrderItem`s existentes ficam com os dois campos NULL pra sempre
+    # (== "sem benefício", comportamento idêntico ao atual).
+    benefit_type: Mapped[BenefitType | None] = mapped_column(pg_enum(BenefitType, "benefit_type"))
+    benefit_amount: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
 
     # --- Etapa C2 — Comissão por serviço vendido (migration 0036) ---
     # Todas NULLABLE de propósito, sem backfill (mesmo raciocínio do

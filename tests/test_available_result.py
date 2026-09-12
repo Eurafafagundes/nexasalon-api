@@ -28,6 +28,7 @@ from nexasalon_api.models.cash_register import CashMovement, CashRegister
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import (
     AppointmentStatus,
+    BenefitType,
     CashMovementType,
     CashRegisterStatus,
     CommissionStatus,
@@ -140,6 +141,13 @@ def _sale(
     commission_type=None, commission_value=None, commission_amount=None, commission_status=None,
     fee_status=None, fee_percent_snapshot=None, fee_amount_snapshot=None, net_amount_snapshot=None,
     payment_method=PaymentMethod.PIX,
+    # Etapa "Resultado Disponível — Benefícios": `benefit_amount` NUNCA
+    # cria/reduz o `Payment` sozinho — replica exatamente o que
+    # `close_order` faz de verdade: o Payment (se algum) cobre só
+    # `price - benefit_amount` (o que realmente precisava ser pago).
+    # `benefit_amount == price` (benefício integral) não cria NENHUM
+    # Payment — mesmo raciocínio de `payments=[]`.
+    benefit_type=None, benefit_amount=None,
 ) -> Order:
     appt = Appointment(organization_id=org_id, branch_id=branch_id, client_id=client_id, status=AppointmentStatus.PAID)
     session.add(appt)
@@ -162,16 +170,19 @@ def _sale(
             duration_minutes=60, price=price, service_name="Serviço", professional_name="Profissional",
             commission_type_snapshot=commission_type, commission_value_snapshot=commission_value,
             commission_amount_snapshot=commission_amount, commission_status=commission_status,
+            benefit_type=benefit_type, benefit_amount=benefit_amount,
         )
     )
-    session.add(
-        Payment(
-            organization_id=org_id, order_id=order.id, cash_register_id=cash_register_id,
-            method=payment_method, amount=price, created_by_name="Teste",
-            fee_status=fee_status, fee_percent_snapshot=fee_percent_snapshot,
-            fee_amount_snapshot=fee_amount_snapshot, net_amount_snapshot=net_amount_snapshot,
+    amount_due = price - (benefit_amount or Decimal("0"))
+    if amount_due > 0:
+        session.add(
+            Payment(
+                organization_id=org_id, order_id=order.id, cash_register_id=cash_register_id,
+                method=payment_method, amount=amount_due, created_by_name="Teste",
+                fee_status=fee_status, fee_percent_snapshot=fee_percent_snapshot,
+                fee_amount_snapshot=fee_amount_snapshot, net_amount_snapshot=net_amount_snapshot,
+            )
         )
-    )
     session.flush()
     return order
 
@@ -645,3 +656,273 @@ def test_resultado_disponivel_deduz_e_exibe_o_rateio_gerencial_em_periodo_parcia
     ).available_result
     assert hoje_fechado.fixed_costs == Decimal("0")
     assert hoje_fechado.fixed_expense_breakdown == []
+
+
+# ---------------------------------------------------------------------
+# Benefício por Item (Cartão Fidelidade/Cortesia) reduz o Resultado
+# Disponível — nunca o Faturamento Bruto (`gross_revenue`). Fórmula:
+# Bruto - Benefícios - Impostos - Comissões - Taxas - Variáveis - Fixas.
+# ---------------------------------------------------------------------
+
+
+def test_periodo_sem_beneficios_nao_altera_o_resultado_nem_aparece_a_linha(org_session):
+    """Regressão — comportamento IDÊNTICO a antes desta feature existir
+    quando nenhum item tem benefício."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("300.00"),
+    )
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.gross_revenue == Decimal("300.00")
+    assert result.benefits_granted == Decimal("0")
+    assert result.available_result == Decimal("300.00")
+
+
+def test_fidelidade_integral_exemplo_exato_do_pedido(org_session):
+    """Exemplo obrigatório do pedido: Serviço R$260, Fidelidade R$260,
+    Pagamento R$0, Comissão R$52, sem outros custos/impostos ->
+    Resultado Disponível = -R$52 (NUNCA +R$208)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    order = _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("260.00"),
+        commission_type=CommissionType.PERCENTAGE, commission_value=Decimal("20.00"),
+        commission_amount=Decimal("52.00"), commission_status=CommissionStatus.CALCULATED,
+        benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00"),
+    )
+    assert order.payments == []  # nenhum Payment criado — benefício integral.
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.gross_revenue == Decimal("260.00")  # Faturamento Bruto INTOCADO.
+    assert result.benefits_granted == Decimal("260.00")
+    assert result.commissions == Decimal("52.00")  # comissão sobre o valor econômico cheio.
+    assert result.taxes_provisioned == Decimal("0")  # sem alíquota configurada nesta rodada.
+    assert result.available_result == Decimal("-52.00")  # 260 - 260 - 0 - 52 = -52, NUNCA +208.
+
+
+def test_fidelidade_parcial_reduz_so_o_valor_do_beneficio(org_session):
+    """Benefício PARCIAL: preço R$260, Fidelidade cobre só R$180 —
+    cliente paga R$80 de verdade (Payment real), comissão continua
+    sobre os R$260 cheios."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    order = _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("260.00"),
+        commission_type=CommissionType.PERCENTAGE, commission_value=Decimal("20.00"),
+        commission_amount=Decimal("52.00"), commission_status=CommissionStatus.CALCULATED,
+        benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("180.00"),
+    )
+    assert len(order.payments) == 1
+    assert order.payments[0].amount == Decimal("80.00")  # 260 - 180, valor real recebido.
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.gross_revenue == Decimal("260.00")
+    assert result.benefits_granted == Decimal("180.00")
+    assert result.commissions == Decimal("52.00")  # sobre o valor econômico cheio, nunca sobre os 80 recebidos.
+    assert result.available_result == Decimal("28.00")  # 260 - 180 - 52 = 28.
+
+
+def test_cortesia_tambem_reduz_o_resultado_disponivel_igual_a_fidelidade(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("150.00"),
+        benefit_type=BenefitType.COURTESY, benefit_amount=Decimal("150.00"),
+    )
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.benefits_granted == Decimal("150.00")
+    assert result.available_result == Decimal("0.00")  # 150 - 150.
+
+
+def test_fidelidade_e_cortesia_somam_juntas_em_beneficios_concedidos(org_session):
+    """Os dois tipos de benefício somam pro MESMO total — o card não
+    distingue Fidelidade de Cortesia na linha agregada."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("260.00"),
+        benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00"),
+    )
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 12), price=Decimal("150.00"),
+        benefit_type=BenefitType.COURTESY, benefit_amount=Decimal("150.00"),
+    )
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.gross_revenue == Decimal("410.00")
+    assert result.benefits_granted == Decimal("410.00")  # 260 (Fidelidade) + 150 (Cortesia).
+
+
+def test_comanda_mista_um_item_com_beneficio_outro_pago_normalmente(org_session):
+    """UMA comanda com 2 itens: Manutenção R$260 (Fidelidade integral) +
+    Corte R$100 (Pix real) — mesmo cenário do pedido anterior (Etapa
+    "Benefício por Item"), agora verificado no agregado do Dashboard."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service_manutencao = _service(session, org_id, name="Manutenção")
+    service_corte = _service(session, org_id, name="Corte")
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    closed_at = _at(_MONTH_0, 10)
+    appt = Appointment(organization_id=org_id, branch_id=branch.id, client_id=client.id, status=AppointmentStatus.PAID)
+    session.add(appt)
+    session.flush()
+    order = Order(
+        organization_id=org_id, order_number=_next_order_number(), appointment_id=appt.id,
+        branch_id=branch.id, client_id=client.id, status=OrderStatus.CLOSED, closed_at=closed_at,
+    )
+    session.add(order)
+    session.flush()
+    session.add_all([
+        OrderItem(
+            organization_id=org_id, order_id=order.id, service_id=service_manutencao.id,
+            professional_id=professional.id, duration_minutes=60, price=Decimal("260.00"),
+            service_name="Manutenção", professional_name="Profissional",
+            commission_type_snapshot=CommissionType.PERCENTAGE, commission_value_snapshot=Decimal("20.00"),
+            commission_amount_snapshot=Decimal("52.00"), commission_status=CommissionStatus.CALCULATED,
+            benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00"),
+        ),
+        OrderItem(
+            organization_id=org_id, order_id=order.id, service_id=service_corte.id,
+            professional_id=professional.id, duration_minutes=30, price=Decimal("100.00"),
+            service_name="Corte", professional_name="Profissional",
+            commission_type_snapshot=CommissionType.PERCENTAGE, commission_value_snapshot=Decimal("20.00"),
+            commission_amount_snapshot=Decimal("20.00"), commission_status=CommissionStatus.CALCULATED,
+        ),
+    ])
+    session.add(
+        Payment(
+            organization_id=org_id, order_id=order.id, cash_register_id=register.id,
+            method=PaymentMethod.PIX, amount=Decimal("100.00"), created_by_name="Teste",
+        )
+    )
+    session.flush()
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.gross_revenue == Decimal("360.00")  # 260 + 100, econômico cheio.
+    assert result.benefits_granted == Decimal("260.00")  # só a Manutenção.
+    assert result.commissions == Decimal("72.00")  # 52 + 20, cada item na sua base.
+    assert result.available_result == Decimal("28.00")  # 360 - 260 - 72 = 28.
+
+
+def test_beneficio_fora_do_periodo_consultado_nao_entra_no_resultado(org_session):
+    """Mesmo filtro temporal de `_revenue`/`_received` — um benefício
+    de uma comanda fechada FORA do período (mês seguinte) nunca vaza
+    pro cálculo do período consultado."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("300.00"),  # sem benefício, dentro do período.
+    )
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_1, 5), price=Decimal("260.00"),  # com benefício, FORA do período consultado.
+        benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00"),
+    )
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.gross_revenue == Decimal("300.00")  # só a venda de dentro do período.
+    assert result.benefits_granted == Decimal("0")  # o benefício de fora não vaza pra cá.
+    assert result.available_result == Decimal("300.00")
+
+
+def test_beneficio_respeita_isolamento_por_unidade(org_session):
+    """Mesmo raciocínio de filtro — benefício de OUTRA unidade não
+    entra quando o painel filtra por `branch_id`."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch_a = _branch(session, org_id, "Filial A")
+    branch_b = _branch(session, org_id, "Filial B")
+    client = _client(session, org_id)
+    professional_a = _professional(session, org_id, branch_a.id)
+    professional_b = _professional(session, org_id, branch_b.id)
+    service = _service(session, org_id)
+    register_a = _cash_register(session, org_id, branch_a.id, actor.user_id)
+    register_b = _cash_register(session, org_id, branch_b.id, actor.user_id)
+
+    _sale(
+        session, org_id, branch_a.id, client.id, professional_a.id, service.id, register_a.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("200.00"),
+    )
+    _sale(
+        session, org_id, branch_b.id, client.id, professional_b.id, service.id, register_b.id,
+        closed_at=_at(_MONTH_0, 11), price=Decimal("260.00"),
+        benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("260.00"),
+    )
+
+    result_a = dashboard_service.get_overview(
+        session, actor, branch_id=branch_a.id, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result_a.gross_revenue == Decimal("200.00")
+    assert result_a.benefits_granted == Decimal("0")  # benefício é da Filial B, nunca vaza pra A.

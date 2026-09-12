@@ -12,6 +12,7 @@ import os
 import subprocess
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import psycopg
 import pgserver
@@ -27,7 +28,10 @@ try:
 except Exception:
     pass  # já existe de uma execução anterior que não limpou
 
-_ADMIN_URL = f"postgresql+psycopg://postgres:@/nexasalon_test?host={_PGDATA}"
+_server_uri = urlsplit(_srv.get_uri())
+_host = _server_uri.hostname or "127.0.0.1"
+_port = _server_uri.port or 5432
+_ADMIN_URL = f"postgresql+psycopg://postgres:@{_host}:{_port}/nexasalon_test"
 
 # migrations rodam com o usuário dono do schema (postgres), nunca com o
 # role restrito que a API usa — mesma separação de papéis do README.
@@ -43,7 +47,7 @@ _result = subprocess.run(
 if _result.returncode != 0:
     raise RuntimeError(f"Falha ao rodar migrations no banco de teste:\n{_result.stdout}\n{_result.stderr}")
 
-with psycopg.connect(f"host={_PGDATA} dbname=nexasalon_test user=postgres", autocommit=True) as _conn:
+with psycopg.connect(host=_host, port=_port, dbname="nexasalon_test", user="postgres", autocommit=True) as _conn:
     with _conn.cursor() as _cur:
         # idempotente: se o role já existir de uma execução anterior que
         # não limpou o .pgdata_test, revoga antes de tentar recriar.
@@ -57,7 +61,7 @@ with psycopg.connect(f"host={_PGDATA} dbname=nexasalon_test user=postgres", auto
         _cur.execute("GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO nexasalon_app")
 
 os.environ["NEXASALON_DATABASE_URL"] = (
-    f"postgresql+psycopg://nexasalon_app:test@/nexasalon_test?host={_PGDATA}"
+    f"postgresql+psycopg://nexasalon_app:test@{_host}:{_port}/nexasalon_test"
 )
 os.environ["NEXASALON_ENVIRONMENT"] = "test"
 os.environ["NEXASALON_DEV_AUTH_ENABLED"] = "true"

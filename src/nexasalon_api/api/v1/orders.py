@@ -13,6 +13,7 @@ from nexasalon_api.schemas.order import (
     OrderClose,
     OrderConsumptionCorrection,
     OrderCreate,
+    OrderItemBenefitUpdate,
     OrderItemUpdate,
     OrderObservationUpdate,
     OrderProductItemCreate,
@@ -158,6 +159,22 @@ def update_order_item(
     actor: ActorContext = Depends(_edit_price),
 ) -> OrderRead:
     order = orders_service.update_order_item(session, actor, order_id, item_id, payload)
+    return OrderRead.from_order(order)
+
+
+@router.patch(
+    "/{order_id}/items/{item_id}/benefit",
+    response_model=OrderRead,
+    summary="Aplicar ou limpar benefício (Cartão Fidelidade/Cortesia) numa linha de serviço da comanda",
+)
+def update_order_item_benefit(
+    order_id: uuid.UUID,
+    item_id: uuid.UUID,
+    payload: OrderItemBenefitUpdate,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_edit_price),
+) -> OrderRead:
+    order = orders_service.update_order_item_benefit(session, actor, order_id, item_id, payload)
     return OrderRead.from_order(order)
 
 
