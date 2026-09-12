@@ -281,3 +281,23 @@ def test_comprovante_isolamento_multi_tenant(client_as, org_a_actor, org_b_actor
     c_b = client_as(org_b_actor)
     resp = c_b.get(f"/api/v1/orders/{order['id']}/receipt")
     assert resp.status_code == 404
+
+
+def test_comprovante_exclui_revertidos_apos_reabrir_e_fechar(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    appt, branch, _, _ = _setup_finished_appointment(c)
+    register = c.post("/api/v1/cash-registers", json={"branch_id": branch["id"], "initial_amount": "0"}).json()
+    order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
+    url = f"/api/v1/orders/{order['id']}"
+    payload = {"payments": [{"method": "pix", "amount": "310.00", "cash_register_id": register["id"]}]}
+    assert c.post(url + "/close", json=payload).status_code == 200
+    reopened = c.post(url + "/reopen", json={"reason": "Corrigir forma de pagamento"})
+    assert reopened.status_code == 200, reopened.text
+    assert reopened.json()["payments"][0]["reversed_at"] is not None
+    assert c.post(url + "/close", json=payload).status_code == 200
+    history = c.get(url).json()["payments"]
+    assert len(history) == 2
+    receipt = c.get(url + "/receipt")
+    assert receipt.status_code == 200
+    assert len(receipt.json()["payments"]) == 1
+    assert receipt.json()["payments"][0]["amount"] == "310.00"

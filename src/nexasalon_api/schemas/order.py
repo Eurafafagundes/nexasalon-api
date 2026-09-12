@@ -689,7 +689,7 @@ class OrderReceiptRead(BaseModel):
                 ReceiptPayment(
                     method=p.method, card_brand=p.card_brand, installments=p.installments, amount=p.amount
                 )
-                for p in order.payments
+                for p in order.payments if p.reversed_at is None
             ],
             subtotal=subtotal,
             total=subtotal,
