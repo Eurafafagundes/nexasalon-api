@@ -251,19 +251,29 @@ class RevenueFeeSummary(BaseModel):
     `Payment` — por isso são calculadas a partir de uma população
     diferente (pagamentos, não itens), sem redefinir o que é Bruto.
 
-    `known_net_revenue` = `gross_revenue - known_fee_total`, SEMPRE
-    calculável (nunca `None`) — mas só pode ser apresentado como
-    "Faturamento Líquido" definitivo quando `has_unconfigured_fee` é
-    `False`. Quando `has_unconfigured_fee` é `True`, este mesmo número
-    ainda é exibível, só que como "Líquido CONHECIDO" (rótulo
-    diferente, nunca fingindo ser o líquido final) — exatamente porque
-    ele deliberadamente NÃO desconta nenhuma taxa dos pagamentos em
-    `unconfigured_card_amount` (a taxa real deles é desconhecida, nunca
-    zero); o frontend é responsável por mostrar `unconfigured_card_amount`
-    junto sempre que `has_unconfigured_fee` for `True`, pra nunca deixar
-    a impressão de que R$X é definitivo. Mesmo raciocínio do item do
-    pedido: "Líquido conhecido: R$9.800" + "R$2.000 aguardando
-    configuração de taxa" (nunca só "Líquido: R$9.800")."""
+    `known_net_revenue` = `gross_revenue - benefits_granted -
+    known_fee_total` (correção de bug confirmado em produção — Etapa
+    "Benefício por Item"): `benefits_granted` é a MESMA soma de
+    `OrderItem.benefit_amount` (Fidelidade + Cortesia) já usada por
+    `AvailableResultSummary.benefits_granted`, subtraída aqui como termo
+    INDEPENDENTE, nunca misturado com `known_fee_total`/
+    `unconfigured_card_amount`/`has_unconfigured_fee` (esses 3
+    continuam vindo exclusivamente de `Payment` reais). Sem isso, uma
+    comanda 100% coberta por benefício (`payments=[]`) mostrava
+    `known_net_revenue == gross_revenue`, como se o valor tivesse sido
+    efetivamente recebido. SEMPRE calculável (nunca `None`) — mas só
+    pode ser apresentado como "Faturamento Líquido" definitivo quando
+    `has_unconfigured_fee` é `False`. Quando `has_unconfigured_fee` é
+    `True`, este mesmo número ainda é exibível, só que como "Líquido
+    CONHECIDO" (rótulo diferente, nunca fingindo ser o líquido final) —
+    exatamente porque ele deliberadamente NÃO desconta nenhuma taxa dos
+    pagamentos em `unconfigured_card_amount` (a taxa real deles é
+    desconhecida, nunca zero); o frontend é responsável por mostrar
+    `unconfigured_card_amount` junto sempre que `has_unconfigured_fee`
+    for `True`, pra nunca deixar a impressão de que R$X é definitivo.
+    Mesmo raciocínio do item do pedido: "Líquido conhecido: R$9.800" +
+    "R$2.000 aguardando configuração de taxa" (nunca só "Líquido:
+    R$9.800")."""
 
     gross_revenue: Decimal
     known_fee_total: Decimal

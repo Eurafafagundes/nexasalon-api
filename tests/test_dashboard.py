@@ -30,6 +30,7 @@ from nexasalon_api.models.cash_register import CashRegister
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import (
     AppointmentStatus,
+    BenefitType,
     CardBrand,
     CashRegisterStatus,
     OrderStatus,
@@ -154,6 +155,10 @@ def _closed_order(
                 professional_id=it["professional_id"], duration_minutes=it.get("duration_minutes", 60),
                 price=it["price"], service_name=it.get("service_name", "Serviço"),
                 professional_name=it.get("professional_name", "Profissional"),
+                # Etapa "Benefício por Item" — Fidelidade/Cortesia, opcional
+                # (default None+None = sem benefício, comportamento de
+                # sempre pros testes que já existiam antes desta chave).
+                benefit_type=it.get("benefit_type"), benefit_amount=it.get("benefit_amount"),
             )
         )
     for p in payments:
@@ -1529,6 +1534,227 @@ def test_fee_summary_isolamento_entre_organizacoes(org_session):
     summary_a = _overview(session, actor_a).revenue_fee_summary
     assert summary_a.gross_revenue == Decimal("500")
     assert summary_a.has_unconfigured_fee is True
+
+
+# ---------------------------------------------------------------------------
+# Faturamento Líquido x Benefícios (bug confirmado em produção — comanda
+# 100% coberta por Fidelidade/Cortesia mostrava Líquido == Bruto, como se
+# o valor tivesse sido recebido). `known_net_revenue = gross_revenue -
+# benefits_granted - known_fee_total`; `benefits_granted` nunca se mistura
+# com `known_fee_total`/`unconfigured_card_amount`/`has_unconfigured_fee`
+# (esses três continuam vindo só de `Payment` reais).
+# ---------------------------------------------------------------------------
+
+
+def test_fee_summary_beneficio_integral_liquido_vira_zero_nunca_igual_ao_bruto(org_session):
+    """Cenário A do bug reportado: Bruto=130, Fidelidade=130, sem
+    Payment nenhum (amount_due=0) — Líquido tinha que ser 0, nunca 130.
+
+    `start_at` do agendamento deliberadamente em junho/2026, FORA da
+    janela consultada (agosto) — limitação conhecida e pré-existente do
+    Postgres embarcado do `pgserver` (tzdata incompleto: o heatmap do
+    Dashboard lança "America/Sao_Paulo not recognized" quando processa
+    algum `Appointment.starts_at` dentro do período consultado; nunca
+    acontece com `Order.closed_at`, que é o único campo que importa
+    pra Faturamento/Líquido — mesma técnica já usada em
+    `tests/test_order_reopen.py`)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 6, 1, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{
+            "service_id": service_id, "professional_id": prof.id, "price": Decimal("130.00"),
+            "benefit_type": BenefitType.LOYALTY, "benefit_amount": Decimal("130.00"),
+        }],
+        payments=[],
+        cash_register_id=None,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("130.00")  # Faturamento Bruto continua o valor econômico — intocado.
+    assert summary.known_fee_total == Decimal("0")
+    assert summary.known_net_revenue == Decimal("0")  # NUNCA 130 — nenhum dinheiro foi recebido.
+    assert summary.unconfigured_card_amount == Decimal("0")
+    assert summary.has_unconfigured_fee is False
+
+
+def test_fee_summary_beneficio_parcial_sem_taxa(org_session):
+    """Cenário B: Bruto=260, Cortesia=100, restante pago em Pix (sem
+    taxa) — Líquido = 260 - 100 - 0 = 160."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 6, 1, 9))  # fora da janela consultada (ver comentário do Cenário A) — evita bug de tzdata no heatmap.
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{
+            "service_id": service_id, "professional_id": prof.id, "price": Decimal("260.00"),
+            "benefit_type": BenefitType.COURTESY, "benefit_amount": Decimal("100.00"),
+        }],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("160.00")}],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("260.00")
+    assert summary.known_fee_total == Decimal("0")
+    assert summary.known_net_revenue == Decimal("160.00")
+
+
+def test_fee_summary_beneficio_parcial_com_taxa_conhecida(org_session):
+    """Cenário C: Bruto=260, Fidelidade=100, restante (160) pago em
+    Crédito com taxa CONHECIDA de R$5 — Líquido = 260 - 100 - 5 = 155."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 6, 1, 9))  # fora da janela consultada (ver comentário do Cenário A) — evita bug de tzdata no heatmap.
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{
+            "service_id": service_id, "professional_id": prof.id, "price": Decimal("260.00"),
+            "benefit_type": BenefitType.LOYALTY, "benefit_amount": Decimal("100.00"),
+        }],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("160.00"), "card_brand": CardBrand.VISA,
+            "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("3.13"),
+            "fee_amount_snapshot": Decimal("5.00"), "net_amount_snapshot": Decimal("155.00"),
+        }],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("260.00")
+    assert summary.known_fee_total == Decimal("5.00")
+    assert summary.known_net_revenue == Decimal("155.00")
+    assert summary.unconfigured_card_amount == Decimal("0")
+    assert summary.has_unconfigured_fee is False
+
+
+def test_fee_summary_sem_beneficio_comportamento_anterior_preservado(org_session):
+    """Cenário D — regressão explícita: SEM benefício nenhum, o
+    resultado tem que continuar EXATAMENTE igual ao de antes da
+    correção (Líquido = Bruto - taxa, nada mais)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 6, 1, 9))  # fora da janela consultada (ver comentário do Cenário A) — evita bug de tzdata no heatmap.
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("260.00")}],
+        payments=[{
+            "method": PaymentMethod.CREDIT, "amount": Decimal("260.00"), "card_brand": CardBrand.VISA,
+            "fee_status": PaymentFeeStatus.CALCULATED, "fee_percent_snapshot": Decimal("1.92"),
+            "fee_amount_snapshot": Decimal("5.00"), "net_amount_snapshot": Decimal("255.00"),
+        }],
+        cash_register_id=cr.id,
+    )
+
+    summary = _overview(session, actor).revenue_fee_summary
+    assert summary.gross_revenue == Decimal("260.00")
+    assert summary.known_fee_total == Decimal("5.00")
+    assert summary.known_net_revenue == Decimal("255.00")
+
+
+def test_fee_summary_comparativo_desconta_beneficio_de_cada_periodo_independentemente(org_session):
+    """Cenário E — período atual (com Fidelidade integral) e período
+    comparativo (sem benefício) precisam descontar cada um o SEU
+    próprio benefício, nunca a mesma base pros dois."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    # Período comparativo (julho/2026) — sem benefício, R$200 recebidos em Pix.
+    _sale(
+        session, org_id, branch.id, client.id, prof.id, service_id, cr.id,
+        closed_at=_dt(2026, 7, 10), price=Decimal("200.00"), method=PaymentMethod.PIX,
+    )
+    # Período atual (agosto/2026) — Fidelidade integral, sem Payment.
+    appt_current = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 6, 1, 9))  # fora da janela consultada (ver comentário do Cenário A) — evita bug de tzdata no heatmap.
+    _closed_order(
+        session, org_id, branch.id, client.id, appt_current.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{
+            "service_id": service_id, "professional_id": prof.id, "price": Decimal("130.00"),
+            "benefit_type": BenefitType.LOYALTY, "benefit_amount": Decimal("130.00"),
+        }],
+        payments=[],
+        cash_register_id=cr.id,
+    )
+
+    overview = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_dt(2026, 8, 1, 0), date_to=_dt(2026, 9, 1, 0),
+        compare_from=_dt(2026, 7, 1, 0), compare_to=_dt(2026, 8, 1, 0),
+    )
+    assert overview.kpis.net_revenue.value == Decimal("0")  # atual: 130 - 130 (benefício) - 0.
+    assert overview.kpis.net_revenue.comparison_value == Decimal("200")  # comparativo: 200 - 0 (sem benefício) - 0.
+
+
+def test_fee_summary_sparkline_beneficio_reduz_so_o_bucket_da_propria_comanda(org_session):
+    """Cenário F — o benefício do Dia 1 nunca pode "vazar" pro bucket
+    do Dia 2 (nem o inverso): cada comanda desconta só no bucket do seu
+    próprio `closed_at`."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+
+    # `start_at` dos dois agendamentos deliberadamente FORA da janela
+    # consultada (Aug10-Aug12) — limitação conhecida e pré-existente do
+    # Postgres embarcado do `pgserver` usado nos testes (tzdata
+    # incompleto: `timezone(...)` lança "America/Sao_Paulo not
+    # recognized" quando o heatmap do Dashboard processa algum
+    # `Appointment.starts_at` dentro do período consultado; nunca
+    # acontece com `Order.closed_at`, que nunca passa por `timezone()`
+    # — mesmo raciocínio já aplicado em `tests/test_order_reopen.py`).
+    # Dia 1 (10/08): Bruto 130, Fidelidade 130, sem Payment -> Líquido 0.
+    appt_1 = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 6, 1, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt_1.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{
+            "service_id": service_id, "professional_id": prof.id, "price": Decimal("130.00"),
+            "benefit_type": BenefitType.LOYALTY, "benefit_amount": Decimal("130.00"),
+        }],
+        payments=[],
+        cash_register_id=cr.id,
+    )
+    # Dia 2 (11/08): Bruto 200, sem benefício, pago em Pix -> Líquido 200.
+    appt_2 = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 6, 1, 10))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt_2.id, closed_at=_dt(2026, 8, 11, 11),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("200.00")}],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("200.00")}],
+        cash_register_id=cr.id,
+    )
+
+    overview = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_dt(2026, 8, 10, 0), date_to=_dt(2026, 8, 12, 0),
+        compare_from=None, compare_to=None,
+    )
+    assert overview.kpis.net_revenue.sparkline == [Decimal("0"), Decimal("200.00")]
 
 
 # ---------------------------------------------------------------------------
