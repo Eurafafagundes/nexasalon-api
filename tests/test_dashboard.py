@@ -1537,18 +1537,23 @@ def test_fee_summary_isolamento_entre_organizacoes(org_session):
 
 
 # ---------------------------------------------------------------------------
-# Faturamento Líquido x Benefícios (bug confirmado em produção — comanda
-# 100% coberta por Fidelidade/Cortesia mostrava Líquido == Bruto, como se
-# o valor tivesse sido recebido). `known_net_revenue = gross_revenue -
-# benefits_granted - known_fee_total`; `benefits_granted` nunca se mistura
-# com `known_fee_total`/`unconfigured_card_amount`/`has_unconfigured_fee`
-# (esses três continuam vindo só de `Payment` reais).
+# Faturamento Bruto/Líquido x Benefícios (decisão de negócio confirmada:
+# Fidelidade/Cortesia NÃO são Faturamento do estabelecimento). `gross_revenue`
+# (o Bruto EXIBIDO no Dashboard) já vem líquido de benefício —
+# `_gross_revenue_after_benefits(data) = _revenue(data) - _benefits_granted(data)`
+# — e `known_net_revenue = gross_revenue - known_fee_total`, SEM subtrair
+# benefício uma segunda vez (evita o desconto duplo 260-100-100=60).
+# `_revenue()`/`OrderItem.price`/comissão continuam intocados — só o que é
+# EXIBIDO como Faturamento no Dashboard muda.
 # ---------------------------------------------------------------------------
 
 
-def test_fee_summary_beneficio_integral_liquido_vira_zero_nunca_igual_ao_bruto(org_session):
-    """Cenário A do bug reportado: Bruto=130, Fidelidade=130, sem
-    Payment nenhum (amount_due=0) — Líquido tinha que ser 0, nunca 130.
+def test_fee_summary_beneficio_integral_zera_bruto_e_liquido_no_dashboard(org_session):
+    """Cenário A — econômico 130, Fidelidade 130, sem Payment nenhum
+    (amount_due=0): Bruto Dashboard = 0 e Líquido = 0 (nunca 130 em
+    nenhum dos dois — o serviço continua registrado por R$130 só
+    internamente, base de comissão/histórico, nunca no que é EXIBIDO
+    como Faturamento).
 
     `start_at` do agendamento deliberadamente em junho/2026, FORA da
     janela consultada (agosto) — limitação conhecida e pré-existente do
@@ -1576,17 +1581,24 @@ def test_fee_summary_beneficio_integral_liquido_vira_zero_nunca_igual_ao_bruto(o
         cash_register_id=None,
     )
 
-    summary = _overview(session, actor).revenue_fee_summary
-    assert summary.gross_revenue == Decimal("130.00")  # Faturamento Bruto continua o valor econômico — intocado.
+    overview = _overview(session, actor)
+    summary = overview.revenue_fee_summary
+    assert summary.gross_revenue == Decimal("0")  # Bruto Dashboard = econômico(130) - benefício(130) = 0.
     assert summary.known_fee_total == Decimal("0")
     assert summary.known_net_revenue == Decimal("0")  # NUNCA 130 — nenhum dinheiro foi recebido.
     assert summary.unconfigured_card_amount == Decimal("0")
     assert summary.has_unconfigured_fee is False
+    # kpis.revenue (o card "Faturamento Bruto" da Visão Geral) reflete o
+    # MESMO valor — nunca um número diferente do que aparece em
+    # `revenue_fee_summary` pra "Faturamento Bruto".
+    assert overview.kpis.revenue.value == Decimal("0")
 
 
 def test_fee_summary_beneficio_parcial_sem_taxa(org_session):
-    """Cenário B: Bruto=260, Cortesia=100, restante pago em Pix (sem
-    taxa) — Líquido = 260 - 100 - 0 = 160."""
+    """Cenário B — econômico 260, Cortesia 100, restante (160) pago em
+    Pix sem taxa: Bruto Dashboard = 260 - 100 = 160; Líquido = 160 - 0
+    = 160 (nunca 60 = 260-100-100, o desconto duplo que este teste
+    existe pra prevenir)."""
     session, org_id = org_session
     actor = _actor(session, org_id)
     branch = _branch(session, org_id)
@@ -1606,14 +1618,15 @@ def test_fee_summary_beneficio_parcial_sem_taxa(org_session):
     )
 
     summary = _overview(session, actor).revenue_fee_summary
-    assert summary.gross_revenue == Decimal("260.00")
+    assert summary.gross_revenue == Decimal("160.00")  # Bruto Dashboard = econômico(260) - benefício(100).
     assert summary.known_fee_total == Decimal("0")
-    assert summary.known_net_revenue == Decimal("160.00")
+    assert summary.known_net_revenue == Decimal("160.00")  # NUNCA 60 (260-100-100).
 
 
 def test_fee_summary_beneficio_parcial_com_taxa_conhecida(org_session):
-    """Cenário C: Bruto=260, Fidelidade=100, restante (160) pago em
-    Crédito com taxa CONHECIDA de R$5 — Líquido = 260 - 100 - 5 = 155."""
+    """Cenário C — econômico 260, Fidelidade 100, restante (160) pago em
+    Crédito com taxa CONHECIDA de R$5: Bruto Dashboard = 160; Líquido =
+    160 - 5 = 155 (nunca 55 = 260-100-5-100, desconto duplo)."""
     session, org_id = org_session
     actor = _actor(session, org_id)
     branch = _branch(session, org_id)
@@ -1637,9 +1650,9 @@ def test_fee_summary_beneficio_parcial_com_taxa_conhecida(org_session):
     )
 
     summary = _overview(session, actor).revenue_fee_summary
-    assert summary.gross_revenue == Decimal("260.00")
+    assert summary.gross_revenue == Decimal("160.00")  # Bruto Dashboard = econômico(260) - benefício(100).
     assert summary.known_fee_total == Decimal("5.00")
-    assert summary.known_net_revenue == Decimal("155.00")
+    assert summary.known_net_revenue == Decimal("155.00")  # NUNCA 55 (260-100-5-100).
     assert summary.unconfigured_card_amount == Decimal("0")
     assert summary.has_unconfigured_fee is False
 
@@ -1754,7 +1767,101 @@ def test_fee_summary_sparkline_beneficio_reduz_so_o_bucket_da_propria_comanda(or
         session, actor, branch_id=None, date_from=_dt(2026, 8, 10, 0), date_to=_dt(2026, 8, 12, 0),
         compare_from=None, compare_to=None,
     )
+    # Bruto Dashboard (Faturamento Bruto) e Líquido reduzidos SÓ no
+    # bucket do Dia 1 — o benefício nunca vaza pro Dia 2.
+    assert overview.kpis.revenue.sparkline == [Decimal("0"), Decimal("200.00")]
     assert overview.kpis.net_revenue.sparkline == [Decimal("0"), Decimal("200.00")]
+
+
+def test_reconciliacao_beneficio_integral_nao_gera_pendencia_ficticia(org_session):
+    """Cenário G (parte 1) — econômico 130, Fidelidade 130, recebido 0:
+    a pendência tem que ser 0 (o dinheiro nunca vai ser cobrado, por
+    desenho — não é uma inadimplência real), nunca R$130."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 6, 1, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{
+            "service_id": service_id, "professional_id": prof.id, "price": Decimal("130.00"),
+            "benefit_type": BenefitType.LOYALTY, "benefit_amount": Decimal("130.00"),
+        }],
+        payments=[],
+        cash_register_id=None,
+    )
+
+    detail = _revenue_detail(session, actor)
+    assert detail.reconciliation is not None
+    assert detail.reconciliation.revenue == Decimal("0")  # mesmo Bruto exibido no card/drill-down.
+    assert detail.reconciliation.received == Decimal("0")
+    assert detail.reconciliation.pending_amount == Decimal("0")  # NUNCA 130.
+    assert detail.reconciliation.overpaid_amount == Decimal("0")
+
+
+def test_reconciliacao_beneficio_parcial_nao_gera_pendencia_ficticia(org_session):
+    """Cenário G (parte 2) — econômico 260, Cortesia 100, recebido 160
+    (exatamente o valor a cobrar): pendência 0, nunca R$100."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 6, 1, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{
+            "service_id": service_id, "professional_id": prof.id, "price": Decimal("260.00"),
+            "benefit_type": BenefitType.COURTESY, "benefit_amount": Decimal("100.00"),
+        }],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("160.00")}],
+        cash_register_id=cr.id,
+    )
+
+    detail = _revenue_detail(session, actor)
+    assert detail.reconciliation is not None
+    assert detail.reconciliation.revenue == Decimal("160.00")
+    assert detail.reconciliation.received == Decimal("160.00")
+    assert detail.reconciliation.pending_amount == Decimal("0")  # NUNCA 100.
+    assert detail.reconciliation.overpaid_amount == Decimal("0")
+
+
+def test_ticket_medio_nao_e_afetado_pelo_beneficio(org_session):
+    """Cenário I — Ticket Médio preserva EXATAMENTE a semântica/valor
+    atual (valor econômico puro, `_revenue`/`_ticket_average`), mesmo
+    numa comanda 100% coberta por Fidelidade — decisão de negócio
+    explícita de NÃO estender a mudança de Faturamento Bruto/Líquido
+    pra este indicador nesta rodada."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 6, 1, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id, closed_at=_dt(2026, 8, 10, 11),
+        items=[{
+            "service_id": service_id, "professional_id": prof.id, "price": Decimal("130.00"),
+            "benefit_type": BenefitType.LOYALTY, "benefit_amount": Decimal("130.00"),
+        }],
+        payments=[],
+        cash_register_id=None,
+    )
+
+    overview = _overview(session, actor)
+    # Ticket Médio = valor econômico (130) / 1 comanda = 130 — nunca 0,
+    # mesmo com Faturamento Bruto (Dashboard) mostrando R$0 pra essa
+    # mesma comanda no card ao lado.
+    assert overview.kpis.ticket_average.value == Decimal("130.00")
+    assert overview.kpis.revenue.value == Decimal("0")
 
 
 # ---------------------------------------------------------------------------

@@ -245,23 +245,25 @@ class RevenueFeeSummary(BaseModel):
     segunda interpretação de `fee_status` aqui.
 
     `gross_revenue` é EXATAMENTE `kpis.revenue.value` (soma de
-    `OrderItem.price` de comandas fechadas no período) — nunca soma de
-    `Payment.amount`; ver docstring "TRÊS CONCEITOS" em
-    `services/dashboard.py`. As taxas, por sua vez, só existem nos
-    `Payment` — por isso são calculadas a partir de uma população
-    diferente (pagamentos, não itens), sem redefinir o que é Bruto.
+    `OrderItem.price` de comandas fechadas no período MENOS benefícios
+    concedidos — Fidelidade/Cortesia, Etapa "Benefício NÃO é
+    Faturamento no Dashboard"; ver `services/dashboard.py::
+    _gross_revenue_after_benefits`) — nunca soma de `Payment.amount`;
+    ver docstring "TRÊS CONCEITOS" em `services/dashboard.py`. As
+    taxas, por sua vez, só existem nos `Payment` — por isso são
+    calculadas a partir de uma população diferente (pagamentos, não
+    itens), sem redefinir o que é Bruto.
 
-    `known_net_revenue` = `gross_revenue - benefits_granted -
-    known_fee_total` (correção de bug confirmado em produção — Etapa
-    "Benefício por Item"): `benefits_granted` é a MESMA soma de
-    `OrderItem.benefit_amount` (Fidelidade + Cortesia) já usada por
-    `AvailableResultSummary.benefits_granted`, subtraída aqui como termo
-    INDEPENDENTE, nunca misturado com `known_fee_total`/
-    `unconfigured_card_amount`/`has_unconfigured_fee` (esses 3
-    continuam vindo exclusivamente de `Payment` reais). Sem isso, uma
-    comanda 100% coberta por benefício (`payments=[]`) mostrava
-    `known_net_revenue == gross_revenue`, como se o valor tivesse sido
-    efetivamente recebido. SEMPRE calculável (nunca `None`) — mas só
+    `known_net_revenue` = `gross_revenue - known_fee_total` — SEM
+    subtrair benefício de novo aqui: `gross_revenue` já chega líquido
+    de benefício (decisão de negócio: Fidelidade/Cortesia não é
+    Faturamento do estabelecimento). Subtrair `benefits_granted` outra
+    vez nesta função descontaria o benefício DUAS vezes (ex.: econômico
+    260, benefício 100 → Bruto exibido 160; Líquido tem que ser 160
+    menos taxa, nunca 60) — erro corrigido explicitamente nesta etapa;
+    `known_fee_total`/`unconfigured_card_amount`/`has_unconfigured_fee`
+    continuam vindo exclusivamente de `Payment` reais, sem nenhuma
+    relação com benefício. SEMPRE calculável (nunca `None`) — mas só
     pode ser apresentado como "Faturamento Líquido" definitivo quando
     `has_unconfigured_fee` é `False`. Quando `has_unconfigured_fee` é
     `True`, este mesmo número ainda é exibível, só que como "Líquido

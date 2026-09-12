@@ -65,6 +65,25 @@ comanda sem NENHUM `OrderItem` (só produto) também entra — a query
 nunca faz INNER JOIN direto com `OrderItem`/`OrderProductItem` (ver
 `_fetch_period_data`), exatamente pra não sumir comandas assim.
 
+Etapa "Benefício NÃO é Faturamento no Dashboard" (decisão de negócio
+confirmada — Fidelidade/Cortesia são benefícios concedidos à cliente,
+não receita do estabelecimento): `_revenue(data)` acima continua
+calculando o valor econômico PURO — é a base de comissão, do histórico
+da comanda e do Resultado Disponível (que já desconta benefício com
+sua própria lógica, ver `_available_result`/`AvailableResultSummary`),
+e NUNCA é redefinida. O que MUDA é o que é EXIBIDO como "Faturamento
+Bruto"/"Faturamento Líquido" no Dashboard (`kpis.revenue`/
+`kpis.net_revenue`, seus comparativos/sparklines/drill-downs, e o
+gráfico "Evolução do Faturamento"): todos passam a usar
+`_gross_revenue_after_benefits(data) = _revenue(data) -
+_benefits_granted(data)`, calculado UMA vez e nunca subtraído de novo
+mais adiante (ver docstring de `_revenue_fee_summary` pro raciocínio
+completo de por que evitar o desconto duplo). Ticket Médio, Top
+Serviços/Ranking de Profissionais/Análise de Serviços e a provisão de
+imposto do Resultado Disponível continuam lendo `_revenue`/
+`OrderItem.price` puro, sem essa dedução — decisão de negócio explícita
+de não estender a mudança pra esses indicadores nesta rodada.
+
 RECEBIDO = soma de `Payment.amount` das mesmas comandas fechadas no
 período (mesmo filtro de organização/unidade/data que o Faturamento,
 calculado sobre a MESMA população de `_PeriodData`, nunca uma query
@@ -650,10 +669,35 @@ def _benefits_granted(data: _PeriodData) -> Decimal:
     """BENEFÍCIOS CONCEDIDOS — soma de `OrderItem.benefit_amount`
     (Cartão Fidelidade + Cortesia) das mesmas comandas fechadas do
     período (MESMA população de `_revenue`/`_received`, populada em
-    `_fetch_period_data`). Usado SÓ pelo painel "Resultado disponível"
-    (`_available_result`) — nunca redefine `_revenue`
-    (Faturamento Bruto continua o valor econômico cheio, intocado)."""
+    `_fetch_period_data`). Consumido por DOIS lugares, cada um com sua
+    própria semântica — nunca a mesma conta usada duas vezes sobre o
+    mesmo total:
+
+      - `_available_result` ("Resultado disponível"): subtrai
+        `benefits_granted` a partir do valor econômico CHEIO
+        (`_revenue`, intocado) — comportamento histórico, preservado
+        exatamente como está.
+      - `_gross_revenue_after_benefits` (Etapa "Benefício NÃO é
+        Faturamento no Dashboard"): usado pra formar a base do
+        Faturamento Bruto/Líquido EXIBIDOS no Dashboard — nunca
+        redefine `_revenue()` em si, que continua sendo o valor
+        econômico puro (base de comissão/histórico/Resultado
+        Disponível, inalterado)."""
     return sum((row.benefit for row in data.orders), Decimal("0"))
+
+
+def _gross_revenue_after_benefits(data: _PeriodData) -> Decimal:
+    """Etapa "Benefício NÃO é Faturamento no Dashboard" — decisão de
+    negócio confirmada: Fidelidade/Cortesia são benefícios concedidos à
+    cliente, não receita do estabelecimento. Base do Faturamento Bruto
+    EXIBIDO no Dashboard (`kpis.revenue`, seu comparativo/sparkline/
+    drill-down, e a base do Faturamento Líquido) — NUNCA redefine
+    `_revenue()` em si (continua o valor econômico puro, usado por
+    `_available_result`/Ticket Médio/provisão de imposto, todos
+    preservados sem alteração). `OrderItem.price`/`benefit_amount`/
+    comissão nunca são tocados — só a leitura agregada do Dashboard
+    muda."""
+    return _revenue(data) - _benefits_granted(data)
 
 
 def _revenue_reconciliation_totals(data: _PeriodData) -> tuple[Decimal, Decimal]:
@@ -663,11 +707,17 @@ def _revenue_reconciliation_totals(data: _PeriodData) -> tuple[Decimal, Decimal]
     cancelar num único "diferença = 0": são duas inconsistências
     diferentes, cada uma pertence à sua própria comanda (item explícito
     do pedido: "não misture essas granularidades"). `overpaid_total`
-    nunca é somado ao Faturamento em nenhum lugar deste módulo."""
+    nunca é somado ao Faturamento em nenhum lugar deste módulo.
+
+    Base cobrável por comanda = `row.total - row.benefit` (Etapa
+    "Benefício NÃO é Faturamento no Dashboard") — nunca `row.total`
+    puro: uma comanda 100% coberta por Fidelidade/Cortesia não pode
+    aparecer como "pendência" (dinheiro que nunca vai ser cobrado, por
+    desenho, não uma inadimplência real)."""
     pending_total = Decimal("0")
     overpaid_total = Decimal("0")
     for row in data.orders:
-        diff = row.total - row.received
+        diff = (row.total - row.benefit) - row.received
         if diff > 0:
             pending_total += diff
         elif diff < 0:
@@ -815,12 +865,13 @@ def _orders_count_series_values(buckets: list[tuple[datetime, datetime]], data: 
 def _net_revenue_series_values(
     session: Session, filters: DashboardFilters, buckets: list[tuple[datetime, datetime]], data: _PeriodData
 ) -> list[Decimal]:
-    """Trilha do Faturamento Líquido — Bruto por bucket (reaproveita
-    `_revenue_series_values`) menos BENEFÍCIO por bucket (reaproveita
-    `_benefit_series_values` — mesmos dados de `_PeriodData` já
-    buscados por `_fetch_period_data`, nenhuma query nova) menos taxa
-    CONHECIDA por bucket, somada numa ÚNICA passada sobre os `Payment`
-    do intervalo inteiro (mesmo raciocínio de custo de
+    """Trilha do Faturamento Líquido — reaproveita
+    `_gross_revenue_series_after_benefits` (o MESMO Bruto EXIBIDO no
+    Dashboard, já líquido de benefício por bucket — nunca uma segunda
+    subtração de benefício aqui, senão duplicaria o desconto: Etapa
+    "Benefício NÃO é Faturamento no Dashboard") menos taxa CONHECIDA
+    por bucket, somada numa ÚNICA passada sobre os `Payment` do
+    intervalo inteiro (mesmo raciocínio de custo de
     `_revenue_fee_summary`, nunca uma query por bucket). Pagamento com
     taxa `unconfigured` nunca desconta 0 nem inventa um valor —
     simplesmente não entra na subtração (mesma semântica do card
@@ -831,10 +882,9 @@ def _net_revenue_series_values(
     total do PERÍODO INTEIRO subtraído de cada bucket, o que inflaria
     artificialmente todos os outros buckets além do que a comanda
     realmente pertence."""
-    revenue_totals = _revenue_series_values(buckets, data)
-    benefit_totals = _benefit_series_values(buckets, data)
+    gross_after_benefits = _gross_revenue_series_after_benefits(buckets, data)
     if not buckets:
-        return revenue_totals
+        return gross_after_benefits
     stmt = (
         select(Payment, Order.closed_at)
         .join(Order, Order.id == Payment.order_id)
@@ -855,7 +905,7 @@ def _net_revenue_series_values(
         breakdown = payment_fees_service.breakdown_for_display(payment)
         if breakdown.fee_status == PaymentFeeStatus.CALCULATED:
             fee_totals[idx] += breakdown.fee_amount or Decimal("0")
-    return [revenue_totals[i] - benefit_totals[i] - fee_totals[i] for i in range(len(buckets))]
+    return [gross_after_benefits[i] - fee_totals[i] for i in range(len(buckets))]
 
 
 # ---------------------------------------------------------------------------
@@ -1119,17 +1169,25 @@ def _revenue_fee_summary(
     gross_revenue: Decimal,
     date_from: datetime,
     date_to: datetime,
-    *,
-    benefits_granted: Decimal,
 ) -> RevenueFeeSummary:
     """Etapa N4 — Bruto/Taxa/Líquido do período. `gross_revenue` é
-    SEMPRE recebido de fora (= `_revenue(data)`, o mesmo Faturamento de
-    sempre) — esta função nunca soma `Payment.amount` pra formar o
-    Bruto, só usa `Payment` pra achar a taxa (item explícito do pedido:
-    "não calcular bruto somando Payments"). `date_from`/`date_to`
-    explícitos (mesmo padrão de `_top_services`) — Etapa BI passou a
-    chamar isto também pro período COMPARATIVO (`net_revenue`, o novo
-    card de Faturamento Líquido), nunca só o período atual de `filters`.
+    SEMPRE recebido de fora — esta função nunca soma `Payment.amount`
+    pra formar o Bruto, só usa `Payment` pra achar a taxa (item
+    explícito do pedido: "não calcular bruto somando Payments").
+    `date_from`/`date_to` explícitos (mesmo padrão de `_top_services`)
+    — Etapa BI passou a chamar isto também pro período COMPARATIVO
+    (`net_revenue`, o card de Faturamento Líquido), nunca só o período
+    atual de `filters`.
+
+    Etapa "Benefício NÃO é Faturamento no Dashboard" — `gross_revenue`
+    passa a chegar aqui JÁ líquido de benefício (=
+    `_gross_revenue_after_benefits(data)`, calculado pelo chamador,
+    nunca uma segunda vez aqui dentro). Por isso esta função NÃO
+    subtrai benefício de novo — fazer isso descontaria Fidelidade/
+    Cortesia duas vezes (uma no Bruto recebido, outra aqui), reduzindo
+    o Líquido a menos do que deveria (ex.: econômico 260, benefício
+    100, Bruto exibido 160 — o Líquido tem que ser 160 menos taxa,
+    nunca 60).
 
     Reaproveita `services/payment_fees.py::breakdown_for_display` —
     MESMA função usada pelo Extrato — pra nunca duplicar a
@@ -1138,18 +1196,7 @@ def _revenue_fee_summary(
 
     `reversed_at IS NULL` — mesmo raciocínio de `received_stmt`/
     `_payment_methods`: pagamento estornado por `reopen_order` nunca
-    entra na taxa, mesmo se a comanda for refechada depois.
-
-    `benefits_granted` (Etapa "Benefício por Item" — correção de bug
-    confirmado em produção) — SEMPRE recebido de fora (= `_benefits_granted(data)`,
-    a MESMA soma usada por `_available_result`, nunca uma segunda
-    conta) e subtraído como termo INDEPENDENTE de `known_fee_total`/
-    `unconfigured_card_amount`/`has_unconfigured_fee` (esses 3 continuam
-    calculados SÓ a partir de `Payment` reais, sem misturar benefício
-    com taxa). Sem isso, uma comanda 100% coberta por Fidelidade/
-    Cortesia (`payments=[]`) mostrava `known_net_revenue == gross_revenue`
-    — Faturamento Líquido idêntico ao Bruto, como se o dinheiro tivesse
-    sido recebido, quando na verdade nenhum `Payment` existe."""
+    entra na taxa, mesmo se a comanda for refechada depois."""
     stmt = (
         select(Payment)
         .join(Order, Order.id == Payment.order_id)
@@ -1179,7 +1226,7 @@ def _revenue_fee_summary(
     return RevenueFeeSummary(
         gross_revenue=gross_revenue,
         known_fee_total=known_fee_total,
-        known_net_revenue=gross_revenue - benefits_granted - known_fee_total,
+        known_net_revenue=gross_revenue - known_fee_total,
         unconfigured_card_amount=unconfigured_card_amount,
         has_unconfigured_fee=has_unconfigured_fee,
     )
@@ -1484,6 +1531,22 @@ def _benefit_series_values(buckets: list[tuple[datetime, datetime]], data: _Peri
     return totals
 
 
+def _gross_revenue_series_after_benefits(
+    buckets: list[tuple[datetime, datetime]], data: _PeriodData
+) -> list[Decimal]:
+    """Trilha do Faturamento Bruto EXIBIDO no Dashboard (Etapa
+    "Benefício NÃO é Faturamento no Dashboard") — `_revenue_series_values`
+    (econômico puro, por bucket) menos `_benefit_series_values` (mesmo
+    bucketing por `row.closed_at`, benefício nunca vaza pro bucket
+    vizinho). Base do sparkline/gráfico/drill-down de Faturamento
+    Bruto E do Faturamento Líquido (`_net_revenue_series_values`) —
+    nunca redefine `_revenue_series_values` em si, que continua a
+    trilha econômica pura usada pelo sparkline de Ticket Médio."""
+    revenue_totals = _revenue_series_values(buckets, data)
+    benefit_totals = _benefit_series_values(buckets, data)
+    return [revenue_totals[i] - benefit_totals[i] for i in range(len(buckets))]
+
+
 # ---------------------------------------------------------------------------
 # Orquestração pública.
 # ---------------------------------------------------------------------------
@@ -1531,7 +1594,7 @@ def _bucket_values_for_key(
     if period_data is None or bucket_list is None:
         return None
     if key == "revenue":
-        return _revenue_series_values(bucket_list, period_data)
+        return _gross_revenue_series_after_benefits(bucket_list, period_data)
     if key == "received":
         return _received_series_values(bucket_list, period_data)
     if key in ("clients_served", "appointments_count", "ticket_average", "no_show_rate"):
@@ -1584,8 +1647,15 @@ def get_overview(
     # requests (ver docstring de `_first_visit_by_client`).
     first_visit_cache: dict = {}
 
-    revenue_current = _revenue(current)
-    revenue_previous = _revenue(comparison) if comparison is not None else None
+    # Etapa "Benefício NÃO é Faturamento no Dashboard" — `revenue_current`/
+    # `revenue_previous` passam a ser o Faturamento Bruto EXIBIDO
+    # (já líquido de benefício, `_gross_revenue_after_benefits`), nunca
+    # `_revenue()` puro. `_available_result` (Resultado Disponível)
+    # continua recebendo `_revenue(current)` direto no seu próprio
+    # ponto de chamada — decisão de negócio explícita de NÃO acoplar
+    # essa mudança lá (ver docstring de `_available_result`).
+    revenue_current = _gross_revenue_after_benefits(current)
+    revenue_previous = _gross_revenue_after_benefits(comparison) if comparison is not None else None
     ticket_previous = _ticket_average(comparison) if comparison is not None else None
     clients_previous = Decimal(_clients_served(comparison)) if comparison is not None else None
     appts_previous = Decimal(_appointments_count(comparison)) if comparison is not None else None
@@ -1606,19 +1676,12 @@ def get_overview(
     # o atual, que já era calculado antes) — `_revenue_fee_summary`
     # agora recebe `date_from`/`date_to` explícitos por isso.
     #
-    # `benefits_granted` calculado independentemente pra cada período
-    # (`_benefits_granted(current)`/`_benefits_granted(comparison)`) —
-    # nunca a mesma base pros dois, senão o comparativo ficaria
-    # descontando o benefício do período ERRADO.
-    fee_summary_current = _revenue_fee_summary(
-        session, filters, revenue_current, filters.date_from, filters.date_to,
-        benefits_granted=_benefits_granted(current),
-    )
+    # `revenue_current`/`revenue_previous` já chegam líquidos de
+    # benefício (ver acima) — `_revenue_fee_summary` NUNCA subtrai
+    # benefício de novo (evita o desconto duplo 260-100-100=60).
+    fee_summary_current = _revenue_fee_summary(session, filters, revenue_current, filters.date_from, filters.date_to)
     fee_summary_previous = (
-        _revenue_fee_summary(
-            session, filters, revenue_previous, filters.compare_from, filters.compare_to,
-            benefits_granted=_benefits_granted(comparison),
-        )
+        _revenue_fee_summary(session, filters, revenue_previous, filters.compare_from, filters.compare_to)
         if comparison is not None and revenue_previous is not None
         else None
     )
@@ -1673,11 +1736,14 @@ def get_overview(
         ),
     )
 
+    # Etapa "Benefício NÃO é Faturamento no Dashboard" — gráfico
+    # "Evolução do Faturamento" reflete o mesmo Bruto EXIBIDO nos KPIs
+    # (já líquido de benefício), nunca a trilha econômica pura.
     revenue_series = _align_series(
         buckets,
-        _revenue_series_values(buckets, current),
+        _gross_revenue_series_after_benefits(buckets, current),
         comparison_buckets,
-        _revenue_series_values(comparison_buckets, comparison) if comparison is not None else None,
+        _gross_revenue_series_after_benefits(comparison_buckets, comparison) if comparison is not None else None,
     )
 
     top_services_current = _top_services(session, filters, filters.date_from, filters.date_to)
@@ -1724,7 +1790,12 @@ def get_overview(
         ),
         available_result=_available_result(
             session, actor, filters, current,
-            gross_revenue=revenue_current, known_fee_total=fee_summary_current.known_fee_total,
+            # `_revenue(current)` (econômico puro), NUNCA `revenue_current`
+            # (que já veio líquido de benefício acima, Etapa "Benefício NÃO
+            # é Faturamento no Dashboard") — Resultado Disponível preserva
+            # seu próprio desconto interno de `benefits_granted`, decisão
+            # de negócio explícita de não alterar este painel.
+            gross_revenue=_revenue(current), known_fee_total=fee_summary_current.known_fee_total,
         ),
     )
 
@@ -1776,7 +1847,10 @@ def get_kpi_detail(
     if key == "revenue":
         pending_total, overpaid_total = _revenue_reconciliation_totals(current)
         reconciliation = RevenueReconciliation(
-            revenue=_revenue(current),
+            # Mesmo Bruto EXIBIDO no card/drill-down (já líquido de
+            # benefício) — nunca dois números de "Faturamento"
+            # diferentes na mesma tela de reconciliação.
+            revenue=_gross_revenue_after_benefits(current),
             received=_received(current),
             pending_amount=pending_total,
             overpaid_amount=overpaid_total,
@@ -1860,7 +1934,11 @@ def _kpi_totals(
     first_visit_cache: dict | None = None,
 ) -> tuple[KpiKind, Decimal, Decimal | None]:
     if key == "revenue":
-        return KpiKind.CURRENCY, _revenue(current), (_revenue(comparison) if comparison else None)
+        return (
+            KpiKind.CURRENCY,
+            _gross_revenue_after_benefits(current),
+            (_gross_revenue_after_benefits(comparison) if comparison else None),
+        )
     if key == "received":
         return KpiKind.CURRENCY, _received(current), (_received(comparison) if comparison else None)
     if key == "ticket_average":
@@ -1917,13 +1995,11 @@ def _kpi_totals(
         return KpiKind.RATE, current_total, previous_total
     if key == "net_revenue":
         current_summary = _revenue_fee_summary(
-            session, filters, _revenue(current), filters.date_from, filters.date_to,
-            benefits_granted=_benefits_granted(current),
+            session, filters, _gross_revenue_after_benefits(current), filters.date_from, filters.date_to,
         )
         previous_summary = (
             _revenue_fee_summary(
-                session, filters, _revenue(comparison), filters.compare_from, filters.compare_to,
-                benefits_granted=_benefits_granted(comparison),
+                session, filters, _gross_revenue_after_benefits(comparison), filters.compare_from, filters.compare_to,
             )
             if comparison is not None
             else None
