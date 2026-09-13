@@ -376,6 +376,74 @@ def test_reopen_refechar_com_outra_forma_de_pagamento_nao_duplica_recebido_nem_c
     assert final_credit["amount"] == "130.00"
 
 
+def test_reopen_refechar_nao_vaza_taxa_revertida_para_sparkline_nem_drilldown_do_liquido(client_as, org_a_actor):
+    """Auditoria do Dashboard — bug confirmado: `_net_revenue_series_values`
+    tinha sua PRÓPRIA query de `Payment` (usada pelo sparkline do card e
+    pelo drill-down `GET /dashboard/kpi/net_revenue`) sem o filtro
+    `reversed_at IS NULL` que `_revenue_fee_summary` (o card em si) já
+    tinha — uma comanda fechada com taxa, reaberta e refechada sem taxa
+    mostrava o card correto mas o sparkline/drill-down ainda contando a
+    taxa do pagamento revertido.
+
+    Cenário exato do pedido: Crédito R$260 com taxa R$13,00 (5%) ->
+    reabre -> Crédito revertido -> refecha com Pix R$260 sem taxa.
+    Card, sparkline e drill-down do Líquido têm que bater os TRÊS em
+    R$260,00 — nunca R$247,00 (260-13) escondido no sparkline/drill-down
+    enquanto o card mostra 260."""
+    c = client_as(org_a_actor)
+    appt, *_ = _setup_finished_appointment(c, price="260.00")
+
+    # Regra de taxa de 5% pra Crédito/Visa/1x — só existe pra provar que
+    # a taxa REAL (R$13,00) não vaza depois da reversão; Pix nunca tem
+    # taxa configurada nestes testes (fica NOT_APPLICABLE).
+    fee_rule = c.post(
+        "/api/v1/payment-fee-rules",
+        json={"method": "credit", "card_brand": "visa", "installments": 1, "fee_percent": "5.00"},
+    )
+    assert fee_rule.status_code == 201, fee_rule.text
+
+    register = c.post("/api/v1/cash-registers", json={"branch_id": appt["branch_id"], "initial_amount": "0"}).json()
+    order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
+    closed = c.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={
+            "payments": [
+                {"method": "credit", "amount": "260.00", "cash_register_id": register["id"], "card_brand": "visa", "installments": 1}
+            ]
+        },
+    )
+    assert closed.status_code == 200, closed.text
+    # Taxa realmente resolvida (nunca UNCONFIGURED) — prova que a regra
+    # criada acima está mesmo em vigor antes de reabrir.
+    credit_payment = closed.json()["payments"][0]
+    assert credit_payment["fee_status"] == "calculated"
+
+    reopened = c.post(f"/api/v1/orders/{order['id']}/reopen", json={"reason": "Cliente pediu para trocar para Pix"})
+    assert reopened.status_code == 200, reopened.text
+
+    reclosed = c.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={"payments": [{"method": "pix", "amount": "260.00", "cash_register_id": register["id"]}]},
+    )
+    assert reclosed.status_code == 200, reclosed.text
+
+    # Intervalo largo o bastante pra cobrir "agora" (mesma técnica de
+    # `_WIDE_RANGE` — `date_from` depois de `_START_A` evita o bug de
+    # tzdata pré-existente do heatmap, ver comentário em
+    # `test_reopen_refechar_com_outra_forma_de_pagamento_nao_duplica_recebido_nem_comissao`).
+    wide_range = {"date_from": "2026-08-14T00:00:00-03:00", "date_to": "2030-12-31T23:59:59-03:00"}
+
+    overview = c.get("/api/v1/dashboard/overview", params=wide_range).json()
+    assert Decimal(overview["kpis"]["net_revenue"]["value"]) == Decimal("260.00")  # Card.
+    sparkline_total = sum(Decimal(v) for v in overview["kpis"]["net_revenue"]["sparkline"])
+    assert sparkline_total == Decimal("260.00")  # Sparkline — nunca 247 (260-13 vazando).
+
+    drilldown = c.get("/api/v1/dashboard/kpi/net_revenue", params=wide_range).json()
+    assert Decimal(drilldown["kpi"]["value"]) == Decimal("260.00")
+    series_total = sum(Decimal(point["current_value"]) for point in drilldown["series"])
+    assert series_total == Decimal("260.00")  # Drill-down — mesmo raciocínio do sparkline.
+
+
 # ---------------------------------------------------------------------
 # Trava 1 — caixa relacionado já fechado
 # ---------------------------------------------------------------------

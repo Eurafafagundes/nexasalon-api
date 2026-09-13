@@ -881,7 +881,14 @@ def _net_revenue_series_values(
     `closed_at` (correção de bug confirmado em produção) — nunca o
     total do PERÍODO INTEIRO subtraído de cada bucket, o que inflaria
     artificialmente todos os outros buckets além do que a comanda
-    realmente pertence."""
+    realmente pertence.
+
+    `reversed_at IS NULL` (auditoria do Dashboard — bug confirmado:
+    esta query própria de `Payment` nunca tinha recebido o mesmo filtro
+    já usado por `_revenue_fee_summary`/`_payment_methods`/
+    `received_stmt`) — pagamento estornado por `reopen_order` nunca
+    entra na taxa do sparkline/drill-down, mesmo se a comanda for
+    refechada com outra forma de pagamento no MESMO bucket."""
     gross_after_benefits = _gross_revenue_series_after_benefits(buckets, data)
     if not buckets:
         return gross_after_benefits
@@ -893,6 +900,7 @@ def _net_revenue_series_values(
             Order.status == OrderStatus.CLOSED,
             Order.closed_at >= buckets[0][0],
             Order.closed_at < buckets[-1][1],
+            Payment.reversed_at.is_(None),
         )
     )
     if filters.branch_id is not None:
@@ -1321,14 +1329,23 @@ def _available_result(
     )
     commissions = commission_overview.known_commission_total
 
-    # --- Impostos provisionados: revenue por competência (mês
+    # --- Impostos provisionados: BASE GERENCIAL por competência (mês
     # calendário) × alíquota vigente NAQUELA competência ---------------
+    # Base = `row.total - row.benefit` (Etapa "Impostos sobre base após
+    # benefícios" — decisão de negócio confirmada: Fidelidade/Cortesia
+    # reduzem o faturamento reconhecido, então não provisionamos imposto
+    # sobre a parte coberta por benefício). Produto nunca tem benefício
+    # (campo só existe em `OrderItem`), então continua compondo a base
+    # integralmente — `row.total` já soma serviço+produto, `row.benefit`
+    # só desconta a parte de serviço coberta. NUNCA toca `OrderItem.price`
+    # nem `commission_amount_snapshot` — comissão continua sobre o valor
+    # econômico cheio, só a base de IMPOSTO muda aqui.
     months = tax_rates_service.months_between(filters.date_from, filters.date_to)
     revenue_by_month: dict = {m: Decimal("0") for m in months}
     for row in data.orders:
         month_key = row.closed_at.date().replace(day=1)
         if month_key in revenue_by_month:
-            revenue_by_month[month_key] += row.total
+            revenue_by_month[month_key] += row.total - row.benefit
 
     resolutions = tax_rates_service.resolve_rates_for_months(session, filters.organization_id, months)
 
@@ -1387,13 +1404,28 @@ def _available_result(
         },
     )
 
-    # Etapa "Resultado Disponível — Benefícios": Cartão Fidelidade e
-    # Cortesia reduzem o valor DISPONÍVEL (esse dinheiro não entrou),
-    # mesmo o Faturamento Bruto (`gross_revenue`, acima) continuando
-    # intocado — nunca redefine `kpis.revenue`/`_revenue()`. Mesma
-    # população de comandas de `data` (já filtrada por organização/
-    # unidade/período/status=CLOSED em `_fetch_period_data`), snapshot
-    # histórico (`OrderItem.benefit_amount`), nunca preço de catálogo.
+    # Etapa "Resultado Disponível — Benefícios" (auditoria do Dashboard —
+    # comentário atualizado pra deixar explícita a distinção entre as
+    # duas variáveis, que já existem separadas no código mas tinham
+    # ficado confusas na doc):
+    #
+    #   - `_revenue(current)` = receita ECONÔMICA PURA (`OrderItem.price`
+    #     + produto, intocado) — é exatamente o `gross_revenue` recebido
+    #     como parâmetro por ESTA função, chamado assim de propósito em
+    #     `get_overview` (nunca a variável `revenue_current` usada pelos
+    #     cards de Faturamento Bruto/Líquido do Dashboard).
+    #   - `kpis.revenue` = receita JÁ LÍQUIDA de benefício (`_gross_revenue_
+    #     after_benefits`, ver mesmo módulo) — é o que aparece no card
+    #     "Faturamento Bruto" da Visão Geral, uma conta SEPARADA.
+    #
+    # Cartão Fidelidade/Cortesia reduzem o valor DISPONÍVEL (esse
+    # dinheiro não entrou) — `_available_result` subtrai `benefits_granted`
+    # UMA ÚNICA VEZ, aqui, a partir da receita econômica pura acima; nunca
+    # a partir de `kpis.revenue` (que já viria líquida), o que duplicaria
+    # o desconto. Mesma população de comandas de `data` (já filtrada por
+    # organização/unidade/período/status=CLOSED em `_fetch_period_data`),
+    # snapshot histórico (`OrderItem.benefit_amount`), nunca preço de
+    # catálogo.
     benefits_granted = _benefits_granted(data)
 
     available_result = (

@@ -317,11 +317,16 @@ class FinancialSummary(BaseModel):
 
 
 class TaxCompetenceBreakdownRow(BaseModel):
-    """Uma competência (mês) dentro do período do Dashboard, com o
-    faturamento ATRIBUÍDO a ela e a alíquota que estava vigente NAQUELA
-    competência — nunca a alíquota atual. Só inclui competências com
-    faturamento > 0 (mês sem venda não aparece, mesmo que tenha uma
-    linha de alíquota configurada)."""
+    """Uma competência (mês) dentro do período do Dashboard, com a
+    BASE TRIBUTÁVEL GERENCIAL atribuída a ela e a alíquota que estava
+    vigente NAQUELA competência — nunca a alíquota atual. `revenue`
+    aqui é `OrderItem.price + produto − OrderItem.benefit_amount`
+    (decisão de negócio: Fidelidade/Cortesia reduzem o faturamento
+    reconhecido, então não geram imposto provisionado sobre a parte
+    coberta) — nunca o valor econômico cheio, e nunca `OrderItem.price`
+    tocado (isso permanece intocado; só a base de imposto muda). Só
+    inclui competências com base > 0 (mês sem venda cobrável não
+    aparece, mesmo que tenha uma linha de alíquota configurada)."""
 
     competence_month: date
     revenue: Decimal
@@ -349,16 +354,26 @@ class AvailableResultSummary(BaseModel):
         nunca recalculado a partir do preço atual do catálogo. Reduz
         o Resultado Disponível porque esse valor nunca virou dinheiro
         (nunca gera `Payment`/entrada de caixa), mas NÃO reduz
-        `gross_revenue`/`kpis.revenue` (Faturamento Bruto continua
-        contando o valor econômico cheio). Voucher/Permuta NUNCA
+        `gross_revenue` deste painel — `_available_result` usa
+        deliberadamente `_revenue(current)` (receita econômica PURA,
+        `OrderItem.price` intocado) e subtrai `benefits_granted` uma
+        única vez, internamente, nunca a versão já líquida de benefício
+        que `kpis.revenue`/"Faturamento Bruto" do Dashboard exibe hoje
+        (essa sim já vem líquida de benefício, mas é uma conta
+        SEPARADA — ver `services/dashboard.py::
+        _gross_revenue_after_benefits` — nunca reaproveitada aqui, pra
+        não subtrair benefício duas vezes). Voucher/Permuta NUNCA
         entram aqui — continuam `Payment` real, sem nenhuma redução.
-      - `taxes_provisioned`: PROVISÃO gerencial (faturamento aplicável
-        × alíquota vigente EM CADA COMPETÊNCIA tocada pelo período —
-        ver `tax_breakdown`) — nunca um lançamento de caixa/pagamento
-        real. `has_unconfigured_tax_rate=True` quando alguma competência
-        com faturamento não tinha nenhuma alíquota configurada até ela
-        (nesse caso `unconfigured_tax_revenue` guarda o faturamento
-        daquelas competências, nunca tratado como 0% de imposto).
+      - `taxes_provisioned`: PROVISÃO gerencial sobre a BASE TRIBUTÁVEL
+        já líquida de benefício (`OrderItem.price + produto −
+        benefit_amount`, ver `TaxCompetenceBreakdownRow`) × alíquota
+        vigente EM CADA COMPETÊNCIA tocada pelo período (ver
+        `tax_breakdown`) — nunca um lançamento de caixa/pagamento real,
+        e nunca sobre o valor econômico cheio quando há benefício.
+        `has_unconfigured_tax_rate=True` quando alguma competência com
+        base tributável não tinha nenhuma alíquota configurada até ela
+        (nesse caso `unconfigured_tax_revenue` guarda essa base,
+        nunca tratada como 0% de imposto).
       - `commissions`: idêntico a
         `financial_summary.commissions_calculated` — soma dos
         snapshots de comissão (`OrderItem.commission_amount_snapshot`)

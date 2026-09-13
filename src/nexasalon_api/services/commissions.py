@@ -307,7 +307,14 @@ def get_overview(
             Order.organization_id == organization_id,
             Order.status == OrderStatus.CLOSED,
             Order.closed_at >= date_from,
-            Order.closed_at <= date_to,
+            # `< date_to` (exclusivo) — auditoria do Dashboard: alinhado
+            # com o contrato `[date_from, date_to)` já usado por todo o
+            # resto do módulo (`services/dashboard.py::_fetch_period_data`
+            # e afins), que trata `date_to` como "o instante logo após o
+            # último dia incluído". Antes usava `<=` (inclusivo), o que
+            # permitia uma comanda fechada EXATAMENTE em `date_to`
+            # aparecer tanto neste período quanto no próximo.
+            Order.closed_at < date_to,
         )
         .group_by(OrderItem.professional_id)
         .order_by(func.sum(production_case).desc())

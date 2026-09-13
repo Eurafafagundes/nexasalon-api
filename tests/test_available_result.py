@@ -35,13 +35,15 @@ from nexasalon_api.models.enums import (
     CommissionType,
     ExpenseNature,
     FixedExpenseRecurrence,
+    OrderProductItemKind,
     OrderStatus,
     PaymentFeeStatus,
     PaymentMethod,
 )
 from nexasalon_api.models.identity import User
-from nexasalon_api.models.order import Order, OrderItem, Payment
+from nexasalon_api.models.order import Order, OrderItem, OrderProductItem, Payment
 from nexasalon_api.models.organization import Branch, BusinessHours, Organization
+from nexasalon_api.models.product import Product
 from nexasalon_api.models.professional import Professional
 from nexasalon_api.models.service import Service
 from nexasalon_api.schemas.financial_category import (
@@ -50,6 +52,7 @@ from nexasalon_api.schemas.financial_category import (
 )
 from nexasalon_api.schemas.fixed_expense import FixedExpenseCreate
 from nexasalon_api.schemas.tax_rate import TaxRateSet
+from nexasalon_api.services import commissions as commissions_service
 from nexasalon_api.services import dashboard as dashboard_service
 from nexasalon_api.services import financial_categories as financial_categories_service
 from nexasalon_api.services import fixed_expenses as fixed_expenses_service
@@ -926,3 +929,253 @@ def test_beneficio_respeita_isolamento_por_unidade(org_session):
     ).available_result
     assert result_a.gross_revenue == Decimal("200.00")
     assert result_a.benefits_granted == Decimal("0")  # benefício é da Filial B, nunca vaza pra A.
+
+
+# ---------------------------------------------------------------------------
+# Auditoria do Dashboard — Impostos provisionados sobre BASE TRIBUTÁVEL após
+# benefícios (decisão de negócio: Fidelidade/Cortesia reduzem o faturamento
+# reconhecido, então não geram imposto sobre a parte coberta). Base =
+# `row.total - row.benefit`, nunca `OrderItem.price`/`commission_amount_
+# snapshot` tocados — comissão continua sobre o valor econômico cheio.
+# ---------------------------------------------------------------------------
+
+
+def _product_item(session, org_id, order, *, unit_price, name="Produto") -> OrderProductItem:
+    product = Product(organization_id=org_id, name=name, sale_price=unit_price)
+    session.add(product)
+    session.flush()
+    item = OrderProductItem(
+        organization_id=org_id, order_id=order.id, product_id=product.id, product_name=name,
+        quantity=Decimal("1"), unit_price=unit_price, item_type=OrderProductItemKind.SALE,
+    )
+    session.add(item)
+    session.flush()
+    return item
+
+
+def test_impostos_beneficio_integral_zera_base_tributavel(org_session):
+    """Cenário A do pedido: serviço R$130, Fidelidade R$130 — base de
+    imposto = R$0, imposto provisionado = R$0 (nunca sobre os R$130
+    econômicos cheios)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    tax_rates_service.set_rate(session, actor, TaxRateSet(competence_month=_MONTH_0, tax_rate="6.00"))
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("130.00"),
+        benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("130.00"),
+    )
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.gross_revenue == Decimal("130.00")  # receita econômica pura, intocada.
+    assert result.benefits_granted == Decimal("130.00")
+    assert result.taxes_provisioned == Decimal("0")  # NUNCA 7.80 (130 × 6%).
+    assert result.tax_breakdown == []  # mês sem base tributável > 0 não aparece no detalhamento.
+
+
+def test_impostos_beneficio_parcial_reduz_base_tributavel(org_session):
+    """Cenário B: serviço R$260, benefício R$100 — base = R$160; a 6%,
+    imposto = R$9,60 (nunca R$15,60 = 260 × 6%)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    tax_rates_service.set_rate(session, actor, TaxRateSet(competence_month=_MONTH_0, tax_rate="6.00"))
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("260.00"),
+        benefit_type=BenefitType.COURTESY, benefit_amount=Decimal("100.00"),
+    )
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.taxes_provisioned == Decimal("9.60")
+    assert result.tax_breakdown[0].revenue == Decimal("160.00")  # base, não os 260 econômicos.
+    assert result.tax_breakdown[0].tax_amount == Decimal("9.60")
+
+
+def test_impostos_sem_beneficio_comportamento_anterior_preservado(org_session):
+    """Cenário C — regressão explícita: SEM benefício, base = valor
+    econômico cheio, comportamento idêntico ao de antes desta correção."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    tax_rates_service.set_rate(session, actor, TaxRateSet(competence_month=_MONTH_0, tax_rate="6.00"))
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("260.00"),
+    )
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.taxes_provisioned == Decimal("15.60")  # 260 × 6%, sem nenhuma dedução nova.
+
+
+def test_impostos_produto_nao_e_afetado_por_beneficio_do_servico(org_session):
+    """Cenário D — serviço R$100 com benefício integral (R$100) + produto
+    R$50 SEM benefício (campo só existe em `OrderItem`, nunca em
+    `OrderProductItem`): base tributável = 0 (serviço) + 50 (produto) =
+    R$50 — produto continua compondo a base normalmente."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    tax_rates_service.set_rate(session, actor, TaxRateSet(competence_month=_MONTH_0, tax_rate="6.00"))
+    order = _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("100.00"),
+        benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("100.00"),
+    )
+    _product_item(session, org_id, order, unit_price=Decimal("50.00"))
+    session.add(
+        Payment(
+            organization_id=org_id, order_id=order.id, cash_register_id=register.id,
+            method=PaymentMethod.PIX, amount=Decimal("50.00"), created_by_name="Teste",
+        )
+    )
+    session.flush()
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.gross_revenue == Decimal("150.00")  # serviço(100) + produto(50), econômico puro.
+    assert result.benefits_granted == Decimal("100.00")
+    assert result.taxes_provisioned == Decimal("3.00")  # 6% sobre 50 (só o produto), nunca sobre 150.
+
+
+def test_beneficio_nao_reduz_comissao_mesmo_com_nova_base_de_imposto(org_session):
+    """Serviço R$130, Fidelidade integral, comissão 20% (R$26) — a nova
+    base de imposto (R$0) NUNCA afeta `commission_amount_snapshot`
+    (continua sobre os R$130 econômicos) nem `OrderItem.price`."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("130.00"),
+        benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("130.00"),
+        commission_type=CommissionType.PERCENTAGE, commission_value=Decimal("20.00"),
+        commission_amount=Decimal("26.00"), commission_status=CommissionStatus.CALCULATED,
+    )
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.commissions == Decimal("26.00")  # sobre o preço econômico, nunca sobre a base de imposto.
+    assert result.taxes_provisioned == Decimal("0")
+    # Resultado Disponível reflete o custo da comissão mesmo sem faturamento
+    # recebido — regra de negócio já aprovada (comissão calculada no
+    # fechamento, não na liquidação).
+    assert result.available_result == Decimal("-26.00")  # 130 - 130(benefício) - 0(imposto) - 26(comissão).
+
+
+def test_resultado_disponivel_sem_dupla_subtracao_de_beneficio_com_nova_base_de_imposto(org_session):
+    """Fim a fim: serviço R$260, benefício R$100, taxa Pix configurada
+    (3%, R$4,80 sobre os R$160 efetivamente pagos), comissão 10% (R$26,
+    sobre o econômico). Confirma que o benefício é descontado exatamente
+    UMA vez no Resultado Disponível (não duas: uma vez direto, outra
+    "escondida" dentro de um imposto que já teria descontado sozinho)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    tax_rates_service.set_rate(session, actor, TaxRateSet(competence_month=_MONTH_0, tax_rate="6.00"))
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=_at(_MONTH_0, 10), price=Decimal("260.00"),
+        benefit_type=BenefitType.COURTESY, benefit_amount=Decimal("100.00"),
+        commission_type=CommissionType.PERCENTAGE, commission_value=Decimal("10.00"),
+        commission_amount=Decimal("26.00"), commission_status=CommissionStatus.CALCULATED,
+        payment_method=PaymentMethod.PIX,
+        fee_status=PaymentFeeStatus.CALCULATED, fee_percent_snapshot=Decimal("3.00"),
+        fee_amount_snapshot=Decimal("4.80"), net_amount_snapshot=Decimal("155.20"),
+    )
+
+    result = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    ).available_result
+    assert result.gross_revenue == Decimal("260.00")
+    assert result.benefits_granted == Decimal("100.00")
+    assert result.taxes_provisioned == Decimal("9.60")  # 6% sobre a base 160, não sobre 260.
+    assert result.commissions == Decimal("26.00")
+    assert result.payment_fees == Decimal("4.80")
+    # 260 - 100(benefício, uma única vez) - 9.60(imposto já sobre base
+    # reduzida) - 26(comissão) - 4.80(taxa) = 119.60 — nunca 19.60 (que
+    # seria o resultado de descontar o benefício DUAS vezes).
+    assert result.available_result == Decimal("119.60")
+
+
+# ---------------------------------------------------------------------------
+# Auditoria do Dashboard — boundary de data em `commissions_service.get_overview`
+# (`[date_from, date_to)`, exclusivo — mesmo contrato de `_fetch_period_data`).
+# ---------------------------------------------------------------------------
+
+
+def test_comissao_exatamente_em_date_to_nao_pertence_ao_periodo_que_termina_ali(org_session):
+    """Uma comanda fechada EXATAMENTE no instante `date_to` não pode
+    pertencer ao período que termina ali (boundary exclusivo) — tem que
+    aparecer só no período SEGUINTE, que começa nesse mesmo instante.
+    Antes desta correção (`<=`), ela apareceria nos DOIS períodos."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    boundary = _at(_MONTH_1, 1, hour=0)  # início exato do mês 1 = fim exato do período do mês 0.
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        closed_at=boundary, price=Decimal("130.00"),
+        commission_type=CommissionType.PERCENTAGE, commission_value=Decimal("20.00"),
+        commission_amount=Decimal("26.00"), commission_status=CommissionStatus.CALCULATED,
+    )
+
+    ending_here = commissions_service.get_overview(
+        session, actor, date_from=_at(_MONTH_0, 1), date_to=boundary,
+    )
+    assert ending_here.known_commission_total == Decimal("0")  # NUNCA 26 — a comanda não pertence a este período.
+
+    starting_here = commissions_service.get_overview(
+        session, actor, date_from=boundary, date_to=_at(_MONTH_2, 1),
+    )
+    assert starting_here.known_commission_total == Decimal("26.00")  # pertence ao período seguinte.
