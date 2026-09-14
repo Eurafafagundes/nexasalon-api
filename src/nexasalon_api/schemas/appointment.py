@@ -55,6 +55,19 @@ class AppointmentCreate(BaseModel):
     fit_in: bool = False
 
 
+class AppointmentItemAdd(AppointmentItemCreate):
+    """`POST /appointments/{id}/items` (Etapa "Múltiplos serviços por
+    atendimento") — adiciona UM serviço a uma reserva JÁ EXISTENTE, sem
+    tocar nos itens atuais (nunca passa por `delete_for_appointment`/
+    `replace_appointment` — item explícito "nunca usar replace para
+    isso", necessário porque um item já pode ter `OrderItem` linkado,
+    `ondelete=RESTRICT`). Mesmos campos de `AppointmentItemCreate`
+    (profissional, serviço, início, price_override/duration_override
+    opcionais) + `force_overlap`, mesmo padrão de `AppointmentCreate`."""
+
+    force_overlap: bool = False
+
+
 class AppointmentReplace(AppointmentCreate):
     """PUT — substitui a reserva inteira (unidade, cliente, notas e TODOS
     os itens). Semântica idempotente, igual a `WorkingHoursReplaceRequest`."""
@@ -111,11 +124,21 @@ class AppointmentItemUpdate(BaseModel):
         e/ou `duration_override`, com `reason` obrigatório quando o
         preço muda de fato — `services/appointments.py::
         update_appointment_item` valida isso, nunca só o frontend);
-      - mover pelo drag-and-drop (`professional_id` e/ou `start_at`).
+      - mover pelo drag-and-drop (`professional_id` e/ou `start_at`);
+      - trocar o SERVIÇO do item (`service_id` — Etapa "Editar serviço
+        do item"): revalida vínculo `ProfessionalService` ativo com o
+        profissional (atual ou novo, se os dois vierem juntos),
+        recusado se a Comanda linkada já estiver `CLOSED` (mesma trava
+        de `price_override`, nunca uma alteração financeira silenciosa
+        depois do fechamento) — preço/duração do catálogo NUNCA são
+        recalculados sozinhos quando só o serviço muda; use
+        `price_override`/`duration_override` juntos se o valor também
+        precisar mudar.
 
     Pelo menos um campo precisa vir preenchido."""
 
     professional_id: uuid.UUID | None = None
+    service_id: uuid.UUID | None = None
     start_at: datetime | None = None
     price_override: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     duration_override: int | None = Field(default=None, gt=0, le=1440)
@@ -133,10 +156,10 @@ class AppointmentItemUpdate(BaseModel):
     def _check_at_least_one_field(self) -> "AppointmentItemUpdate":
         if all(
             f is None
-            for f in (self.professional_id, self.start_at, self.price_override, self.duration_override)
+            for f in (self.professional_id, self.service_id, self.start_at, self.price_override, self.duration_override)
         ):
             raise ValueError(
-                "Informe ao menos um campo para editar (professional_id, start_at, "
+                "Informe ao menos um campo para editar (professional_id, service_id, start_at, "
                 "price_override ou duration_override)."
             )
         return self

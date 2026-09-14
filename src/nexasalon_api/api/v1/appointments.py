@@ -9,6 +9,7 @@ from nexasalon_api.repositories import client_repo
 from nexasalon_api.schemas.appointment import (
     AppointmentCreate,
     AppointmentCustomStatusAssign,
+    AppointmentItemAdd,
     AppointmentItemUpdate,
     AppointmentNotesUpdate,
     AppointmentRead,
@@ -60,7 +61,7 @@ def replace_appointment(
 @router.patch(
     "/{appointment_id}/items/{item_id}",
     response_model=AppointmentRead,
-    summary="Editar preço/duração/profissional/horário de UM item (drawer da Agenda + drag-and-drop)",
+    summary="Editar serviço/preço/duração/profissional/horário de UM item (drawer da Agenda + drag-and-drop)",
 )
 def update_appointment_item(
     appointment_id: uuid.UUID,
@@ -70,6 +71,22 @@ def update_appointment_item(
     actor: ActorContext = Depends(_edit),
 ) -> AppointmentRead:
     appointment = appointments_service.update_appointment_item(session, actor, appointment_id, item_id, payload)
+    return AppointmentRead.model_validate(appointment)
+
+
+@router.post(
+    "/{appointment_id}/items",
+    response_model=AppointmentRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Adicionar um novo serviço a um agendamento já existente (sem tocar nos itens atuais)",
+)
+def add_appointment_item(
+    appointment_id: uuid.UUID,
+    payload: AppointmentItemAdd,
+    session: Session = Depends(get_db),
+    actor: ActorContext = Depends(_edit),
+) -> AppointmentRead:
+    appointment = appointments_service.add_appointment_item(session, actor, appointment_id, payload)
     return AppointmentRead.model_validate(appointment)
 
 

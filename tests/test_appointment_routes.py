@@ -352,3 +352,97 @@ def test_permissao_agenda_edit_e_exigida_para_editar_item(client_as, org_a_actor
         json={"start_at": "2026-08-13T16:00:00-03:00"},
     )
     assert resp.status_code == 403
+
+
+def test_adicionar_servico_via_http(client_as, org_a_actor):
+    """`POST /appointments/{id}/items` pela API real — adiciona sem
+    apagar o item original, resposta já traz os dois itens."""
+    c = client_as(org_a_actor)
+    branch, professional, service, client = _setup_agenda(c)
+    outra_profissional = c.post("/api/v1/professionals", json={"name": "Maria"}).json()
+    escova = c.post(
+        "/api/v1/services", json={"name": "Escova", "default_duration_minutes": 45, "default_price": "80.00"}
+    ).json()
+    assert c.put(
+        f"/api/v1/professionals/{outra_profissional['id']}/services",
+        json={"items": [{"service_id": escova["id"]}]},
+    ).status_code == 200
+    assert c.put(
+        f"/api/v1/professionals/{outra_profissional['id']}/working-hours",
+        json={"items": [{"weekday": 4, "start_time": "09:00:00", "end_time": "19:00:00"}]},
+    ).status_code == 200
+
+    appt = c.post(
+        "/api/v1/appointments",
+        json={
+            "branch_id": branch["id"], "client_id": client["id"],
+            "items": [{"professional_id": professional["id"], "service_id": service["id"], "start_at": _START}],
+        },
+    ).json()
+    first_item_id = appt["items"][0]["id"]
+
+    resp = c.post(
+        f"/api/v1/appointments/{appt['id']}/items",
+        json={
+            "professional_id": outra_profissional["id"], "service_id": escova["id"],
+            "start_at": "2026-08-13T16:30:00-03:00",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert len(body["items"]) == 2
+    assert any(i["id"] == first_item_id for i in body["items"])
+    novo = next(i for i in body["items"] if i["id"] != first_item_id)
+    assert novo["service_id"] == escova["id"]
+    assert novo["professional_id"] == outra_profissional["id"]
+
+
+def test_permissao_agenda_edit_e_exigida_para_adicionar_servico(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    branch, professional, service, client = _setup_agenda(c)
+    appt = c.post(
+        "/api/v1/appointments",
+        json={
+            "branch_id": branch["id"], "client_id": client["id"],
+            "items": [{"professional_id": professional["id"], "service_id": service["id"], "start_at": _START}],
+        },
+    ).json()
+
+    restricted = _restricted_actor(org_a_actor, permissions={"agenda.view_all"})
+    resp = client_as(restricted).post(
+        f"/api/v1/appointments/{appt['id']}/items",
+        json={
+            "professional_id": professional["id"], "service_id": service["id"],
+            "start_at": "2026-08-13T16:00:00-03:00",
+        },
+    )
+    assert resp.status_code == 403
+
+
+def test_trocar_servico_do_item_via_http(client_as, org_a_actor):
+    """`PATCH /appointments/{id}/items/{item_id}` com `service_id` —
+    item 1 do pedido ("trocar o serviço atual") pela API real."""
+    c = client_as(org_a_actor)
+    branch, professional, service, client = _setup_agenda(c)
+    hidratacao = c.post(
+        "/api/v1/services", json={"name": "Hidratação", "default_duration_minutes": 45, "default_price": "90.00"}
+    ).json()
+    assert c.put(
+        f"/api/v1/professionals/{professional['id']}/services",
+        json={"items": [{"service_id": service["id"]}, {"service_id": hidratacao["id"]}]},
+    ).status_code == 200
+
+    appt = c.post(
+        "/api/v1/appointments",
+        json={
+            "branch_id": branch["id"], "client_id": client["id"],
+            "items": [{"professional_id": professional["id"], "service_id": service["id"], "start_at": _START}],
+        },
+    ).json()
+    item_id = appt["items"][0]["id"]
+
+    resp = c.patch(
+        f"/api/v1/appointments/{appt['id']}/items/{item_id}", json={"service_id": hidratacao["id"]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"][0]["service_id"] == hidratacao["id"]

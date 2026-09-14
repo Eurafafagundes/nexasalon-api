@@ -37,6 +37,7 @@ from nexasalon_api.repositories import (
     branch_repo,
     client_repo,
     customer_account_repo,
+    order_item_repo,
     order_repo,
     professional_repo,
     professional_service_repo,
@@ -45,6 +46,7 @@ from nexasalon_api.repositories import (
 )
 from nexasalon_api.schemas.appointment import (
     AppointmentCreate,
+    AppointmentItemAdd,
     AppointmentItemCreate,
     AppointmentItemUpdate,
     AppointmentReplace,
@@ -90,6 +92,14 @@ class _ItemSnapshot:
     duration_minutes: int
     price: Decimal
     has_conflict: bool
+    # Etapa "Agendar mesmo assim" — preenchidos SÓ quando `has_conflict`
+    # nasceu de uma regra que `force_overlap` pode ignorar (jornada do
+    # profissional, horário de funcionamento, bloqueio de agenda OU
+    # conflito de horário — as 4 regras do pedido). Usado por
+    # `_audit_force_overlap` pra registrar "motivo/regra ignorada" no
+    # AuditLog, nunca só um booleano genérico.
+    conflict_reason: str | None = None
+    conflict_message: str | None = None
 
 
 def _format_windows(windows: list[tuple[datetime, datetime]], tz: ZoneInfo) -> str:
@@ -245,6 +255,7 @@ def _build_item_snapshot(
     *,
     exclude_appointment_id: uuid.UUID | None,
     siblings: list["_ItemSnapshot"],
+    force_overlap: bool = False,
 ) -> _ItemSnapshot:
     professional = professional_repo.get(session, organization_id, item_in.professional_id)
     if professional is None:
@@ -280,10 +291,30 @@ def _build_item_snapshot(
     start_at = item_in.start_at
     end_at = start_at + timedelta(minutes=duration_minutes)
 
-    _assert_within_working_hours(
-        session, organization_id, branch_id, item_in.professional_id, professional.name, start_at, end_at
-    )
-    _assert_no_schedule_block(session, organization_id, branch_id, item_in.professional_id, start_at, end_at)
+    # Etapa "Agendar mesmo assim" — jornada/bloqueio de agenda eram
+    # travas DURAS (levantavam na hora, nunca passavam por
+    # `force_overlap`). Agora, quando `force_overlap=True` (já
+    # autorizado pelo chamador via `_resolve_force_overlap` ANTES desta
+    # função rodar — nunca checado aqui dentro), a exceção é capturada
+    # em vez de propagada: vira só mais um "motivo de conflito" no
+    # snapshot, decidido junto com o conflito de horário por
+    # `_apply_conflict_policy`, exatamente como já acontecia só pra
+    # conflito de agendamento. Quando `force_overlap=False` (caminho
+    # de sempre, imensa maioria das chamadas), o comportamento é
+    # IDÊNTICO ao de antes — levanta na hora, mesma mensagem.
+    conflict_reason: str | None = None
+    conflict_message: str | None = None
+    try:
+        _assert_within_working_hours(
+            session, organization_id, branch_id, item_in.professional_id, professional.name, start_at, end_at
+        )
+        _assert_no_schedule_block(session, organization_id, branch_id, item_in.professional_id, start_at, end_at)
+    except ValidationDomainError as exc:
+        if not force_overlap:
+            raise
+        details = exc.details if isinstance(exc.details, dict) else {}
+        conflict_reason = details.get("reason") or "availability"
+        conflict_message = str(exc)
 
     db_conflicts = appointment_item_repo.list_conflicts(
         session, organization_id, professional_id=item_in.professional_id, start_at=start_at, end_at=end_at,
@@ -293,7 +324,10 @@ def _build_item_snapshot(
         s.professional_id == item_in.professional_id and s.start_at < end_at and s.end_at > start_at
         for s in siblings
     )
-    has_conflict = bool(db_conflicts) or sibling_conflict
+    if (bool(db_conflicts) or sibling_conflict) and conflict_reason is None:
+        conflict_reason = "conflict"
+        conflict_message = "Profissional já tem um atendimento nesse horário. Escolha outro horário."
+    has_conflict = conflict_reason is not None
 
     return _ItemSnapshot(
         professional_id=item_in.professional_id,
@@ -303,6 +337,8 @@ def _build_item_snapshot(
         duration_minutes=duration_minutes,
         price=price,
         has_conflict=has_conflict,
+        conflict_reason=conflict_reason,
+        conflict_message=conflict_message,
     )
 
 
@@ -313,12 +349,14 @@ def _build_all_item_snapshots(
     items_in: list[AppointmentItemCreate],
     *,
     exclude_appointment_id: uuid.UUID | None,
+    force_overlap: bool = False,
 ) -> list[_ItemSnapshot]:
     snapshots: list[_ItemSnapshot] = []
     for item_in in items_in:
         snapshot = _build_item_snapshot(
             session, organization_id, branch_id, item_in,
             exclude_appointment_id=exclude_appointment_id, siblings=snapshots,
+            force_overlap=force_overlap,
         )
         snapshots.append(snapshot)
     return snapshots
@@ -412,7 +450,14 @@ def _resolve_force_overlap(actor: ActorContext, requested: bool) -> bool:
 def _apply_conflict_policy(snapshots: list[_ItemSnapshot], effective_force_overlap: bool) -> bool:
     """Levanta 409 se houver conflito e o encaixe não for permitido.
     Devolve True se algum conflito real foi (legitimamente) ignorado —
-    sinal pra registrar auditoria de force_overlap."""
+    sinal pra registrar auditoria de force_overlap.
+
+    Na prática, quando `effective_force_overlap` é `False` (caminho de
+    sempre), `_build_item_snapshot` já levantou na hora pra jornada/
+    bloqueio — só sobra o conflito de horário puro pra decidir aqui.
+    Ainda assim usa `snapshot.conflict_message`/`reason` quando vierem
+    preenchidos (nunca um texto genérico por cima de um motivo já
+    conhecido) — `ConflictError` continua o tipo (409), igual sempre foi."""
     any_forced = False
     for snapshot in snapshots:
         if snapshot.has_conflict:
@@ -422,8 +467,9 @@ def _apply_conflict_policy(snapshots: list[_ItemSnapshot], effective_force_overl
                 # olhando pro horário que acabou de escolher, não
                 # precisa dele repetido tecnicamente na mensagem.
                 raise ConflictError(
-                    "Profissional já tem um atendimento nesse horário. Escolha outro horário.",
-                    {"reason": "conflict"},
+                    snapshot.conflict_message
+                    or "Profissional já tem um atendimento nesse horário. Escolha outro horário.",
+                    {"reason": snapshot.conflict_reason or "conflict"},
                 )
             any_forced = True
     return any_forced
@@ -453,12 +499,18 @@ def _insert_items(session: Session, organization_id: uuid.UUID, appointment_id: 
 
 
 def _audit_force_overlap(session: Session, actor: ActorContext, appointment_id: uuid.UUID, snapshots: list[_ItemSnapshot]) -> None:
+    # Usuário/horário já vêm de `AuditLog.user_id`/`created_at`
+    # (padrão do módulo) — aqui só o que falta: item/profissional e o
+    # motivo/regra especificamente ignorado (item explícito do pedido
+    # "Agendar mesmo assim").
     forced_items = [
         {
             "professional_id": str(s.professional_id),
             "service_id": str(s.service_id),
             "start_at": s.start_at.isoformat(),
             "end_at": s.end_at.isoformat(),
+            "reason": s.conflict_reason,
+            "message": s.conflict_message,
         }
         for s in snapshots
         if s.has_conflict
@@ -495,7 +547,8 @@ def create_appointment(session: Session, actor: ActorContext, data: AppointmentC
     cash_register_service.assert_operational_prerequisites(session, actor, data.branch_id, purpose="appointment")
 
     snapshots = _build_all_item_snapshots(
-        session, organization_id, data.branch_id, data.items, exclude_appointment_id=None
+        session, organization_id, data.branch_id, data.items, exclude_appointment_id=None,
+        force_overlap=effective_force_overlap,
     )
     _assert_can_edit(actor, {s.professional_id for s in snapshots})
     any_forced = _apply_conflict_policy(snapshots, effective_force_overlap)
@@ -570,7 +623,8 @@ def replace_appointment(
 
     _assert_branch_and_client(session, organization_id, data.branch_id, data.client_id)
     snapshots = _build_all_item_snapshots(
-        session, organization_id, data.branch_id, data.items, exclude_appointment_id=appointment_id
+        session, organization_id, data.branch_id, data.items, exclude_appointment_id=appointment_id,
+        force_overlap=effective_force_overlap,
     )
     # Edição precisa valer tanto para os profissionais que JÁ estavam no
     # agendamento (pode estar reduzindo/removendo o item deles) quanto
@@ -1277,26 +1331,38 @@ def update_appointment_item(
     """PATCH parcial de UM item, em vez do PUT que apaga+recria tudo
     (`replace_appointment`) — necessário assim que existe uma Comanda
     aberta linkada (`OrderItem.appointment_item_id`, RESTRICT: apagar o
-    item quebraria a referência). Cobre DOIS itens do pedido com o
+    item quebraria a referência). Cobre estes itens do pedido com o
     MESMO código, porque no fundo são o mesmo tipo de edição:
 
       - "editar valor e duração no agendamento" (drawer da Agenda):
         `price_override`/`duration_override` (+ `reason` obrigatório
         quando o preço muda de fato — nunca só confiado ao frontend);
-      - "drag and drop": `professional_id`/`start_at`.
+      - "drag and drop": `professional_id`/`start_at`;
+      - "trocar o serviço do item" (Etapa "Múltiplos serviços por
+        atendimento"): `service_id`.
 
     Regra ÚNICA pra Agenda/Comanda nunca divergirem silenciosamente
     (item explícito do pedido): se existe uma Comanda ATIVA
     (`order_repo.get_by_appointment`, já filtra cancelada) linkada a
     este agendamento —
-      - `CLOSED` (paga): recusa qualquer mudança de PREÇO (alteração
-        financeira depois do fechamento exige um fluxo de estorno, não
-        implementado). Duração/horário/profissional continuam livres
-        (são só agenda, não tocam a comanda já fechada/congelada).
+      - `CLOSED` (paga): recusa qualquer mudança de PREÇO ou SERVIÇO
+        (alteração financeira depois do fechamento exige um fluxo de
+        estorno, não implementado). Duração/horário/profissional
+        continuam livres (são só agenda, não tocam a comanda já
+        fechada/congelada).
       - `OPEN`: a linha correspondente da comanda (`OrderItem` com o
         mesmo `appointment_item_id`) é sincronizada automaticamente —
         nada ainda está financeiramente comprometido, então as duas
-        camadas continuam mostrando o MESMO número."""
+        camadas continuam mostrando o MESMO número.
+
+    `force_overlap` (Etapa "Agendar mesmo assim") resolvido CEDO, antes
+    de qualquer validação de disponibilidade — mesmo padrão de
+    `create_appointment`/`replace_appointment`, nunca ignora em
+    silêncio um pedido sem a permission `agenda.force_overlap` mesmo
+    quando o horário final não tem conflito nenhum. Cobre as 4 regras
+    do pedido (jornada do profissional, horário de funcionamento,
+    bloqueio de agenda, conflito de horário) — as duas primeiras
+    (jornada/funcionamento) eram travas duras antes desta etapa."""
     organization_id = actor.organization_id
     appointment = get_appointment(session, actor, appointment_id)
     item = next((i for i in appointment.items if i.id == item_id), None)
@@ -1304,13 +1370,16 @@ def update_appointment_item(
         raise NotFoundError("Item do agendamento não encontrado.")
 
     target_professional_id = data.professional_id if data.professional_id is not None else item.professional_id
+    target_service_id = data.service_id if data.service_id is not None else item.service_id
     target_start_at = data.start_at if data.start_at is not None else item.start_at
     target_duration = data.duration_override if data.duration_override is not None else item.duration_minutes
     target_end_at = target_start_at + timedelta(minutes=target_duration)
     target_price = data.price_override if data.price_override is not None else item.price
     price_changing = data.price_override is not None and data.price_override != item.price
+    service_changing = target_service_id != item.service_id
 
     _assert_can_edit(actor, {item.professional_id, target_professional_id})
+    effective_force_overlap = _resolve_force_overlap(actor, data.force_overlap)
 
     if price_changing and not data.reason:
         raise ValidationDomainError(
@@ -1318,8 +1387,22 @@ def update_appointment_item(
             "de um atendimento é editado pela Agenda."
         )
 
+    # `AppointmentItem` nunca guarda nome de serviço (ao contrário de
+    # `OrderItem`, que é snapshot histórico) — só `service_id`, sempre
+    # resolvido AO VIVO contra o catálogo atual. `target_service_name`
+    # só existe pra alimentar o snapshot do `OrderItem` sincronizado
+    # (abaixo), nunca escrito de volta no `AppointmentItem` em si.
+    target_service_name: str | None = None
+    if service_changing:
+        target_service = service_repo.get(session, organization_id, target_service_id)
+        if target_service is None:
+            raise NotFoundError("Serviço não encontrado.")
+        if not target_service.is_active:
+            raise ValidationDomainError("Serviço está inativo.")
+        target_service_name = target_service.name
+
     professional_changing = target_professional_id != item.professional_id
-    if professional_changing:
+    if professional_changing or service_changing:
         professional = professional_repo.get(session, organization_id, target_professional_id)
         if professional is None:
             raise NotFoundError("Profissional não encontrado.")
@@ -1328,16 +1411,16 @@ def update_appointment_item(
         if professional.branch_id is not None and professional.branch_id != appointment.branch_id:
             raise ValidationDomainError("Profissional não atende nesta unidade.")
         professional_service = professional_service_repo.get_for_pair(
-            session, organization_id, target_professional_id, item.service_id
+            session, organization_id, target_professional_id, target_service_id
         )
         if professional_service is None or not professional_service.is_active:
             raise ValidationDomainError("Este profissional não executa este serviço.")
         target_professional_name = professional.name
     else:
-        # Não trocou de profissional — busca só pelo NOME (usado nas
-        # mensagens específicas de `_assert_within_working_hours` abaixo),
-        # sem repetir as checagens de ativo/unidade/vínculo acima (o item
-        # já existe com este profissional, então elas já passaram antes).
+        # Não trocou de profissional nem de serviço — busca só pelo NOME
+        # (usado nas mensagens específicas de `_assert_within_working_hours`
+        # abaixo), sem repetir as checagens de ativo/unidade/vínculo acima
+        # (o item já existe assim, então elas já passaram antes).
         existing_professional = professional_repo.get(session, organization_id, target_professional_id)
         target_professional_name = existing_professional.name if existing_professional else "O profissional"
 
@@ -1346,17 +1429,33 @@ def update_appointment_item(
     # descobrir que precisava recusar (item "impedir alteração
     # financeira silenciosa" quando a comanda já está fechada).
     order = order_repo.get_by_appointment(session, organization_id, appointment_id)
-    if order is not None and order.status == OrderStatus.CLOSED and price_changing:
+    if order is not None and order.status == OrderStatus.CLOSED and (price_changing or service_changing):
         raise ValidationDomainError(
-            "Esta comanda já foi fechada — não é possível alterar o valor deste atendimento "
+            "Esta comanda já foi fechada — não é possível alterar o valor/serviço deste atendimento "
             "silenciosamente. Use o fluxo financeiro de estorno/reversão."
         )
 
-    _assert_within_working_hours(
-        session, organization_id, appointment.branch_id, target_professional_id, target_professional_name,
-        target_start_at, target_end_at,
-    )
-    _assert_no_schedule_block(session, organization_id, appointment.branch_id, target_professional_id, target_start_at, target_end_at)
+    # Etapa "Agendar mesmo assim" — mesmo padrão de `_build_item_snapshot`:
+    # jornada/bloqueio só são engolidos (viram motivo de conflito, não
+    # exceção imediata) quando `effective_force_overlap` já foi
+    # autorizado acima; caso contrário levantam na hora, comportamento
+    # idêntico ao de sempre.
+    conflict_reason: str | None = None
+    conflict_message: str | None = None
+    try:
+        _assert_within_working_hours(
+            session, organization_id, appointment.branch_id, target_professional_id, target_professional_name,
+            target_start_at, target_end_at,
+        )
+        _assert_no_schedule_block(
+            session, organization_id, appointment.branch_id, target_professional_id, target_start_at, target_end_at
+        )
+    except ValidationDomainError as exc:
+        if not effective_force_overlap:
+            raise
+        details = exc.details if isinstance(exc.details, dict) else {}
+        conflict_reason = details.get("reason") or "availability"
+        conflict_message = str(exc)
 
     sibling_conflict = any(
         sibling.id != item.id
@@ -1369,33 +1468,36 @@ def update_appointment_item(
         session, organization_id, professional_id=target_professional_id,
         start_at=target_start_at, end_at=target_end_at, exclude_appointment_id=appointment.id,
     )
-    has_conflict = sibling_conflict or bool(db_conflicts)
-    any_forced = False
-    if has_conflict:
-        effective_force_overlap = _resolve_force_overlap(actor, data.force_overlap)
-        if not effective_force_overlap:
-            # Bug real corrigido: mesma mensagem humana de
-            # `_apply_conflict_policy` (sem ISO cru) — o usuário já
-            # está olhando pro horário que acabou de escolher.
-            raise ConflictError(
-                "Profissional já tem um atendimento nesse horário. Escolha outro horário.",
-                {"reason": "conflict"},
-            )
-        any_forced = True
+    if (sibling_conflict or bool(db_conflicts)) and conflict_reason is None:
+        conflict_reason = "conflict"
+        conflict_message = "Profissional já tem um atendimento nesse horário. Escolha outro horário."
+    has_conflict = conflict_reason is not None
+    if has_conflict and not effective_force_overlap:
+        # Bug real corrigido: mesma mensagem humana de
+        # `_apply_conflict_policy` (sem ISO cru) — o usuário já
+        # está olhando pro horário que acabou de escolher.
+        raise ConflictError(
+            conflict_message or "Profissional já tem um atendimento nesse horário. Escolha outro horário.",
+            {"reason": conflict_reason or "conflict"},
+        )
+    any_forced = has_conflict and effective_force_overlap
     _maybe_allow_overlap(session, any_forced)
 
     old_professional_id = item.professional_id
+    old_service_id = item.service_id
     old_start_at = item.start_at
     old_price = item.price
     old_duration = item.duration_minutes
     old_values = {
         "professional_id": str(old_professional_id),
+        "service_id": str(old_service_id),
         "start_at": old_start_at.isoformat(),
         "price": str(old_price),
         "duration_minutes": str(old_duration),
     }
 
     item.professional_id = target_professional_id
+    item.service_id = target_service_id
     item.start_at = target_start_at
     item.end_at = target_end_at
     item.duration_minutes = target_duration
@@ -1414,6 +1516,10 @@ def update_appointment_item(
                 order_item.professional_name = (
                     new_professional.name if new_professional is not None else "Profissional removido"
                 )
+            if service_changing and target_service_name is not None:
+                order_item_changes["service_id"] = (str(order_item.service_id), str(target_service_id))
+                order_item.service_id = target_service_id
+                order_item.service_name = target_service_name
             if target_duration != order_item.duration_minutes:
                 order_item_changes["duration_minutes"] = (str(order_item.duration_minutes), str(target_duration))
                 order_item.duration_minutes = target_duration
@@ -1435,6 +1541,8 @@ def update_appointment_item(
     change_types: list[str] = []
     if professional_changing:
         change_types.append("professional_change")
+    if service_changing:
+        change_types.append("service_change")
     if target_start_at != old_start_at:
         change_types.append("reschedule")
     if price_changing:
@@ -1448,6 +1556,7 @@ def update_appointment_item(
         old_values=old_values,
         new_values={
             "professional_id": str(target_professional_id),
+            "service_id": str(target_service_id),
             "start_at": target_start_at.isoformat(),
             "price": str(target_price),
             "duration_minutes": str(target_duration),
@@ -1460,11 +1569,118 @@ def update_appointment_item(
             session, actor, appointment_id,
             [
                 _ItemSnapshot(
-                    professional_id=target_professional_id, service_id=item.service_id,
+                    professional_id=target_professional_id, service_id=target_service_id,
                     start_at=target_start_at, end_at=target_end_at, duration_minutes=target_duration,
                     price=target_price, has_conflict=True,
+                    conflict_reason=conflict_reason, conflict_message=conflict_message,
                 )
             ],
+        )
+
+    return _reload(session, organization_id, appointment_id)
+
+
+def add_appointment_item(
+    session: Session, actor: ActorContext, appointment_id: uuid.UUID, data: AppointmentItemAdd
+) -> Appointment:
+    """`POST /appointments/{id}/items` (Etapa "Múltiplos serviços por
+    atendimento") — adiciona UM `AppointmentItem` a uma reserva JÁ
+    EXISTENTE. Reaproveita `_build_item_snapshot` (MESMA validação de
+    catálogo/jornada/bloqueio/conflito de `create_appointment`, nunca
+    uma segunda regra de disponibilidade) só pro item novo — os itens
+    ATUAIS nunca são tocados, nunca passam por `delete_for_appointment`
+    (item explícito do pedido: "nunca usar replace_appointment/
+    delete_for_appointment para isso" — evita o `IntegrityError` de
+    `OrderItem.appointment_item_id` RESTRICT quando já existe uma
+    Comanda linkada a algum item anterior).
+
+    Se existir uma Comanda ATIVA `OPEN` pra este agendamento, o novo
+    item vira automaticamente um `OrderItem` novo NELA (nunca cria uma
+    segunda Comanda) — mesmo raciocínio de granularidade de
+    `create_order` (1 OrderItem por serviço/profissional). Se a Comanda
+    já está `CLOSED`, o item é adicionado só na Agenda — a Comanda
+    fechada continua congelada, exatamente como qualquer edição pós-
+    fechamento (adicionar não é diferente de editar preço nesse
+    sentido: precisa reabrir a comanda pra refletir lá, mesma regra já
+    usada em `update_appointment_item`)."""
+    organization_id = actor.organization_id
+    appointment = get_appointment(session, actor, appointment_id)
+
+    effective_force_overlap = _resolve_force_overlap(actor, data.force_overlap)
+
+    existing_snapshots = [
+        _ItemSnapshot(
+            professional_id=i.professional_id, service_id=i.service_id, start_at=i.start_at, end_at=i.end_at,
+            duration_minutes=i.duration_minutes, price=i.price, has_conflict=False,
+        )
+        for i in appointment.items
+    ]
+    snapshot = _build_item_snapshot(
+        session, organization_id, appointment.branch_id, data,
+        exclude_appointment_id=appointment_id, siblings=existing_snapshots,
+        force_overlap=effective_force_overlap,
+    )
+    _assert_can_edit(actor, {snapshot.professional_id})
+    any_forced = _apply_conflict_policy([snapshot], effective_force_overlap)
+    _maybe_allow_overlap(session, any_forced)
+
+    service = service_repo.get(session, organization_id, snapshot.service_id)
+    professional = professional_repo.get(session, organization_id, snapshot.professional_id)
+    new_item = appointment_item_repo.create(
+        session,
+        organization_id,
+        appointment_id=appointment_id,
+        service_id=snapshot.service_id,
+        professional_id=snapshot.professional_id,
+        start_at=snapshot.start_at,
+        end_at=snapshot.end_at,
+        duration_minutes=snapshot.duration_minutes,
+        price=snapshot.price,
+    )
+    appointment.updated_by = actor.user_id
+    session.flush()  # dispara o trigger recalc_appointment_bounds (migration 0006)
+
+    audit_log_repo.create(
+        session, organization_id=organization_id, user_id=actor.user_id, entity_type="appointment_item",
+        entity_id=new_item.id, action=AuditAction.CREATE,
+        new_values={
+            "appointment_id": str(appointment_id), "professional_id": str(snapshot.professional_id),
+            "service_id": str(snapshot.service_id), "start_at": snapshot.start_at.isoformat(),
+            "price": str(snapshot.price), "duration_minutes": str(snapshot.duration_minutes),
+            "change_type": "item_added",
+        },
+    )
+    if any_forced:
+        _audit_force_overlap(session, actor, appointment_id, [snapshot])
+
+    # Comanda ABERTA linkada? O novo serviço vira um OrderItem novo na
+    # MESMA comanda — nunca uma segunda comanda pro mesmo agendamento
+    # (mesma unicidade de sempre, `uq_orders_appointment_id_active`).
+    # Comanda `CLOSED` ou inexistente: o item fica só na Agenda por
+    # enquanto, igual a qualquer edição pós-fechamento.
+    order = order_repo.get_by_appointment(session, organization_id, appointment_id)
+    if order is not None and order.status == OrderStatus.OPEN:
+        order_item_repo.create(
+            session,
+            organization_id,
+            order_id=order.id,
+            appointment_item_id=new_item.id,
+            service_id=snapshot.service_id,
+            professional_id=snapshot.professional_id,
+            duration_minutes=snapshot.duration_minutes,
+            price=snapshot.price,
+            service_name=service.name if service is not None else "Serviço removido",
+            professional_name=professional.name if professional is not None else "Profissional removido",
+        )
+        session.flush()
+        audit_log_repo.create(
+            session, organization_id=organization_id, user_id=actor.user_id, entity_type="order",
+            entity_id=order.id, action=AuditAction.UPDATE,
+            new_values={
+                "change_type": "item_added_from_appointment", "appointment_item_id": str(new_item.id),
+                "service_id": str(snapshot.service_id), "professional_id": str(snapshot.professional_id),
+                "price": str(snapshot.price),
+            },
         )
 
     return _reload(session, organization_id, appointment_id)

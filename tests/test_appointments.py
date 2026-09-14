@@ -32,6 +32,7 @@ from nexasalon_api.models.professional import Professional, ScheduleBlock, Worki
 from nexasalon_api.models.service import ProfessionalService, Service
 from nexasalon_api.schemas.appointment import (
     AppointmentCreate,
+    AppointmentItemAdd,
     AppointmentItemCreate,
     AppointmentItemUpdate,
     AppointmentReplace,
@@ -1789,3 +1790,457 @@ def test_check_availability_motivo_generico_sem_reason_especifico(org_session):
     assert result.available is False
     assert result.reason is None
     assert result.message  # ainda tem uma mensagem humana, só não um dos 4 reasons.
+
+
+# ---------------------------------------------------------------------------
+# Etapa "Múltiplos serviços por atendimento" — `POST /appointments/{id}/items`
+# (adicionar sem apagar os existentes) + `service_id` em
+# `AppointmentItemUpdate` (trocar o serviço de um item já existente).
+# ---------------------------------------------------------------------------
+
+
+def test_adicionar_segundo_servico_ao_mesmo_appointment(org_session):
+    """Cenário do pedido: Ana 15:00 Manutenção com Ianka, depois decide
+    fazer Escova às 16:30 com OUTRA profissional — mesmo Appointment,
+    item novo, nunca apaga o item original."""
+    session, org_id = org_session
+    branch = _branch(session, org_id)
+    ianka = _professional(session, org_id, branch.id, name="Ianka")
+    maria = _professional(session, org_id, branch.id, name="Maria")
+    manutencao = _service(session, org_id, name="Manutenção 3 telas", duration=90, price=360)
+    escova = _service(session, org_id, name="Escova", duration=45, price=80)
+    _link(session, ianka.id, manutencao.id)
+    _link(session, maria.id, escova.id)
+    _working_hours(session, org_id, ianka.id, _OUR_THURSDAY, time(9, 0), time(19, 0))
+    _working_hours(session, org_id, maria.id, _OUR_THURSDAY, time(9, 0), time(19, 0))
+    client = _client(session, org_id, name="Ana")
+    actor = _actor(session, org_id)
+
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=ianka.id, service_id=manutencao.id, start_at=_dt(15, 0))],
+        ),
+    )
+    first_item_id = appt.items[0].id
+
+    updated = appointments.add_appointment_item(
+        session, actor, appt.id,
+        AppointmentItemAdd(professional_id=maria.id, service_id=escova.id, start_at=_dt(16, 30)),
+    )
+
+    assert len(updated.items) == 2
+    # O item original continua exatamente o mesmo (mesmo id) — nunca
+    # apagado/recriado (item explícito: nunca usar replace/delete pra isso).
+    original = next(i for i in updated.items if i.id == first_item_id)
+    assert original.service_id == manutencao.id
+    assert original.professional_id == ianka.id
+    assert original.price == Decimal("360.00")
+    novo = next(i for i in updated.items if i.id != first_item_id)
+    assert novo.service_id == escova.id
+    assert novo.professional_id == maria.id  # segundo serviço com profissional DIFERENTE.
+    assert novo.price == Decimal("80.00")
+    assert updated.starts_at == _dt(15, 0)
+    assert updated.ends_at == _dt(17, 15)
+
+
+def test_adicionar_item_horario_manual_fora_de_slot_de_30_minutos(org_session):
+    """Item do pedido — 15:20 precisa ser possível, mesmo a grade visual
+    trabalhando com slots de 30 minutos."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(9, 0))],
+        ),
+    )
+
+    updated = appointments.add_appointment_item(
+        session, actor, appt.id,
+        AppointmentItemAdd(professional_id=prof.id, service_id=service.id, start_at=_dt(15, 20)),
+    )
+
+    novo = next(i for i in updated.items if i.start_at == _dt(15, 20))
+    assert novo.start_at.minute == 20
+
+
+def test_adicionar_item_nao_apaga_nem_recria_appointment_item_repo(org_session):
+    """Prova estrutural do item explícito do pedido: `add_appointment_item`
+    NUNCA passa por `delete_for_appointment` — os ids dos itens
+    existentes ANTES da chamada continuam sendo os MESMOS depois."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(9, 0))],
+        ),
+    )
+    ids_before = {i.id for i in appt.items}
+
+    updated = appointments.add_appointment_item(
+        session, actor, appt.id,
+        AppointmentItemAdd(professional_id=prof.id, service_id=service.id, start_at=_dt(11, 0)),
+    )
+
+    ids_after = {i.id for i in updated.items}
+    assert ids_before.issubset(ids_after)
+    assert len(ids_after) == len(ids_before) + 1
+
+
+def test_adicionar_item_conflito_sem_force_bloqueia(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+
+    with pytest.raises(ConflictError) as exc_info:
+        appointments.add_appointment_item(
+            session, actor, appt.id,
+            AppointmentItemAdd(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 30)),
+        )
+    assert exc_info.value.details["reason"] == "conflict"
+
+
+def test_adicionar_item_conflito_com_force_autorizado_cria_e_audita(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+
+    updated = appointments.add_appointment_item(
+        session, actor, appt.id,
+        AppointmentItemAdd(
+            professional_id=prof.id, service_id=service.id, start_at=_dt(14, 30), force_overlap=True,
+        ),
+    )
+    assert len(updated.items) == 2
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == appt.id,
+    ).all()
+    forced = [log for log in logs if log.new_values and log.new_values.get("change_type") == "force_overlap"]
+    assert len(forced) == 1
+    forced_items = forced[0].new_values["items"]
+    assert len(forced_items) == 1
+    assert forced_items[0]["reason"] == "conflict"  # motivo/regra ignorada, registrado.
+
+
+def test_adicionar_item_force_nao_autorizado_bloqueia(org_session):
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor_sem_forcar = _actor(session, org_id, permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap"})
+    appt = appointments.create_appointment(
+        session, actor_sem_forcar,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+        ),
+    )
+
+    with pytest.raises(ForbiddenError):
+        appointments.add_appointment_item(
+            session, actor_sem_forcar, appt.id,
+            AppointmentItemAdd(
+                professional_id=prof.id, service_id=service.id, start_at=_dt(14, 30), force_overlap=True,
+            ),
+        )
+    # Nada foi adicionado — o 403 aconteceu antes de qualquer inserção.
+    assert len(appointments.get_appointment(session, actor_sem_forcar, appt.id).items) == 1
+
+
+def test_adicionar_item_fora_da_jornada_sem_force_bloqueia(org_session):
+    """Antes desta etapa, jornada/bloqueio eram travas DURAS que
+    `force_overlap` nunca alcançava — confirma que sem force continua
+    bloqueando normalmente."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)  # jornada 09-18.
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(9, 0))],
+        ),
+    )
+
+    with pytest.raises(ValidationDomainError) as exc_info:
+        appointments.add_appointment_item(
+            session, actor, appt.id,
+            AppointmentItemAdd(professional_id=prof.id, service_id=service.id, start_at=_dt(20, 0)),
+        )
+    assert exc_info.value.details["reason"] == "professional_hours"
+
+
+def test_adicionar_item_fora_da_jornada_com_force_autorizado_cria_e_audita(org_session):
+    """Extensão nova desta etapa: `force_overlap` agora TAMBÉM cobre
+    jornada do profissional/horário de funcionamento/bloqueio de
+    agenda, não só conflito de horário — item explícito do pedido
+    ("Agendar mesmo assim" cobre as 4 regras)."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)  # jornada 09-18.
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(9, 0))],
+        ),
+    )
+
+    updated = appointments.add_appointment_item(
+        session, actor, appt.id,
+        AppointmentItemAdd(
+            professional_id=prof.id, service_id=service.id, start_at=_dt(20, 0), force_overlap=True,
+        ),
+    )
+    assert len(updated.items) == 2
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == appt.id,
+    ).all()
+    forced = [log for log in logs if log.new_values and log.new_values.get("change_type") == "force_overlap"]
+    assert len(forced) == 1
+    assert forced[0].new_values["items"][0]["reason"] == "professional_hours"
+
+
+def test_adicionar_item_com_comanda_aberta_cria_order_item_na_mesma_comanda(org_session):
+    """Comanda já aberta pro agendamento: o novo serviço vira um
+    OrderItem novo NELA — nunca uma segunda comanda."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    outro_servico = _service(session, org_id, name="Hidratação", duration=30, price=60)
+    _link(session, prof.id, outro_servico.id)
+    actor = _actor(session, org_id, permissions=_ALL_AGENDA_PERMS | frozenset({"orders.manage"}))
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(9, 0))],
+        ),
+    )
+    order = orders.create_order(session, actor, appt.id)
+    assert len(order.items) == 1
+
+    updated_appt = appointments.add_appointment_item(
+        session, actor, appt.id,
+        AppointmentItemAdd(professional_id=prof.id, service_id=outro_servico.id, start_at=_dt(11, 0)),
+    )
+    new_appt_item = next(i for i in updated_appt.items if i.service_id == outro_servico.id)
+
+    session.refresh(order)
+    assert len(order.items) == 2  # NUNCA uma segunda Order — mesma comanda.
+    new_order_item = next(oi for oi in order.items if oi.appointment_item_id == new_appt_item.id)
+    assert new_order_item.service_id == outro_servico.id
+    assert new_order_item.price == Decimal("60.00")
+
+
+def test_adicionar_item_com_comanda_fechada_nao_cria_order_item(org_session):
+    """Comanda já FECHADA: o item novo entra só na Agenda — nunca
+    reabre nem altera a comanda congelada em silêncio."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    outro_servico = _service(session, org_id, name="Hidratação", duration=30, price=60)
+    _link(session, prof.id, outro_servico.id)
+    actor = _actor(
+        session, org_id,
+        permissions=_ALL_AGENDA_PERMS | frozenset({"orders.manage", "orders.view", "payments.register"}),
+    )
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(9, 0))],
+        ),
+    )
+    order = orders.create_order(session, actor, appt.id)
+    order.status = OrderStatus.CLOSED
+    order.closed_at = datetime.now(timezone.utc)
+    session.flush()
+
+    updated_appt = appointments.add_appointment_item(
+        session, actor, appt.id,
+        AppointmentItemAdd(professional_id=prof.id, service_id=outro_servico.id, start_at=_dt(11, 0)),
+    )
+    assert len(updated_appt.items) == 2  # a Agenda ganhou o item...
+
+    session.refresh(order)
+    assert len(order.items) == 1  # ...mas a Comanda fechada continua intocada.
+
+
+def test_trocar_service_id_em_item_existente(org_session):
+    """Item 1 do pedido: trocar o SERVIÇO de um item já existente."""
+    session, org_id = org_session
+    branch, prof, corte, client = _setup_basic(session, org_id)
+    hidratacao = _service(session, org_id, name="Hidratação", duration=45, price=90)
+    _link(session, prof.id, hidratacao.id)
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=corte.id, start_at=_dt(9, 0))],
+        ),
+    )
+
+    updated = appointments.update_appointment_item(
+        session, actor, appt.id, appt.items[0].id,
+        AppointmentItemUpdate(service_id=hidratacao.id),
+    )
+
+    assert updated.items[0].service_id == hidratacao.id
+    # Preço/duração do item continuam os que já estavam (troca de
+    # serviço sozinha não recalcula do catálogo novo — item explícito
+    # do pedido: use price_override/duration_override junto se precisar).
+    assert updated.items[0].price == Decimal("100.00")
+
+
+def test_trocar_servico_para_par_profissional_servico_invalido_e_bloqueado(org_session):
+    session, org_id = org_session
+    branch, prof, corte, client = _setup_basic(session, org_id)
+    sem_vinculo = _service(session, org_id, name="Coloração", duration=60, price=200)  # SEM _link com `prof`.
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=corte.id, start_at=_dt(9, 0))],
+        ),
+    )
+
+    with pytest.raises(ValidationDomainError):
+        appointments.update_appointment_item(
+            session, actor, appt.id, appt.items[0].id,
+            AppointmentItemUpdate(service_id=sem_vinculo.id),
+        )
+
+
+def test_trocar_servico_sincroniza_order_item_quando_order_open(org_session):
+    """Item 2 do pedido: sincronização com OrderItem quando a Comanda
+    está OPEN."""
+    session, org_id = org_session
+    branch, prof, corte, client = _setup_basic(session, org_id)
+    hidratacao = _service(session, org_id, name="Hidratação", duration=45, price=90)
+    _link(session, prof.id, hidratacao.id)
+    actor = _actor(session, org_id, permissions=_ALL_AGENDA_PERMS | frozenset({"orders.manage"}))
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=corte.id, start_at=_dt(9, 0))],
+        ),
+    )
+    order = orders.create_order(session, actor, appt.id)
+    order_item = order.items[0]
+    assert order_item.service_id == corte.id
+
+    appointments.update_appointment_item(
+        session, actor, appt.id, appt.items[0].id,
+        AppointmentItemUpdate(service_id=hidratacao.id),
+    )
+
+    session.refresh(order_item)
+    assert order_item.service_id == hidratacao.id
+    assert order_item.service_name == "Hidratação"
+    sync_logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == order_item.id, AuditLog.entity_type == "order_item",
+    ).all()
+    assert any(
+        log.new_values.get("change_type") == "synced_from_appointment_edit"
+        and "service_id" in log.new_values
+        for log in sync_logs
+    )
+
+
+def test_trocar_servico_com_comanda_fechada_e_bloqueado(org_session):
+    """Item 2 do pedido: bloqueio quando a Comanda está CLOSED."""
+    session, org_id = org_session
+    branch, prof, corte, client = _setup_basic(session, org_id)
+    hidratacao = _service(session, org_id, name="Hidratação", duration=45, price=90)
+    _link(session, prof.id, hidratacao.id)
+    actor = _actor(
+        session, org_id,
+        permissions=_ALL_AGENDA_PERMS | frozenset({"orders.manage", "orders.view", "payments.register"}),
+    )
+    cash_register.open_register(session, actor, branch.id, Decimal("0"), None)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=corte.id, start_at=_dt(9, 0))],
+        ),
+    )
+    order = orders.create_order(session, actor, appt.id)
+    order.status = OrderStatus.CLOSED
+    order.closed_at = datetime.now(timezone.utc)
+    session.flush()
+
+    with pytest.raises(ValidationDomainError):
+        appointments.update_appointment_item(
+            session, actor, appt.id, appt.items[0].id,
+            AppointmentItemUpdate(service_id=hidratacao.id),
+        )
+
+    # Duração/horário continuam livres (não são alteração financeira/serviço).
+    updated = appointments.update_appointment_item(
+        session, actor, appt.id, appt.items[0].id,
+        AppointmentItemUpdate(start_at=_dt(10, 0)),
+    )
+    assert updated.items[0].start_at == _dt(10, 0)
+    assert updated.items[0].service_id == corte.id  # serviço continua o original — nunca trocado em silêncio.
+
+
+def test_update_item_fora_da_jornada_com_force_autorizado_reagenda_e_audita(org_session):
+    """Mesma extensão de `force_overlap` (jornada/bloqueio), agora pelo
+    caminho de `update_appointment_item` (drag-and-drop/edição pontual),
+    não só `add_appointment_item`."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)  # jornada 09-18.
+    actor = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(9, 0))],
+        ),
+    )
+
+    with pytest.raises(ValidationDomainError):
+        appointments.update_appointment_item(
+            session, actor, appt.id, appt.items[0].id,
+            AppointmentItemUpdate(start_at=_dt(20, 0)),
+        )
+
+    updated = appointments.update_appointment_item(
+        session, actor, appt.id, appt.items[0].id,
+        AppointmentItemUpdate(start_at=_dt(20, 0), force_overlap=True),
+    )
+    assert updated.items[0].start_at == _dt(20, 0)
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == appt.id,
+    ).all()
+    forced = [log for log in logs if log.new_values and log.new_values.get("change_type") == "force_overlap"]
+    assert len(forced) == 1
+    assert forced[0].new_values["items"][0]["reason"] == "professional_hours"
