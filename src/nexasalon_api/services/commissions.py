@@ -134,7 +134,18 @@ def resolve_commission(
     depois. `price` é sempre o valor DESTE `OrderItem` individual (item
     explícito "1 OrderItem = 1 serviço + 1 profissional + 1 valor" —
     nunca a soma da comanda inteira, o que duplicaria comissão entre
-    profissionais diferentes na mesma comanda)."""
+    profissionais diferentes na mesma comanda).
+
+    `price <= 0` NUNCA gera comissão, mesmo com `commission_type=FIXED`
+    (decisão de negócio confirmada — ex.: "AVALIAÇÃO - SEM CUSTO" com
+    comissão fixa configurada: sem sinal/venda, o item fecha a R$0 e a
+    comissão tem que ser R$0; só quando a profissional lança um valor
+    real no item — ex. R$300 de sinal — a comissão fixa configurada é
+    gerada). Pra `PERCENTAGE` isso já acontecia sozinho (`price × taxa
+    / 100` dá 0 quando `price` é 0); pra `FIXED` precisa do guard
+    explícito abaixo, porque o valor configurado nunca dependia de
+    `price` antes. `commission_status` continua `CALCULATED` nos dois
+    casos — a regra existe e foi resolvida, só o valor é zero."""
     link = professional_service_repo.get_for_pair(session, organization_id, professional_id, service_id)
     if link is None or not link.is_active or link.commission_type is None:
         return CommissionResolution(
@@ -153,6 +164,8 @@ def resolve_commission(
     commission_value = Decimal(str(link.commission_value))
     if link.commission_type == CommissionType.PERCENTAGE:
         commission_amount = (price * commission_value / Decimal("100")).quantize(_CENTS)
+    elif price <= 0:
+        commission_amount = Decimal("0.00")
     else:
         commission_amount = commission_value.quantize(_CENTS)
 

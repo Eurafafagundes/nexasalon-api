@@ -1159,17 +1159,19 @@ def test_fechar_comanda_totalmente_gratuita_com_lista_de_pagamentos_vazia_sem_pa
     assert appt.status == AppointmentStatus.PAID
 
 
-def test_comissao_percentual_em_item_zerado_e_zero_mas_comissao_fixa_continua_integral(org_session):
-    """Documenta (nao altera) a regra atual de comissao pra item R$0:
-    PERCENTUAL -> comissao 0 (proporcional ao valor vendido). FIXA ->
-    comissao INTEGRAL, porque `resolve_commission` pro tipo FIXED
-    ignora `price` inteiramente. Pode ser correto de proposito -- numa
-    cortesia o profissional trabalhou igual, entao uma comissao fixa
-    (que remunera o TRABALHO, nao um percentual da venda) continuar
-    integral e uma decisao de negocio legitima, nao um bug. Esta rodada
-    so CONFIRMA que o comportamento e intencional; a decisao de manter
-    ou mudar fica separada, com o usuario."""
-    from nexasalon_api.models.enums import CommissionType
+def test_comissao_percentual_e_fixa_em_item_zerado_sao_ambas_zero(org_session):
+    """Regra atual (revisada — Etapa "Comissão fixa em item R$0"):
+    PERCENTUAL -> comissão 0 (proporcional ao valor vendido, sempre foi
+    assim). FIXA -> também 0 quando `price <= 0`, mesmo com a regra
+    configurada — decisão de negócio confirmada (ex.: "AVALIAÇÃO - SEM
+    CUSTO" com comissão fixa configurada: sem sinal/venda, a avaliação
+    fecha a R$0 e não gera comissão nenhuma; só quando o item tem um
+    valor real lançado é que a comissão fixa configurada é paga
+    integralmente — ver `test_comissao_fixa_so_e_gerada_quando_item_tem_valor_lancado`
+    logo abaixo). Substitui o teste anterior, que documentava o
+    comportamento OPOSTO (fixa integral independente do preço) como
+    intencional — essa decisão foi revista."""
+    from nexasalon_api.models.enums import CommissionStatus, CommissionType
     from nexasalon_api.models.service import ProfessionalService
 
     session, org_id = org_session
@@ -1198,8 +1200,55 @@ def test_comissao_percentual_em_item_zerado_e_zero_mas_comissao_fixa_continua_in
     closed_a = next(i for i in closed.items if i.id == item_a.id)
     closed_b = next(i for i in closed.items if i.id == item_b.id)
     assert closed_a.commission_amount_snapshot == Decimal("0.00")  # percentual: 0% de 0 = 0, proporcional.
-    assert closed_b.commission_amount_snapshot == Decimal("20.00")  # fixa: integral, mesmo com item a R$0 (intencional).
+    assert closed_b.commission_amount_snapshot == Decimal("0.00")  # fixa: também 0 quando o item fecha a R$0.
+    assert closed_a.commission_status == CommissionStatus.CALCULATED  # regra existe e foi resolvida, só o valor é 0.
+    assert closed_b.commission_status == CommissionStatus.CALCULATED
     assert register.id  # caixa aberto continua exigido mesmo sem nenhum Payment (pre-requisito operacional).
+
+
+def test_comissao_fixa_so_e_gerada_quando_item_tem_valor_lancado(org_session):
+    """Cenário real do pedido: serviço "AVALIAÇÃO - SEM CUSTO" (preço
+    padrão R$0) com comissão FIXA de R$50 configurada pra profissional.
+    Fechada sem sinal (item continua R$0) -> comissão R$0. Reaberta,
+    item editado pra R$300 (sinal recebido) e refechada -> comissão
+    fixa integral de R$50, disparada só porque o item passou a ter
+    valor > 0 (nunca porque um Payment de R$300 foi registrado — a
+    comissão nunca olha pra Payment, só pra `OrderItem.price`)."""
+    from nexasalon_api.models.enums import CommissionStatus, CommissionType
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, _branch, prof, _client = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    # Captura os dois IDs ANTES de qualquer update — `order.items` não
+    # garante ordem estável entre reloads (`update_item_price` recarrega
+    # a comanda a cada chamada), então indexar `order.items[1:]` DEPOIS
+    # do primeiro update já mutado é um bug real: pode devolver de novo
+    # o item que acabou de ser zerado, deixando o outro item intocado.
+    item, other_item = order.items[0], order.items[1]
+    session.query(ProfessionalService).filter_by(professional_id=prof.id, service_id=item.service_id).update(
+        {"commission_type": CommissionType.FIXED, "commission_value": Decimal("50.00")}
+    )
+    session.flush()
+    orders.update_item_price(session, actor, order.id, item.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    orders.update_item_price(session, actor, order.id, other_item.id, OrderItemPriceUpdate(price=Decimal("0.00")))
+    register = _open_register(session, actor)
+
+    closed = orders.close_order(session, actor, order.id, OrderClose(payments=[]))
+    closed_item = next(i for i in closed.items if i.id == item.id)
+    assert closed_item.commission_amount_snapshot == Decimal("0.00")  # sem sinal -- sem comissão.
+
+    reopened = orders.reopen_order(session, actor, order.id, OrderReopen(reason="Cliente fechou venda, sinal recebido"))
+    reopened_item = next(i for i in reopened.items if i.id == item.id)
+    orders.update_item_price(session, actor, order.id, reopened_item.id, OrderItemPriceUpdate(price=Decimal("300.00")))
+
+    refeito = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("300.00"), cash_register_id=register.id)]),
+    )
+    refeito_item = next(i for i in refeito.items if i.id == item.id)
+    assert refeito_item.commission_amount_snapshot == Decimal("50.00")  # sinal lançado -- comissão fixa integral.
+    assert refeito_item.commission_status == CommissionStatus.CALCULATED
 
 
 # --- Overpayment: saldo = total - pagamentos ja processados; nenhum ---
