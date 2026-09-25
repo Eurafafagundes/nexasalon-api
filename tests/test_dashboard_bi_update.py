@@ -145,6 +145,11 @@ def _sale(
     service_name="Serviço", professional_name="Profissional",
     commission_type: CommissionType | None = None, commission_value: Decimal | None = None,
     commission_amount: Decimal | None = None, commission_status: CommissionStatus | None = None,
+    # Competência de venda (correção priorizada) — `Order.created_at`,
+    # agora a fonte real usada por `services/dashboard.py`. Default =
+    # `closed_at` (comportamento IDÊNTICO ao de antes desta correção
+    # pra todos os testes existentes deste arquivo).
+    created_at: datetime | None = None,
 ) -> Order:
     """Mesmo atalho de `test_dashboard.py::_sale`, com o acréscimo dos
     campos de snapshot de comissão (Etapa C2) — setados diretamente
@@ -154,6 +159,7 @@ def _sale(
     order = Order(
         organization_id=org_id, order_number=_next_order_number(), appointment_id=appt.id,
         branch_id=branch_id, client_id=client_id, status=OrderStatus.CLOSED, closed_at=closed_at,
+        created_at=created_at if created_at is not None else closed_at,
     )
     session.add(order)
     session.flush()

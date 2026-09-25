@@ -20,6 +20,7 @@ venda continuam sendo conceitos diferentes (ver docstring "TRÊS
 CONCEITOS" em `services/dashboard.py`); esta função nunca lê
 `Payment`."""
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 
 from nexasalon_api.models.order import Order, OrderItem
@@ -47,6 +48,21 @@ def order_total(order: Order) -> Decimal:
     o ÚNICO significado desta função — "quanto foi vendido", não
     "quanto falta pagar"."""
     return order_total_breakdown(order).total
+
+
+# --- Competência de venda (migration 0055, regularização temporária) --
+
+
+def sale_competence(order: Order) -> datetime:
+    """Fonte CANÔNICA (Python, pra código que já tem o objeto `Order`
+    carregado — ex. `services/extract.py`) da competência de venda:
+    `sale_competence_override` quando preenchido (regularização manual
+    no fechamento), senão `created_at` (o padrão, sempre). NUNCA
+    `closed_at` — ver docstring de `Order.sale_competence_override`.
+    Todo consumidor que precisar de "em que dia esta venda conta" deve
+    chamar esta função (ou `sale_competence_expr` em SQL), nunca ler
+    `order.created_at` direto."""
+    return order.sale_competence_override or order.created_at
 
 
 # --- Etapa "Benefício por Item" ---------------------------------------

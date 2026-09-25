@@ -360,6 +360,51 @@ def test_filtro_de_data_inclui_comanda_dentro_do_periodo(org_session):
     assert summary.revenue_total == total
 
 
+def test_comanda_regularizada_com_sale_date_aparece_no_extrato_no_dia_escolhido_nao_no_dia_real(org_session):
+    """Regularização temporária (migration 0055) — fechar HOJE uma
+    comanda com "Data da venda" = dia anterior precisa mover a comanda
+    pro filtro/exibição daquele dia no Extrato, mesmo com `created_at`/
+    `closed_at` reais sendo hoje. `ExtractSaleRow.date` (o que a coluna
+    "Data" mostra e o Excel exporta) precisa refletir o mesmo dia do
+    filtro — nunca as duas fontes divergindo de novo."""
+    from nexasalon_api.schemas.extract import ExtractSaleRow
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+    total = sum((i.price for i in order.items), Decimal("0"))
+    sale_date = (datetime.now(timezone.utc) - timedelta(days=5)).date()
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(
+            payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)],
+            sale_date=sale_date,
+        ),
+    )
+
+    # Filtro do dia REGULARIZADO (5 dias atrás) — a comanda aparece,
+    # mesmo criada/fechada hoje de verdade.
+    regularized_from = datetime.combine(sale_date, time.min, tzinfo=_TZ)
+    regularized_to = regularized_from + timedelta(days=1)
+    summary_regularized = extract.get_extract(session, actor, date_from=regularized_from, date_to=regularized_to)
+    assert len(summary_regularized.sales) == 1
+    assert summary_regularized.revenue_total == total
+
+    # Filtro de HOJE (a data real de created_at/closed_at) — a comanda
+    # NÃO aparece: foi regularizada pra outro dia.
+    today_from = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_to = today_from + timedelta(days=1)
+    summary_today = extract.get_extract(session, actor, date_from=today_from, date_to=today_to)
+    assert summary_today.sales == []
+
+    # A linha exibida/exportada mostra a mesma data do filtro que a
+    # encontrou — nunca a data real de criação.
+    row = ExtractSaleRow.from_order(closed, "Cliente")
+    assert row.date.date() == sale_date
+
+
 # ---------------------------------------------------------------------
 # Isolamento multiempresa
 # ---------------------------------------------------------------------

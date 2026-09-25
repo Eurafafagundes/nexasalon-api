@@ -46,7 +46,7 @@ lugar que efetivamente calcula cada uma)
 
 FATURAMENTO = soma de `OrderItem.price` (serviço) + `OrderProductItem.
 quantity * unit_price` (produto) de comandas (`Order`) com
-`status=CLOSED` e `closed_at` dentro do período — a MESMA fórmula
+`status=CLOSED` e `created_at` dentro do período — a MESMA fórmula
 canônica de `services/order_totals.py::order_total`, já usada por
 `close_order`/`OrderRead`/histórico de compras do cliente. Não é
 `AppointmentItem.price` (valor no momento da RESERVA, pode nunca virar
@@ -57,6 +57,75 @@ pago cobre o total da comanda — ou seja, é dinheiro EFETIVAMENTE
 registrado, não estimativa. Esta é EXATAMENTE a mesma fórmula que
 `services/extract.py` (Financeiro > Extrato) já usa pra "Receitas" —
 escolhida de propósito pra o Dashboard nunca discordar do Financeiro.
+
+CORREÇÃO DE COMPETÊNCIA (item priorizado — "competência de venda"):
+antes desta correção, a competência de TODAS as métricas de
+venda/faturamento abaixo usava `Order.closed_at` (quando a comanda foi
+efetivamente fechada/paga) — divergindo do Extrato, que sempre filtrou
+por `Order.created_at`. Regra de negócio explícita agora:
+
+    VENDA/FATURAMENTO = `sale_competence_expr()` (`models/order.py`)
+                       = COALESCE(Order.sale_competence_override, Order.created_at)
+
+`sale_competence_override` (migration 0055, "regularização temporária
+de vendas antigas") é uma camada OPCIONAL por cima de `created_at`,
+preenchida SÓ quando o usuário escolhe conscientemente uma "Data da
+venda" diferente no fechamento (`OrderClose.sale_date`, ver
+`services/orders.py::close_order`) — nunca em massa, sempre auditado.
+`NULL` (a esmagadora maioria das comandas, sempre) cai de volta em
+`created_at`, comportamento idêntico ao já aprovado antes desta
+coluna existir. NUNCA `Order.closed_at`, nunca `CashRegister.
+opened_at`/`closed_at` (sessão de caixa, jamais competência de venda).
+Isto NUNCA muda o VALOR de nenhuma venda (preço, comissão, taxa,
+benefício continuam exatamente como sempre foram) — só a DATA à qual
+cada comanda é atribuída nas séries/relatórios por dia.
+
+RECEBIDO (correção — "Recebido = Payment.created_at"): deixou de
+compartilhar a população/competência de Faturamento. Agora é uma
+POPULAÇÃO PRÓPRIA e independente — soma `Payment.amount` (`reversed_at
+IS NULL`) filtrando DIRETO por `Payment.created_at` no período (ver
+`_received_total`/`_received_series_values`), nunca mais por
+`Order.sale_competence`. Uma comanda com competência de venda em 20/09
+mas paga (Payment.created_at) em 25/09 aparece com Faturamento em
+20/09 e Recebido em 25/09 — são dois eventos diferentes, cada um no
+seu dia real. EXCEÇÃO: a Reconciliação Faturamento×Recebido
+(`RevenueReconciliation`, dentro do drill-down de "revenue") continua
+usando `_received(data)` — o total pago da comanda, QUALQUER data —
+porque reconciliação responde "esta venda já foi paga?" (pergunta por
+COMANDA), não "quanto entrou neste dia" (pergunta por PAGAMENTO). As
+duas leituras de "Recebido" coexistem de propósito, nunca confundidas
+uma com a outra.
+
+FATURAMENTO LÍQUIDO continua sendo métrica de VENDA (Faturamento menos
+taxa), nunca "Recebido menos taxa" — a taxa por bucket é lida de
+`Payment`, mas bucketizada pela competência de VENDA da comanda
+(`sale_competence_expr()`), nunca por `Payment.created_at`.
+
+RESULTADO DISPONÍVEL — consistência de população (auditoria pedida
+explicitamente): a Comissão OFICIAL do produto (`services/
+commissions.py`, tela Comissões, "Comissão Calculada" do Resumo
+Financeiro) CONTINUA em `Order.closed_at`, decisão de negócio separada,
+nunca redesenhada aqui. Mas DENTRO do Resultado Disponível
+especificamente, subtrair essa comissão (população `closed_at`) de uma
+receita calculada em população `sale_competence` (VENDA) seria
+matematicamente inconsistente mês a mês (uma comanda que atravessa a
+virada do mês entre criação/regularização e fechamento entraria na
+receita de um mês e na comissão de outro). Por isso `_available_result`
+usa uma comissão ECONÔMICA PRÓPRIA (`row.commission`, populada em
+`_fetch_period_data` pela MESMA população de `data.orders` — nunca uma
+segunda chamada a `commissions_service.get_overview`), garantindo que
+receita e comissão do Resultado Disponível sempre somam a MESMA
+população de vendas. Isso é uma leitura DIFERENTE (e deliberadamente
+divergente) da "Comissão Calculada" oficial mostrada em outros lugares
+do Dashboard — mesmo valor econômico por item (`commission_amount_
+snapshot`, `commission_status=CALCULATED`), população diferente.
+
+Duas exceções DELIBERADAS que CONTINUAM usando `Order.closed_at` cru
+(nunca `sale_competence_expr()`), porque respondem uma pergunta
+diferente de "qual a competência da venda": NOVOS CLIENTES/RETENÇÃO
+(ver `_first_visit_by_client`/`_compute_retention_rate`) — "quando o
+cliente foi de fato atendido/pagou pela primeira vez". E a Comissão
+OFICIAL (`services/commissions.py`) — ver parágrafo acima.
 
 Etapa N4.1 — produto vendido (`OrderProductItem`) SEMPRE entra aqui:
 é venda real (baixa de estoque de verdade acontece no fechamento, ver
@@ -178,7 +247,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.actor import ActorContext
@@ -188,11 +257,18 @@ from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import (
     AppointmentStatus,
     CashMovementType,
+    CommissionStatus,
     OrderStatus,
     PaymentFeeStatus,
     PaymentMethod,
 )
-from nexasalon_api.models.order import Order, OrderItem, OrderProductItem, Payment
+from nexasalon_api.models.order import (
+    Order,
+    OrderItem,
+    OrderProductItem,
+    Payment,
+    sale_competence_expr,
+)
 from nexasalon_api.repositories import (
     branch_repo,
     cash_movement_repo,
@@ -233,9 +309,9 @@ from nexasalon_api.schemas.dashboard import (
     TopServiceRow,
 )
 from nexasalon_api.services import commissions as commissions_service
+from nexasalon_api.services import fixed_expenses as fixed_expenses_service
 from nexasalon_api.services import payment_fees as payment_fees_service
 from nexasalon_api.services import tax_rates as tax_rates_service
-from nexasalon_api.services import fixed_expenses as fixed_expenses_service
 
 _CENTS = Decimal("0.01")
 
@@ -300,9 +376,24 @@ class DashboardFilters:
 class _OrderRow:
     order_id: uuid.UUID
     client_id: uuid.UUID
-    closed_at: datetime
+    # Competência de venda EFETIVA (correção priorizada) —
+    # `sale_competence_expr()` (`COALESCE(sale_competence_override,
+    # created_at)`), NUNCA `closed_at`/`CashRegister.opened_at`. Usado
+    # por todo bucket/filtro de população deste módulo (Faturamento,
+    # Ticket Médio, Top Serviços, etc.) — as duas exceções deliberadas
+    # que continuam olhando `Order.closed_at` (Novos Clientes/Retenção,
+    # Comissão oficial) vivem em queries PRÓPRIAS, independentes de
+    # `_OrderRow` (ver `_first_visit_by_client`/`_compute_retention_rate`/
+    # `services/commissions.py`).
+    sale_competence: datetime
     total: Decimal  # FATURAMENTO desta comanda — soma de `OrderItem.price`, nunca `Payment`.
-    received: Decimal  # RECEBIDO desta comanda — soma de `Payment.amount`, granularidade separada (ver docstring do módulo).
+    # RECEBIDO desta comanda — soma de `Payment.amount` (QUALQUER
+    # data), usado EXCLUSIVAMENTE pela Reconciliação por comanda
+    # (`_revenue_reconciliation_totals`). O KPI "Recebido" em si
+    # (card/série/Resumo Financeiro) NÃO usa mais este campo — ver
+    # `_received_total`/`_received_series_values`, população própria
+    # por `Payment.created_at` (docstring do módulo).
+    received: Decimal
     # BENEFÍCIOS CONCEDIDOS desta comanda — soma de `OrderItem.
     # benefit_amount` (Cartão Fidelidade + Cortesia; Voucher/Permuta NÃO
     # entram aqui, continuam Payment real). Sempre <= `total` por
@@ -311,6 +402,15 @@ class _OrderRow:
     # nenhum Payment relacionado (a diferença é dinheiro que nunca
     # existiu, não dinheiro que entrou e saiu).
     benefit: Decimal
+    # COMISSÃO ECONÔMICA desta comanda (`OrderItem.commission_amount_
+    # snapshot`, só quando `commission_status=CALCULATED` — MESMA regra
+    # de `services/commissions.py`) — usada EXCLUSIVAMENTE por
+    # `_available_result` (Resultado Disponível), pra a comissão
+    # subtraída ali corresponder à MESMA população de vendas da receita
+    # (nunca a população `closed_at` da Comissão oficial, ver docstring
+    # do módulo). NUNCA usada como "Comissão Calculada" oficial em
+    # nenhum outro lugar do Dashboard.
+    commission: Decimal
 
 
 @dataclass
@@ -343,20 +443,23 @@ def _resolve_branch(session: Session, organization_id: uuid.UUID, branch_id: uui
 
 
 def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: datetime, date_to: datetime) -> _PeriodData:
-    # Comandas fechadas no período — SEM join a `OrderItem` (Etapa
-    # N4.1: uma comanda só-produto, sem NENHUM `OrderItem`, não pode
-    # sumir do Faturamento por causa de um INNER JOIN vazio).
-    base_order_stmt = select(Order.id, Order.client_id, Order.closed_at).where(
+    # Comandas fechadas cuja competência EFETIVA (`sale_competence_expr()`
+    # — correção priorizada, nunca `closed_at` cru) cai no período — SEM
+    # join a `OrderItem` (Etapa N4.1: uma comanda só-produto, sem NENHUM
+    # `OrderItem`, não pode sumir do Faturamento por causa de um INNER
+    # JOIN vazio).
+    competence = sale_competence_expr()
+    base_order_stmt = select(Order.id, Order.client_id, competence).where(
         Order.organization_id == filters.organization_id,
         Order.status == OrderStatus.CLOSED,
-        Order.closed_at >= date_from,
-        Order.closed_at < date_to,
+        competence >= date_from,
+        competence < date_to,
     )
     if filters.branch_id is not None:
         base_order_stmt = base_order_stmt.where(Order.branch_id == filters.branch_id)
 
     # Serviço e produto somados em queries SEPARADAS — mesmo raciocínio
-    # de `received_stmt` logo abaixo: nunca um join único entre
+    # de `commission_stmt` logo abaixo: nunca um join único entre
     # OrderItem/OrderProductItem/Payment na mesma consulta, que
     # duplicaria por produto cartesiano (ver
     # `test_top_servicos_agrega_por_servico_sem_duplicar_faturamento`).
@@ -372,8 +475,8 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= date_from,
-            Order.closed_at < date_to,
+            competence >= date_from,
+            competence < date_to,
         )
         .group_by(OrderItem.order_id)
     )
@@ -386,8 +489,8 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= date_from,
-            Order.closed_at < date_to,
+            competence >= date_from,
+            competence < date_to,
         )
         .group_by(OrderProductItem.order_id)
     )
@@ -406,8 +509,33 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= date_from,
-            Order.closed_at < date_to,
+            competence >= date_from,
+            competence < date_to,
+        )
+        .group_by(OrderItem.order_id)
+    )
+    # COMISSÃO ECONÔMICA por comanda (auditoria "consistência de
+    # população no Resultado Disponível") — MESMOS filtros/população
+    # que `services_stmt` acima (competência de VENDA, nunca
+    # `closed_at`), MESMA regra de valor que `services/commissions.py`
+    # (`commission_amount_snapshot`, só quando `commission_status=
+    # CALCULATED` — NOT_CONFIGURED/histórico nunca contam, mesmo
+    # raciocínio do módulo de Comissões, nunca uma segunda
+    # interpretação). Usada EXCLUSIVAMENTE por `_available_result` —
+    # nunca é a "Comissão Calculada" oficial (essa continua vindo de
+    # `commissions_service.get_overview`, população `closed_at`).
+    commission_case = case(
+        (OrderItem.commission_status == CommissionStatus.CALCULATED, OrderItem.commission_amount_snapshot),
+        else_=0,
+    )
+    commission_stmt = (
+        select(OrderItem.order_id, func.coalesce(func.sum(commission_case), 0))
+        .join(Order, Order.id == OrderItem.order_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Order.status == OrderStatus.CLOSED,
+            competence >= date_from,
+            competence < date_to,
         )
         .group_by(OrderItem.order_id)
     )
@@ -415,6 +543,7 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
         services_stmt = services_stmt.where(Order.branch_id == filters.branch_id)
         products_stmt = products_stmt.where(Order.branch_id == filters.branch_id)
         benefits_stmt = benefits_stmt.where(Order.branch_id == filters.branch_id)
+        commission_stmt = commission_stmt.where(Order.branch_id == filters.branch_id)
     services_by_order: dict[uuid.UUID, Decimal] = {
         row[0]: Decimal(row[1]) for row in session.execute(services_stmt).all()
     }
@@ -424,24 +553,31 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
     benefits_by_order: dict[uuid.UUID, Decimal] = {
         row[0]: Decimal(row[1]) for row in session.execute(benefits_stmt).all()
     }
+    commission_by_order: dict[uuid.UUID, Decimal] = {
+        row[0]: Decimal(row[1]) for row in session.execute(commission_stmt).all()
+    }
 
-    # RECEBIDO por comanda — query SEPARADA (mesmo raciocínio acima).
-    # Mesmo filtro de organização/unidade/status/data que as demais,
-    # pra somar Payment só das comandas que também entram no Faturamento.
-    # `reversed_at IS NULL` exclui pagamento estornado por
-    # `reopen_order` (comanda reaberta e refechada com outra forma de
-    # pagamento) — sem este filtro, o Payment antigo revertido voltaria
-    # a somar junto com o novo assim que a Order virasse `CLOSED` de
-    # novo (mesmo raciocínio já aplicado em
-    # `cash_register.py::build_summary`).
+    # RECEBIDO por comanda — query SEPARADA (mesmo raciocínio acima),
+    # usada EXCLUSIVAMENTE pela Reconciliação (`_revenue_reconciliation_
+    # totals`): soma TODOS os pagamentos desta comanda, QUALQUER data —
+    # nunca filtra por `Payment.created_at` (isso é o KPI "Recebido" em
+    # si, população própria, ver `_received_total`/`_received_series_
+    # values`, docstring do módulo). Mesmo filtro de organização/
+    # unidade/status/competência que as demais, pra somar Payment só
+    # das comandas que também entram no Faturamento. `reversed_at IS
+    # NULL` exclui pagamento estornado por `reopen_order` (comanda
+    # reaberta e refechada com outra forma de pagamento) — sem este
+    # filtro, o Payment antigo revertido voltaria a somar junto com o
+    # novo assim que a Order virasse `CLOSED` de novo (mesmo raciocínio
+    # já aplicado em `cash_register.py::build_summary`).
     received_stmt = (
         select(Payment.order_id, func.coalesce(func.sum(Payment.amount), 0))
         .join(Order, Order.id == Payment.order_id)
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= date_from,
-            Order.closed_at < date_to,
+            competence >= date_from,
+            competence < date_to,
             Payment.reversed_at.is_(None),
         )
         .group_by(Payment.order_id)
@@ -454,10 +590,11 @@ def _fetch_period_data(session: Session, filters: DashboardFilters, date_from: d
 
     orders = [
         _OrderRow(
-            order_id=row[0], client_id=row[1], closed_at=row[2],
+            order_id=row[0], client_id=row[1], sale_competence=row[2],
             total=services_by_order.get(row[0], Decimal("0")) + products_by_order.get(row[0], Decimal("0")),
             received=received_by_order.get(row[0], Decimal("0")),
             benefit=benefits_by_order.get(row[0], Decimal("0")),
+            commission=commission_by_order.get(row[0], Decimal("0")),
         )
         for row in session.execute(base_order_stmt).all()
     ]
@@ -831,7 +968,7 @@ def _repeat_rate_bucket_values(
     served_by_bucket: dict[int, set[uuid.UUID]] = defaultdict(set)
     repeat_by_bucket: dict[int, set[uuid.UUID]] = defaultdict(set)
     for row in data.orders:
-        idx = _bucket_index(buckets, row.closed_at)
+        idx = _bucket_index(buckets, row.sale_competence)
         if idx is None:
             continue
         served_by_bucket[idx].add(row.client_id)
@@ -856,7 +993,7 @@ def _orders_count_series_values(buckets: list[tuple[datetime, datetime]], data: 
     BI significa venda efetivamente realizada, não volume de agenda)."""
     totals = [Decimal("0")] * len(buckets)
     for row in data.orders:
-        idx = _bucket_index(buckets, row.closed_at)
+        idx = _bucket_index(buckets, row.sale_competence)
         if idx is not None:
             totals[idx] += 1
     return totals
@@ -877,11 +1014,14 @@ def _net_revenue_series_values(
     simplesmente não entra na subtração (mesma semântica do card
     principal `known_net_revenue`).
 
-    Benefício de uma comanda entra SÓ no bucket do seu próprio
-    `closed_at` (correção de bug confirmado em produção) — nunca o
+    Benefício de uma comanda entra SÓ no bucket da sua própria
+    competência de VENDA (`sale_competence_expr()` — correção de
+    competência, nunca `closed_at`/`Payment.created_at`) — nunca o
     total do PERÍODO INTEIRO subtraído de cada bucket, o que inflaria
     artificialmente todos os outros buckets além do que a comanda
-    realmente pertence.
+    realmente pertence. Faturamento Líquido continua métrica de VENDA
+    (nunca "Recebido líquido") — por isso a taxa aqui é bucketizada
+    pela competência da COMANDA, não pela data do Payment.
 
     `reversed_at IS NULL` (auditoria do Dashboard — bug confirmado:
     esta query própria de `Payment` nunca tinha recebido o mesmo filtro
@@ -892,22 +1032,23 @@ def _net_revenue_series_values(
     gross_after_benefits = _gross_revenue_series_after_benefits(buckets, data)
     if not buckets:
         return gross_after_benefits
+    competence = sale_competence_expr()
     stmt = (
-        select(Payment, Order.closed_at)
+        select(Payment, competence)
         .join(Order, Order.id == Payment.order_id)
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= buckets[0][0],
-            Order.closed_at < buckets[-1][1],
+            competence >= buckets[0][0],
+            competence < buckets[-1][1],
             Payment.reversed_at.is_(None),
         )
     )
     if filters.branch_id is not None:
         stmt = stmt.where(Order.branch_id == filters.branch_id)
     fee_totals = [Decimal("0")] * len(buckets)
-    for payment, closed_at in session.execute(stmt).all():
-        idx = _bucket_index(buckets, closed_at)
+    for payment, order_competence in session.execute(stmt).all():
+        idx = _bucket_index(buckets, order_competence)
         if idx is None:
             continue
         breakdown = payment_fees_service.breakdown_for_display(payment)
@@ -1023,6 +1164,7 @@ def _retention_summary(
 
 
 def _top_services(session: Session, filters: DashboardFilters, date_from: datetime, date_to: datetime) -> dict[uuid.UUID, tuple[str, Decimal, int]]:
+    competence = sale_competence_expr()
     stmt = (
         select(
             OrderItem.service_id,
@@ -1034,8 +1176,8 @@ def _top_services(session: Session, filters: DashboardFilters, date_from: dateti
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= date_from,
-            Order.closed_at < date_to,
+            competence >= date_from,
+            competence < date_to,
         )
         .group_by(OrderItem.service_id)
     )
@@ -1045,6 +1187,7 @@ def _top_services(session: Session, filters: DashboardFilters, date_from: dateti
 
 
 def _professionals(session: Session, filters: DashboardFilters) -> list[ProfessionalPerformanceRow]:
+    competence = sale_competence_expr()
     stmt = (
         select(
             OrderItem.professional_id,
@@ -1057,8 +1200,8 @@ def _professionals(session: Session, filters: DashboardFilters) -> list[Professi
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= filters.date_from,
-            Order.closed_at < filters.date_to,
+            competence >= filters.date_from,
+            competence < filters.date_to,
         )
         .group_by(OrderItem.professional_id)
         .order_by(func.sum(OrderItem.price).desc())
@@ -1090,21 +1233,22 @@ def _top_clients(session: Session, filters: DashboardFilters) -> list[ClientPerf
     com Top Serviços/Profissionais). `orders_count` conta comandas
     DISTINTAS (não itens) — um cliente com 1 comanda de 3 serviços
     ainda é "1 atendimento", mesma semântica do KPI "Atendimentos"."""
+    competence = sale_competence_expr()
     stmt = (
         select(
             Order.client_id,
             func.max(Client.name),
             func.sum(OrderItem.price),
             func.count(func.distinct(Order.id)),
-            func.max(Order.closed_at),
+            func.max(competence),
         )
         .join(OrderItem, OrderItem.order_id == Order.id)
         .join(Client, Client.id == Order.client_id)
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= filters.date_from,
-            Order.closed_at < filters.date_to,
+            competence >= filters.date_from,
+            competence < filters.date_to,
         )
         .group_by(Order.client_id)
         .order_by(func.sum(OrderItem.price).desc())
@@ -1141,14 +1285,19 @@ def _payment_methods(session: Session, filters: DashboardFilters) -> list[Paymen
     # `_fetch_period_data`: exclui pagamento estornado por
     # `reopen_order`, nunca somado de novo se a comanda for refechada
     # com outra forma de pagamento.
+    # Formas de pagamento continua população de VENDA (competência da
+    # comanda), NUNCA `Payment.created_at` — ver ressalva explícita no
+    # relatório: é uma decisão de escopo (não pedida explicitamente),
+    # mantendo o comportamento já existente por conservadorismo.
+    competence = sale_competence_expr()
     stmt = (
         select(Payment.method, func.sum(Payment.amount))
         .join(Order, Order.id == Payment.order_id)
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= filters.date_from,
-            Order.closed_at < filters.date_to,
+            competence >= filters.date_from,
+            competence < filters.date_to,
             Payment.reversed_at.is_(None),
         )
         .group_by(Payment.method)
@@ -1205,14 +1354,15 @@ def _revenue_fee_summary(
     `reversed_at IS NULL` — mesmo raciocínio de `received_stmt`/
     `_payment_methods`: pagamento estornado por `reopen_order` nunca
     entra na taxa, mesmo se a comanda for refechada depois."""
+    competence = sale_competence_expr()
     stmt = (
         select(Payment)
         .join(Order, Order.id == Payment.order_id)
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
-            Order.closed_at >= date_from,
-            Order.closed_at < date_to,
+            competence >= date_from,
+            competence < date_to,
             Payment.reversed_at.is_(None),
         )
     )
@@ -1320,14 +1470,22 @@ def _available_result(
     quando o ator não tem `commissions.view_all`/`commissions.manage` —
     ver justificativa na docstring do schema: um total que muda de
     valor dependendo de QUEM está olhando quebraria a premissa de
-    indicador auditável."""
+    indicador auditável.
+
+    Consistência de população (auditoria pedida explicitamente): a
+    comissão subtraída AQUI NUNCA vem de `commissions_service.
+    get_overview` (esse continua existindo, é a "Comissão Calculada"
+    OFICIAL do produto — Comissões/Resumo Financeiro — população
+    `Order.closed_at`, decisão de negócio preservada). Usa
+    `row.commission` (populado por `_fetch_period_data`, MESMA
+    população/competência de `gross_revenue`) — garante que receita e
+    comissão deste painel específico somam sempre a MESMA venda, nunca
+    duas populações divergentes pro mesmo intervalo de datas. Ver
+    docstring do módulo."""
     if "commissions.view_all" not in actor.permissions and "commissions.manage" not in actor.permissions:
         return _empty_available_result()
 
-    commission_overview = commissions_service.get_overview(
-        session, actor, date_from=filters.date_from, date_to=filters.date_to
-    )
-    commissions = commission_overview.known_commission_total
+    commissions = sum((row.commission for row in data.orders), Decimal("0"))
 
     # --- Impostos provisionados: BASE GERENCIAL por competência (mês
     # calendário) × alíquota vigente NAQUELA competência ---------------
@@ -1343,7 +1501,7 @@ def _available_result(
     months = tax_rates_service.months_between(filters.date_from, filters.date_to)
     revenue_by_month: dict = {m: Decimal("0") for m in months}
     for row in data.orders:
-        month_key = row.closed_at.date().replace(day=1)
+        month_key = row.sale_competence.date().replace(day=1)
         if month_key in revenue_by_month:
             revenue_by_month[month_key] += row.total - row.benefit
 
@@ -1501,7 +1659,7 @@ def _new_vs_recurring_series(
     touched: dict[int, set[uuid.UUID]] = defaultdict(set)
 
     for row in data.orders:
-        idx = _bucket_index(buckets, row.closed_at)
+        idx = _bucket_index(buckets, row.sale_competence)
         if idx is None or row.client_id in touched[idx]:
             continue
         touched[idx].add(row.client_id)
@@ -1526,38 +1684,82 @@ def _new_vs_recurring_series(
 def _revenue_series_values(buckets: list[tuple[datetime, datetime]], data: _PeriodData) -> list[Decimal]:
     totals = [Decimal("0")] * len(buckets)
     for row in data.orders:
-        idx = _bucket_index(buckets, row.closed_at)
+        idx = _bucket_index(buckets, row.sale_competence)
         if idx is not None:
             totals[idx] += row.total
     return totals
 
 
-def _received_series_values(buckets: list[tuple[datetime, datetime]], data: _PeriodData) -> list[Decimal]:
-    """RECEBIDO por bucket — mesmo bucketing por `row.closed_at` que
-    `_revenue_series_values` (a comanda é a mesma, o que muda é qual
-    campo somamos: `received` em vez de `total`)."""
+def _received_total(session: Session, filters: DashboardFilters, date_from: datetime, date_to: datetime) -> Decimal:
+    """RECEBIDO (correção — "Recebido = Payment.created_at") — soma
+    `Payment.amount` (`reversed_at IS NULL`) filtrando DIRETO por
+    `Payment.created_at` no período, população TOTALMENTE independente
+    de `_PeriodData`/Faturamento (nunca `sale_competence_expr()`, nunca
+    `Order.closed_at`). Ver docstring do módulo — esta é a ÚNICA leitura
+    de "Recebido" que muda de dia junto com o `Payment`; a Reconciliação
+    por comanda (`_revenue_reconciliation_totals`) continua usando
+    `_received(data)` (total pago da comanda, qualquer data), de
+    propósito, nunca esta função."""
+    stmt = (
+        select(func.coalesce(func.sum(Payment.amount), 0))
+        .join(Order, Order.id == Payment.order_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Payment.reversed_at.is_(None),
+            Payment.created_at >= date_from,
+            Payment.created_at < date_to,
+        )
+    )
+    if filters.branch_id is not None:
+        stmt = stmt.where(Order.branch_id == filters.branch_id)
+    return Decimal(session.execute(stmt).scalar_one())
+
+
+def _received_series_values(
+    session: Session, filters: DashboardFilters, buckets: list[tuple[datetime, datetime]]
+) -> list[Decimal]:
+    """Trilha (sparkline/drill-down) de "Recebido" — mesma população de
+    `_received_total` (`Payment.created_at`, independente de
+    Faturamento), agora bucketizada. Deriva `date_from`/`date_to` de
+    `buckets[0][0]`/`buckets[-1][1]` (mesmo padrão de
+    `_net_revenue_series_values`) — nunca reaproveita `_PeriodData`, que
+    é população de VENDA, não de pagamento."""
+    if not buckets:
+        return []
+    stmt = (
+        select(Payment.created_at, Payment.amount)
+        .join(Order, Order.id == Payment.order_id)
+        .where(
+            Order.organization_id == filters.organization_id,
+            Payment.reversed_at.is_(None),
+            Payment.created_at >= buckets[0][0],
+            Payment.created_at < buckets[-1][1],
+        )
+    )
+    if filters.branch_id is not None:
+        stmt = stmt.where(Order.branch_id == filters.branch_id)
     totals = [Decimal("0")] * len(buckets)
-    for row in data.orders:
-        idx = _bucket_index(buckets, row.closed_at)
+    for payment_created_at, amount in session.execute(stmt).all():
+        idx = _bucket_index(buckets, payment_created_at)
         if idx is not None:
-            totals[idx] += row.received
+            totals[idx] += Decimal(amount)
     return totals
 
 
 def _benefit_series_values(buckets: list[tuple[datetime, datetime]], data: _PeriodData) -> list[Decimal]:
     """BENEFÍCIOS CONCEDIDOS por bucket — mesmo bucketing por
-    `row.closed_at` que `_revenue_series_values`/`_received_series_values`
-    (a MESMA comanda, o que muda é qual campo somamos: `benefit` em vez
-    de `total`/`received`). `row.benefit` já vem populado por
-    `_fetch_period_data` (`benefits_stmt`) — nenhuma query nova aqui,
-    só reagrupa o que já foi buscado por comanda em buckets de data.
-    Usado por `_net_revenue_series_values` pra nunca "vazar" o
-    benefício de uma comanda pro bucket errado (cada comanda entra
-    SÓ no bucket do seu próprio `closed_at`, nunca distribuído/rateado
-    entre buckets vizinhos)."""
+    `row.sale_competence` que `_revenue_series_values` (a MESMA comanda,
+    o que muda é qual campo somamos: `benefit` em vez de `total`).
+    `row.benefit` já vem populado por `_fetch_period_data`
+    (`benefits_stmt`) — nenhuma query nova aqui, só reagrupa o que já
+    foi buscado por comanda em buckets de data. Usado por
+    `_net_revenue_series_values` pra nunca "vazar" o benefício de uma
+    comanda pro bucket errado (cada comanda entra SÓ no bucket da sua
+    própria competência, nunca distribuído/rateado entre buckets
+    vizinhos)."""
     totals = [Decimal(0)] * len(buckets)
     for row in data.orders:
-        idx = _bucket_index(buckets, row.closed_at)
+        idx = _bucket_index(buckets, row.sale_competence)
         if idx is not None:
             totals[idx] += row.benefit
     return totals
@@ -1569,7 +1771,7 @@ def _gross_revenue_series_after_benefits(
     """Trilha do Faturamento Bruto EXIBIDO no Dashboard (Etapa
     "Benefício NÃO é Faturamento no Dashboard") — `_revenue_series_values`
     (econômico puro, por bucket) menos `_benefit_series_values` (mesmo
-    bucketing por `row.closed_at`, benefício nunca vaza pro bucket
+    bucketing por competência, benefício nunca vaza pro bucket
     vizinho). Base do sparkline/gráfico/drill-down de Faturamento
     Bruto E do Faturamento Líquido (`_net_revenue_series_values`) —
     nunca redefine `_revenue_series_values` em si, que continua a
@@ -1628,7 +1830,11 @@ def _bucket_values_for_key(
     if key == "revenue":
         return _gross_revenue_series_after_benefits(bucket_list, period_data)
     if key == "received":
-        return _received_series_values(bucket_list, period_data)
+        # População PRÓPRIA (Payment.created_at) — não usa `period_data`
+        # (nunca é a população de venda, ver docstring do módulo). A
+        # checagem de `period_data is None` acima ainda serve pra saber
+        # se ESTE período está ativo (ex.: sem comparativo selecionado).
+        return _received_series_values(session, filters, bucket_list)
     if key in ("clients_served", "appointments_count", "ticket_average", "no_show_rate"):
         return _generic_bucket_values(key, bucket_list, period_data)
     if key == "new_clients":
@@ -1818,7 +2024,12 @@ def get_overview(
         heatmap=_heatmap(session, filters, org_timezone),
         revenue_fee_summary=fee_summary_current,
         financial_summary=_financial_summary(
-            session, actor, filters, received=_received(current), known_fee_total=fee_summary_current.known_fee_total
+            session, actor, filters,
+            # "Recebido" do Resumo Financeiro = MESMA leitura do KPI
+            # "Recebido" (Payment.created_at, população própria) — nunca
+            # `_received(current)` (essa é só pra Reconciliação).
+            received=_received_total(session, filters, filters.date_from, filters.date_to),
+            known_fee_total=fee_summary_current.known_fee_total,
         ),
         available_result=_available_result(
             session, actor, filters, current,
@@ -1883,6 +2094,10 @@ def get_kpi_detail(
             # benefício) — nunca dois números de "Faturamento"
             # diferentes na mesma tela de reconciliação.
             revenue=_gross_revenue_after_benefits(current),
+            # `_received(current)` de propósito (NUNCA `_received_total`)
+            # — reconciliação por comanda responde "esta venda já foi
+            # paga?" (total pago da Order, qualquer data), não "quanto
+            # entrou neste dia" (ver docstring do módulo).
             received=_received(current),
             pending_amount=pending_total,
             overpaid_amount=overpaid_total,
@@ -1897,7 +2112,7 @@ def _generic_bucket_values(key: str, buckets: list[tuple[datetime, datetime]], d
     if key == "clients_served":
         clients_by_bucket: dict[int, set[uuid.UUID]] = defaultdict(set)
         for row in data.orders:
-            idx = _bucket_index(buckets, row.closed_at)
+            idx = _bucket_index(buckets, row.sale_competence)
             if idx is not None:
                 clients_by_bucket[idx].add(row.client_id)
         return [Decimal(len(clients_by_bucket.get(i, ()))) for i in range(len(buckets))]
@@ -1914,7 +2129,7 @@ def _generic_bucket_values(key: str, buckets: list[tuple[datetime, datetime]], d
         revenue_totals = _revenue_series_values(buckets, data)
         order_counts = [0] * len(buckets)
         for row in data.orders:
-            idx = _bucket_index(buckets, row.closed_at)
+            idx = _bucket_index(buckets, row.sale_competence)
             if idx is not None:
                 order_counts[idx] += 1
         return [
@@ -1972,7 +2187,16 @@ def _kpi_totals(
             (_gross_revenue_after_benefits(comparison) if comparison else None),
         )
     if key == "received":
-        return KpiKind.CURRENCY, _received(current), (_received(comparison) if comparison else None)
+        # População PRÓPRIA (Payment.created_at), nunca `_received(data)`
+        # (essa é só pra Reconciliação por comanda) — ver docstring do
+        # módulo.
+        current_received = _received_total(session, filters, filters.date_from, filters.date_to)
+        comparison_received = (
+            _received_total(session, filters, filters.compare_from, filters.compare_to)
+            if comparison is not None and filters.compare_from is not None and filters.compare_to is not None
+            else None
+        )
+        return KpiKind.CURRENCY, current_received, comparison_received
     if key == "ticket_average":
         return KpiKind.CURRENCY, _ticket_average(current), (_ticket_average(comparison) if comparison else None)
     if key == "clients_served":
@@ -2128,29 +2352,35 @@ def get_service_detail(
     if service is None:
         raise NotFoundError("Serviço não encontrado.")
 
+    competence = sale_competence_expr()
     stmt = (
-        select(OrderItem, Order.id, Order.order_number, Order.closed_at, Client.name)
+        # `sale_competence_expr()` — correção de competência de venda. O
+        # campo do schema (`DashboardOrderItemRow.closed_at`) mantém o
+        # NOME por compatibilidade de contrato de API (frontend), mas
+        # passa a carregar a competência efetiva, nunca mais o
+        # `closed_at` real da comanda.
+        select(OrderItem, Order.id, Order.order_number, competence, Client.name)
         .join(Order, Order.id == OrderItem.order_id)
         .join(Client, Client.id == Order.client_id)
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
             OrderItem.service_id == service_id,
-            Order.closed_at >= filters.date_from,
-            Order.closed_at < filters.date_to,
+            competence >= filters.date_from,
+            competence < filters.date_to,
         )
-        .order_by(Order.closed_at.desc())
+        .order_by(competence.desc())
     )
     if filters.branch_id is not None:
         stmt = stmt.where(Order.branch_id == filters.branch_id)
     rows = session.execute(stmt).all()
     items = [
         DashboardOrderItemRow(
-            order_item_id=item.id, order_id=order_id, order_number=order_number, closed_at=closed_at,
+            order_item_id=item.id, order_id=order_id, order_number=order_number, closed_at=order_competence,
             client_name=client_name, service_name=item.service_name, professional_name=item.professional_name,
             price=item.price,
         )
-        for item, order_id, order_number, closed_at, client_name in rows
+        for item, order_id, order_number, order_competence, client_name in rows
     ]
     service_name = items[0].service_name if items else service.name
 
@@ -2180,18 +2410,25 @@ def get_payment_method_detail(
     )
     methods = _METHODS_BY_BUCKET.get(bucket, [])
 
+    competence = sale_competence_expr()
     stmt = (
-        select(Payment, Order.id, Order.order_number, Order.closed_at, Client.name)
+        # `sale_competence_expr()` — correção de competência de venda
+        # (ver docstring do módulo). Campo do schema mantém o nome
+        # `closed_at` por compatibilidade de API, mas passa a carregar
+        # a competência. Formas de pagamento continua população de
+        # VENDA (não `Payment.created_at`) — mesma ressalva de
+        # `_payment_methods`.
+        select(Payment, Order.id, Order.order_number, competence, Client.name)
         .join(Order, Order.id == Payment.order_id)
         .join(Client, Client.id == Order.client_id)
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
             Payment.method.in_(methods),
-            Order.closed_at >= filters.date_from,
-            Order.closed_at < filters.date_to,
+            competence >= filters.date_from,
+            competence < filters.date_to,
         )
-        .order_by(Order.closed_at.desc())
+        .order_by(competence.desc())
     )
     if filters.branch_id is not None:
         stmt = stmt.where(Order.branch_id == filters.branch_id)
@@ -2199,10 +2436,10 @@ def get_payment_method_detail(
 
     payments = [
         PaymentMethodPaymentRow(
-            payment_id=payment.id, order_id=order_id, order_number=order_number, closed_at=closed_at,
+            payment_id=payment.id, order_id=order_id, order_number=order_number, closed_at=created_at,
             client_name=client_name, method=payment.method, amount=payment.amount,
         )
-        for payment, order_id, order_number, closed_at, client_name in rows
+        for payment, order_id, order_number, created_at, client_name in rows
     ]
     total_amount = sum((p.amount for p in payments), Decimal("0"))
 
@@ -2290,18 +2527,23 @@ def get_professional_detail(
     if professional is None:
         raise NotFoundError("Profissional não encontrado.")
 
+    competence = sale_competence_expr()
     stmt = (
-        select(OrderItem, Order.id, Order.order_number, Order.closed_at, Client.name)
+        # `sale_competence_expr()` — correção de competência de venda
+        # (ver docstring do módulo). Campo do schema mantém o nome
+        # `closed_at` por compatibilidade de API, mas passa a carregar
+        # a competência.
+        select(OrderItem, Order.id, Order.order_number, competence, Client.name)
         .join(Order, Order.id == OrderItem.order_id)
         .join(Client, Client.id == Order.client_id)
         .where(
             Order.organization_id == filters.organization_id,
             Order.status == OrderStatus.CLOSED,
             OrderItem.professional_id == professional_id,
-            Order.closed_at >= filters.date_from,
-            Order.closed_at < filters.date_to,
+            competence >= filters.date_from,
+            competence < filters.date_to,
         )
-        .order_by(Order.closed_at.desc())
+        .order_by(competence.desc())
     )
     if filters.branch_id is not None:
         stmt = stmt.where(Order.branch_id == filters.branch_id)
@@ -2309,11 +2551,11 @@ def get_professional_detail(
 
     items = [
         DashboardOrderItemRow(
-            order_item_id=item.id, order_id=order_id, order_number=order_number, closed_at=closed_at,
+            order_item_id=item.id, order_id=order_id, order_number=order_number, closed_at=order_competence,
             client_name=client_name, service_name=item.service_name, professional_name=item.professional_name,
             price=item.price,
         )
-        for item, order_id, order_number, closed_at, client_name in rows
+        for item, order_id, order_number, order_competence, client_name in rows
     ]
 
     revenue = sum((item.price for item, *_rest in rows), Decimal("0"))
@@ -2339,8 +2581,8 @@ def get_professional_detail(
     granularity = _choose_granularity(filters.date_from, filters.date_to)
     buckets = _generate_buckets(filters.date_from, filters.date_to, granularity)
     revenue_by_bucket = [Decimal("0")] * len(buckets)
-    for item, _order_id, _order_number, closed_at, _client_name in rows:
-        idx = _bucket_index(buckets, closed_at)
+    for item, _order_id, _order_number, order_competence, _client_name in rows:
+        idx = _bucket_index(buckets, order_competence)
         if idx is not None:
             revenue_by_bucket[idx] += item.price
     revenue_series = _align_series(buckets, revenue_by_bucket, None, None)

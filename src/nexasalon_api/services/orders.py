@@ -41,7 +41,7 @@ existia acima:
     que aborta a transação inteira (nenhum pagamento fica "pendurado",
     a comanda continua `OPEN`, ver `api/deps.py::get_db`)."""
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -94,6 +94,7 @@ from nexasalon_api.schemas.order import (
     OrderReopen,
 )
 from nexasalon_api.services import appointments as appointments_service
+from nexasalon_api.services import availability as availability_service
 from nexasalon_api.services import cash_register as cash_register_service
 from nexasalon_api.services import commissions as commissions_service
 from nexasalon_api.services import order_totals
@@ -1052,7 +1053,45 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
     order.status = OrderStatus.CLOSED
     order.closed_at = datetime.now(timezone.utc)
     order.closed_by = actor.user_id
+
+    # Regularização temporária de vendas antigas (migration 0055) —
+    # `data.sale_date` só vem preenchido quando o usuário
+    # conscientemente escolheu uma "Data da venda" diferente da data
+    # real do fechamento. NUNCA toca `created_at`/`closed_at` (ambos
+    # continuam exatamente o momento real, acima) — grava só a camada
+    # OPCIONAL de competência (`Order.sale_competence_override`), que
+    # `services/order_totals.py::sale_competence`/`sale_competence_expr`
+    # passam a ler no lugar de `created_at` puro em toda agregação de
+    # venda. Meio-dia LOCAL da unidade (nunca meia-noite) — evita a
+    # data escolhida cair bem na borda de um bucket por causa do fuso.
+    sale_competence_override_previous = order.sale_competence_override
+    new_sale_competence_override: datetime | None = None
+    if data.sale_date is not None:
+        tz = availability_service.effective_timezone(session, organization_id, order.branch_id)
+        new_sale_competence_override = datetime.combine(data.sale_date, time(12, 0), tzinfo=tz)
+        order.sale_competence_override = new_sale_competence_override
     session.flush()
+
+    audit_new_values = {
+        # `total` = valor econômico/vendido (nunca reduzido por
+        # benefício); `amount_due` = o que de fato precisava ser
+        # pago (chegar aqui só é possível com `saldo == 0`, então
+        # `amount_due` é sempre o valor efetivamente pago);
+        # `benefit_total` = diferença entre os dois, só pra deixar
+        # explícito no registro de auditoria que benefício não é a
+        # mesma coisa que "pagamento menor por erro/desconto".
+        "status": "closed", "change_type": "close_order",
+        "total": str(total), "amount_due": str(amount_due), "benefit_total": str(total - amount_due),
+        "services_total": str(order_totals_breakdown.services_total),
+        "products_total": str(order_totals_breakdown.products_total),
+    }
+    # Registro EXPLÍCITO do ajuste manual de competência (item
+    # obrigatório "nunca falsificar timestamp silenciosamente") — só
+    # aparece quando `sale_date` foi de fato informado; nunca inventa
+    # uma entrada de auditoria pro fechamento normal do dia a dia.
+    if new_sale_competence_override is not None:
+        audit_new_values["sale_competence_override"] = new_sale_competence_override.isoformat()
+        audit_new_values["sale_competence_override_reason"] = "regularizacao_manual_no_fechamento"
 
     audit_log_repo.create(
         session,
@@ -1061,20 +1100,10 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
         entity_type="order",
         entity_id=order.id,
         action=AuditAction.UPDATE,
-        old_values={"status": "open"},
-        new_values={
-            # `total` = valor econômico/vendido (nunca reduzido por
-            # benefício); `amount_due` = o que de fato precisava ser
-            # pago (chegar aqui só é possível com `saldo == 0`, então
-            # `amount_due` é sempre o valor efetivamente pago);
-            # `benefit_total` = diferença entre os dois, só pra deixar
-            # explícito no registro de auditoria que benefício não é a
-            # mesma coisa que "pagamento menor por erro/desconto".
-            "status": "closed", "change_type": "close_order",
-            "total": str(total), "amount_due": str(amount_due), "benefit_total": str(total - amount_due),
-            "services_total": str(order_totals_breakdown.services_total),
-            "products_total": str(order_totals_breakdown.products_total),
-        },
+        old_values={"status": "open", "sale_competence_override": (
+            sale_competence_override_previous.isoformat() if sale_competence_override_previous else None
+        )},
+        new_values=audit_new_values,
     )
     return _reload(session, organization_id, order_id)
 

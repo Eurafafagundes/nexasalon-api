@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from nexasalon_api.models.enums import OrderStatus
-from nexasalon_api.models.order import Order
+from nexasalon_api.models.order import Order, sale_competence_expr
 
 
 def get(session: Session, organization_id: uuid.UUID, order_id: uuid.UUID) -> Order | None:
@@ -172,10 +172,16 @@ def list_for_org(
         stmt = stmt.where(Order.client_id == client_id)
     if order_number is not None:
         stmt = stmt.where(Order.order_number == order_number)
+    # Competência de venda EFETIVA (correção de competência) — nunca
+    # `Order.created_at` cru aqui: uma comanda regularizada
+    # manualmente no fechamento (`Order.sale_competence_override`)
+    # precisa entrar/sair do filtro pelo dia ESCOLHIDO, não pelo dia
+    # real de criação da linha. Ver `models/order.py::sale_competence_expr`.
+    competence = sale_competence_expr()
     if date_from is not None:
-        stmt = stmt.where(Order.created_at >= date_from)
+        stmt = stmt.where(competence >= date_from)
     if date_to is not None:
-        stmt = stmt.where(Order.created_at <= date_to)
+        stmt = stmt.where(competence <= date_to)
     if professional_id is not None:
         stmt = stmt.where(Order.items.any(professional_id=professional_id))
-    return list(session.scalars(stmt.order_by(Order.created_at.desc())).all())
+    return list(session.scalars(stmt.order_by(competence.desc())).all())

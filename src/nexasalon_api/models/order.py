@@ -37,6 +37,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    ColumnElement,
     ForeignKey,
     Index,
     Integer,
@@ -45,6 +46,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -115,6 +117,22 @@ class Order(Base, UUIDPKMixin, TimestampMixin):
         pg_enum(OrderStatus, "order_status"), nullable=False, server_default=OrderStatus.OPEN.value, index=True
     )
     closed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    # Regularização temporária de vendas antigas (migration 0055) —
+    # NUNCA editar `created_at` pra "consertar" a competência (é dado
+    # de auditoria real). Camada OPCIONAL por cima dele: a competência
+    # de venda EFETIVA em todo o sistema (Faturamento/Extrato/
+    # Dashboard) é sempre `COALESCE(sale_competence_override,
+    # created_at)` — ver `services/order_totals.py::sale_competence`.
+    # `NULL` (padrão, todo Order novo do fluxo normal) = usa
+    # `created_at`, comportamento idêntico a antes desta coluna
+    # existir. Só é preenchida quando alguém escolhe explicitamente
+    # uma "Data da venda" diferente no fechamento (`OrderClose.
+    # sale_date`, ver `services/orders.py::close_order`) — nunca em
+    # massa, sempre auditado (`AuditLog`, `change_type=close_order`).
+    # Nunca usada por `CashRegister`, `Payment` ou pela regra de
+    # competência de Comissão (`services/commissions.py`, que continua
+    # em `closed_at` por decisão de negócio separada).
+    sale_competence_override: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -156,6 +174,20 @@ class Order(Base, UUIDPKMixin, TimestampMixin):
     payments: Mapped[list["Payment"]] = relationship(
         back_populates="order", cascade="all, delete-orphan", order_by="Payment.created_at"
     )
+
+
+def sale_competence_expr() -> ColumnElement[datetime]:
+    """Competência de venda EFETIVA, em SQL — `COALESCE(
+    sale_competence_override, created_at)`, NUNCA `closed_at`. Fonte
+    única usada por toda agregação de Faturamento/Extrato/Dashboard
+    (`services/dashboard.py`, `repositories/order_repo.py`) — nunca
+    reimplementar este `COALESCE` inline num segundo lugar. Vive aqui
+    (camada de modelo, não `services/`) porque `repositories/` também
+    precisa importar sem violar a camada repos→services. Para código
+    que já tem um `Order` carregado em Python (não uma query), use
+    `services/order_totals.py::sale_competence` — mesma fonte, mesma
+    regra, só a forma (SQL x Python) muda."""
+    return func.coalesce(Order.sale_competence_override, Order.created_at)
 
 
 class OrderItem(Base, UUIDPKMixin, TimestampMixin):

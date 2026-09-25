@@ -1844,3 +1844,217 @@ def test_beneficio_isolamento_multi_tenant(org_session):
                 OrderItemBenefitUpdate(benefit_type=BenefitType.LOYALTY, benefit_amount=Decimal("100.00")),
             )
         other_session.rollback()
+
+
+# ---------------------------------------------------------------------
+# Regularização temporária de vendas antigas (migration 0055,
+# `Order.sale_competence_override`) — "Data da venda" no fechamento.
+# ---------------------------------------------------------------------
+
+
+def test_fechar_comanda_sem_sale_date_nao_seta_override(org_session):
+    """Fechamento normal (nenhum campo `sale_date` informado) — o
+    comportamento default do pedido: `sale_competence_override` continua
+    `None`, `created_at`/`closed_at` são os únicos timestamps reais
+    envolvidos, exatamente como antes desta coluna existir."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    total = order_totals.order_total(order)
+    register = _open_register(session, actor)
+
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+
+    assert closed.sale_competence_override is None
+    assert order_totals.sale_competence(closed) == closed.created_at
+    # Nenhuma entrada de auditoria de ajuste de competência foi criada.
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == order.id, AuditLog.entity_type == "order",
+    ).all()
+    close_logs = [log for log in logs if log.new_values.get("change_type") == "close_order"]
+    assert len(close_logs) == 1
+    assert "sale_competence_override" not in close_logs[0].new_values
+
+
+def test_fechar_hoje_venda_antiga_com_sale_date_regulariza_a_competencia(org_session):
+    """Cenário exato do pedido: fecha HOJE uma comanda referente a um
+    dia anterior, escolhendo "Data da venda" = 20/09. `created_at`/
+    `closed_at`/`Payment.created_at` continuam os momentos REAIS (agora)
+    — só `sale_competence_override` (e, por consequência,
+    `order_totals.sale_competence`) passa a refletir 20/09. Meio-dia
+    LOCAL (fuso da unidade), nunca meia-noite (evita borda de bucket)."""
+    from datetime import date as date_type
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, branch, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    total = order_totals.order_total(order)
+    register = _open_register(session, actor)
+    real_close_moment = datetime.now(timezone.utc)
+
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(
+            payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)],
+            sale_date=date_type(2026, 9, 20),
+        ),
+    )
+
+    # `created_at`/`closed_at` continuam o momento REAL do fechamento —
+    # NUNCA reescritos pra "consertar" a competência.
+    assert closed.created_at.date() != date_type(2026, 9, 20)
+    assert (closed.closed_at - real_close_moment).total_seconds() < 5
+    assert closed.payments[0].created_at.date() == closed.closed_at.date()  # Payment continua com data real.
+    # A competência EFETIVA passa a ser 20/09, meio-dia local (America/
+    # Sao_Paulo, default da Organization de teste — `Branch.timezone`
+    # herda da Organization quando `None`).
+    effective = order_totals.sale_competence(closed)
+    assert effective.date() == date_type(2026, 9, 20)
+    assert effective.astimezone(timezone(timedelta(hours=-3))).hour == 12
+
+    # AuditLog registra o ajuste manual explicitamente (nunca silencioso).
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == order.id, AuditLog.entity_type == "order",
+    ).all()
+    close_logs = [log for log in logs if log.new_values.get("change_type") == "close_order"]
+    assert len(close_logs) == 1
+    assert close_logs[0].new_values["sale_competence_override_reason"] == "regularizacao_manual_no_fechamento"
+    assert close_logs[0].old_values["sale_competence_override"] is None
+
+
+def test_reabrir_e_refechar_sem_novo_sale_date_preserva_a_competencia_regularizada(org_session):
+    """Reabrir uma comanda regularizada e refechar SEM informar
+    `sale_date` de novo não pode silenciosamente "perder" a
+    regularização já feita — `sale_competence_override` é preservado do
+    fechamento anterior (nunca resetado por `reopen_order`, que não
+    mexe nesse campo)."""
+    from datetime import date as date_type
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    total = order_totals.order_total(order)
+    register = _open_register(session, actor)
+
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(
+            payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)],
+            sale_date=date_type(2026, 9, 20),
+        ),
+    )
+
+    orders.reopen_order(session, actor, order.id, OrderReopen(reason="Ajustar valor"))
+    refeito = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+
+    assert order_totals.sale_competence(refeito).date() == date_type(2026, 9, 20)
+
+
+def test_reabrir_e_refechar_com_novo_sale_date_atualiza_a_competencia(org_session):
+    """Mesmo cenário acima, mas a segunda vez informa uma `sale_date`
+    DIFERENTE — a regularização pode ser corrigida, não é permanente
+    depois do primeiro fechamento."""
+    from datetime import date as date_type
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    total = order_totals.order_total(order)
+    register = _open_register(session, actor)
+
+    orders.close_order(
+        session, actor, order.id,
+        OrderClose(
+            payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)],
+            sale_date=date_type(2026, 9, 20),
+        ),
+    )
+    orders.reopen_order(session, actor, order.id, OrderReopen(reason="Data errada"))
+    refeito = orders.close_order(
+        session, actor, order.id,
+        OrderClose(
+            payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)],
+            sale_date=date_type(2026, 9, 21),
+        ),
+    )
+
+    assert order_totals.sale_competence(refeito).date() == date_type(2026, 9, 21)
+
+
+def test_fechamento_consolidado_nunca_aceita_sale_date_nesta_versao(org_session):
+    """Decisão explícita do pedido: "se isso tornar a UX do consolidado
+    excessivamente complexa, mantenha o fechamento consolidado sem
+    override nesta primeira versão". `ConsolidatedOrderClose` não tem
+    NENHUM campo de data — não é possível regularizar comandas pelo
+    fechamento consolidado nesta versão, só pelo individual."""
+    from nexasalon_api.schemas.order import ConsolidatedOrderClose
+
+    assert "sale_date" not in ConsolidatedOrderClose.model_fields
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt1, branch, prof, client = _finished_appointment_with_two_services(session, org_id, actor)
+    register = _open_register(session, actor)
+    order1 = orders.create_order(session, actor, appt1.id)
+
+    svc = _service(session, org_id, name="Escova", duration=30, price=Decimal("80.00"))
+    _link(session, prof.id, svc.id)
+    appt2 = appointments.create_appointment(
+        session, actor,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=svc.id, start_at=_dt(14, 0))],
+        ),
+    )
+    appt2.status = AppointmentStatus.FINISHED
+    session.flush()
+    order2 = orders.create_order(session, actor, appt2.id)
+
+    closed = orders.close_orders_consolidated(
+        session, actor, order1.id,
+        ConsolidatedOrderClose(
+            order_ids=[order1.id, order2.id],
+            payments=[PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("460.00"), cash_register_id=register.id)],
+        ),
+    )
+    for order in closed:
+        assert order.sale_competence_override is None
+
+
+def test_multiplas_formas_de_pagamento_no_fechamento_regularizado(org_session):
+    """Pagamento misto (Pix + Crédito) numa comanda regularizada — os
+    DOIS `Payment` nascem com o mesmo `created_at` real (o momento do
+    fechamento), a competência de venda (`sale_competence_override`) é
+    da COMANDA, nunca duplicada/dividida entre os pagamentos."""
+    from datetime import date as date_type
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    appt, *_ = _finished_appointment_with_two_services(session, org_id, actor)
+    order = orders.create_order(session, actor, appt.id)
+    register = _open_register(session, actor)
+
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(
+            payments=[
+                PaymentCreate(method=PaymentMethod.PIX, amount=Decimal("200.00"), cash_register_id=register.id),
+                PaymentCreate(method=PaymentMethod.CREDIT, amount=Decimal("180.00"), card_brand=CardBrand.VISA, cash_register_id=register.id),
+            ],
+            sale_date=date_type(2026, 9, 20),
+        ),
+    )
+
+    assert len(closed.payments) == 2
+    assert {p.method for p in closed.payments} == {PaymentMethod.PIX, PaymentMethod.CREDIT}
+    assert order_totals.sale_competence(closed).date() == date_type(2026, 9, 20)

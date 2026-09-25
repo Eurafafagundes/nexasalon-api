@@ -16,7 +16,7 @@ novos×recorrentes, retenção 90 dias com censura temporal, status por
 código interno, e a prova explícita de que nenhuma query duplica
 faturamento por causa de JOIN 1:N entre Order/OrderItem/Payment."""
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -141,10 +141,19 @@ def _closed_order(
     items: list[dict],
     payments: list[dict],
     cash_register_id,
+    # Competência de venda (correção priorizada) — `Order.created_at`,
+    # agora a fonte real usada por `services/dashboard.py` pra
+    # Faturamento/Recebido/etc. Default = `closed_at` (comportamento
+    # IDÊNTICO ao de antes desta correção para TODOS os testes
+    # existentes, que nunca precisaram diferenciar as duas datas) — só
+    # os testes NOVOS de competência passam um `created_at` diferente
+    # de propósito.
+    created_at: datetime | None = None,
 ) -> Order:
     order = Order(
         organization_id=org_id, order_number=_next_order_number(), appointment_id=appointment_id,
         branch_id=branch_id, client_id=client_id, status=OrderStatus.CLOSED, closed_at=closed_at,
+        created_at=created_at if created_at is not None else closed_at,
     )
     session.add(order)
     session.flush()
@@ -170,6 +179,13 @@ def _closed_order(
                 fee_percent_snapshot=p.get("fee_percent_snapshot"),
                 fee_amount_snapshot=p.get("fee_amount_snapshot"),
                 net_amount_snapshot=p.get("net_amount_snapshot"),
+                # Data REAL de registro do pagamento (item 4 do pedido:
+                # "Payment continua com sua própria data") — default =
+                # `closed_at` da comanda (comportamento de sempre); só os
+                # testes novos de competência passam um valor diferente
+                # de propósito (pagamento registrado em dia posterior ao
+                # da comanda).
+                **({"created_at": p["created_at"]} if "created_at" in p else {}),
             )
         )
     session.flush()
@@ -180,22 +196,32 @@ def _sale(
     session, org_id, branch_id, client_id, professional_id, service_id, cash_register_id, *,
     closed_at: datetime, price=Decimal("100.00"), method=PaymentMethod.PIX,
     service_name="Serviço", professional_name="Profissional", appointment_status=AppointmentStatus.PAID,
+    created_at: datetime | None = None,
 ) -> Order:
     """Atalho: 1 agendamento + 1 comanda fechada com 1 item + 1 pagamento
-    — o caso comum usado pela maioria dos testes de faturamento."""
+    — o caso comum usado pela maioria dos testes de faturamento.
+    `created_at` (opcional) = competência de venda; default = `closed_at`
+    (mesmo comportamento de sempre pros testes que não diferenciam as
+    duas datas)."""
     appt = _appointment(
         session, org_id, branch_id, client_id, professional_id, service_id,
-        start_at=closed_at - timedelta(hours=1), status=appointment_status, price=price,
+        start_at=(created_at or closed_at) - timedelta(hours=1), status=appointment_status, price=price,
     )
     return _closed_order(
-        session, org_id, branch_id, client_id, appt.id, closed_at=closed_at,
+        session, org_id, branch_id, client_id, appt.id, closed_at=closed_at, created_at=created_at,
         items=[
             {
                 "service_id": service_id, "professional_id": professional_id, "price": price,
                 "service_name": service_name, "professional_name": professional_name,
             }
         ],
-        payments=[{"method": method, "amount": price}],
+        # Payment.created_at (correção "Recebido = Payment.created_at")
+        # — default = a MESMA data de `closed_at`/`created_at` da
+        # comanda (nunca "agora", o server_default), preservando o
+        # comportamento de TODOS os testes existentes que nunca
+        # diferenciaram as duas datas. Só os testes novos de competência
+        # passam um `created_at` de Payment diferente de propósito.
+        payments=[{"method": method, "amount": price, "created_at": created_at or closed_at}],
         cash_register_id=cash_register_id,
     )
 
@@ -2369,3 +2395,340 @@ def test_http_com_dashboard_view_funciona(org_a_actor, client_as):
     body = resp.json()
     assert body["kpis"]["revenue"]["value"] == "0"
     assert body["granularity"] == "day"
+
+
+# ---------------------------------------------------------------------------
+# Correção de competência de venda (item priorizado) — `Order.created_at`,
+# NUNCA `CashRegister.opened_at`/`Order.closed_at`. Usa `get_kpi_detail`
+# (nunca `get_overview`/`_overview`) de propósito: `get_overview` sempre
+# calcula o heatmap, que quebra neste sandbox por limitação de tzdata do
+# Postgres embarcado (`pgserver`, ver comentário em
+# `test_fee_summary_cartao_com_taxa_nao_configurada_nunca_vira_liquido_
+# zero_por_cento`) — `get_kpi_detail` nunca toca heatmap, então estes
+# testes rodam e provam o comportamento de verdade neste ambiente.
+# ---------------------------------------------------------------------------
+
+
+def _series_by_local_date(detail) -> dict:
+    """`{date(): valor}` a partir de `detail.series` — facilita
+    asserções "dia X tem valor Y, dia Z tem valor 0"."""
+    return {p.current_bucket_start.date(): p.current_value for p in detail.series}
+
+
+def test_competencia_de_venda_usa_created_at_da_comanda_nunca_a_data_de_abertura_do_caixa(org_session):
+    """Cenário exato do bug relatado: caixa aberto em 12/09 e ainda
+    aberto (nunca fechado) em 24/09. Três comandas, criadas em dias
+    diferentes, TODAS fechadas/pagas em 24/09 no MESMO caixa. O fato de
+    todos os pagamentos estarem vinculados ao mesmo `CashRegister` NUNCA
+    pode fazer as três aparecerem no dia de abertura do caixa (12/09) —
+    cada uma pertence ao dia em que sua PRÓPRIA comanda foi criada."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    service_id = _service(session, org_id).id
+    # Caixa aberto em 12/09 — nunca fechado (status continua OPEN),
+    # exatamente o cenário relatado ("caixa aberto 12 dias").
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    def order_created_and_closed(order_number_price, created_day):
+        price = order_number_price
+        appt = _appointment(
+            session, org_id, branch.id, client.id, prof.id, service_id,
+            start_at=_dt(2026, 9, created_day, 8), price=price,
+        )
+        return _closed_order(
+            session, org_id, branch.id, client.id, appt.id,
+            closed_at=_dt(2026, 9, 24, 15),  # TODAS fecham no mesmo dia, no mesmo caixa.
+            created_at=_dt(2026, 9, created_day, 9),
+            items=[{"service_id": service_id, "professional_id": prof.id, "price": price}],
+            payments=[{"method": PaymentMethod.PIX, "amount": price}],
+            cash_register_id=cr.id,
+        )
+
+    order_created_and_closed(Decimal("100"), 12)  # Comanda A
+    order_created_and_closed(Decimal("200"), 20)  # Comanda B
+    order_created_and_closed(Decimal("300"), 24)  # Comanda C
+
+    detail = dashboard_service.get_kpi_detail(
+        session, actor, key="revenue", branch_id=None,
+        date_from=_dt(2026, 9, 12, 0), date_to=_dt(2026, 9, 25, 0),
+        compare_from=None, compare_to=None,
+    )
+    by_day = _series_by_local_date(detail)
+    assert by_day[date(2026, 9, 12)] == Decimal("100")  # SOMENTE A.
+    assert by_day[date(2026, 9, 20)] == Decimal("200")  # SOMENTE B.
+    assert by_day[date(2026, 9, 24)] == Decimal("300")  # SOMENTE C — NUNCA 600.
+    assert detail.kpi.value == Decimal("600")  # total do período continua correto.
+
+
+def test_recebido_usa_payment_created_at_faturamento_usa_competencia_da_comanda(org_session):
+    """Implementação da decisão "Recebido = Payment.created_at" —
+    Faturamento e Recebido deixaram de compartilhar população/
+    competência (ao contrário da versão anterior deste teste). Cenário
+    obrigatório do pedido: comanda 20/09, paga (Payment.created_at)
+    25/09 (aqui simulado como 24/09) → Faturamento em 20/09, Recebido
+    em 24/09, nunca os dois juntos no mesmo dia."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    service_id = _service(session, org_id).id
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 9, 20, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id,
+        closed_at=_dt(2026, 9, 24, 15),
+        created_at=_dt(2026, 9, 20, 9),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("150")}],
+        # Pagamento REGISTRADO (created_at) em dia posterior ao da comanda
+        # — item 4 do pedido: "Payment continua com sua própria data".
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("150"), "created_at": _dt(2026, 9, 24, 16)}],
+        cash_register_id=cr.id,
+    )
+
+    revenue_detail = dashboard_service.get_kpi_detail(
+        session, actor, key="revenue", branch_id=None,
+        date_from=_dt(2026, 9, 20, 0), date_to=_dt(2026, 9, 25, 0),
+        compare_from=None, compare_to=None,
+    )
+    received_detail = dashboard_service.get_kpi_detail(
+        session, actor, key="received", branch_id=None,
+        date_from=_dt(2026, 9, 20, 0), date_to=_dt(2026, 9, 25, 0),
+        compare_from=None, compare_to=None,
+    )
+    revenue_by_day = _series_by_local_date(revenue_detail)
+    received_by_day = _series_by_local_date(received_detail)
+    # Faturamento: 20/09 (competência = created_at da comanda) — nunca
+    # duplicado no dia do pagamento.
+    assert revenue_by_day[date(2026, 9, 20)] == Decimal("150")
+    assert revenue_by_day[date(2026, 9, 24)] == Decimal("0")
+    # Recebido: 24/09 (data REAL do Payment.created_at) — nunca no dia
+    # da comanda.
+    assert received_by_day[date(2026, 9, 20)] == Decimal("0")
+    assert received_by_day[date(2026, 9, 24)] == Decimal("150")
+    # Reconciliação por comanda (drill-down de "revenue") continua
+    # olhando o total pago da Order, INDEPENDENTE da data — a comanda
+    # está 100% quitada, então não pode aparecer pendência nem excedente
+    # mesmo com Faturamento/Recebido em dias diferentes.
+    assert revenue_detail.reconciliation is not None
+    assert revenue_detail.reconciliation.pending_amount == Decimal("0")
+    assert revenue_detail.reconciliation.overpaid_amount == Decimal("0")
+
+
+def test_virada_de_dia_horario_local_proximo_da_meia_noite_fica_no_dia_local_correto(org_session):
+    """Comanda criada às 23h30 (horário local, UTC-3) do dia 12/09 —
+    precisa ficar no bucket de 12/09, nunca "vazar" pro dia 13/09 por
+    conversão incorreta pra UTC. `_dt()` já usa um offset fixo -03:00
+    (mesmo padrão de todo o arquivo) — o teste prova que a comparação
+    de buckets (`_generate_buckets`/`_bucket_index`, aritmética pura de
+    `datetime` com tzinfo) preserva o instante exato, não desloca dia
+    silenciosamente."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    service_id = _service(session, org_id).id
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 9, 12, 23))
+    near_midnight = datetime(2026, 9, 12, 23, 30, tzinfo=_TZ)
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id,
+        closed_at=near_midnight,
+        created_at=near_midnight,
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("80")}],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("80")}],
+        cash_register_id=cr.id,
+    )
+
+    detail = dashboard_service.get_kpi_detail(
+        session, actor, key="revenue", branch_id=None,
+        date_from=_dt(2026, 9, 12, 0), date_to=_dt(2026, 9, 14, 0),
+        compare_from=None, compare_to=None,
+    )
+    by_day = _series_by_local_date(detail)
+    assert by_day[date(2026, 9, 12)] == Decimal("80")
+    assert by_day[date(2026, 9, 13)] == Decimal("0")
+
+
+def test_pagamento_revertido_nao_reduz_faturamento_mas_zera_recebido(org_session):
+    """Faturamento é `OrderItem.price` (nunca `Payment`) — um pagamento
+    revertido (`reopen_order`) não pode reduzir o Faturamento já
+    reconhecido daquela comanda. "Recebido" SIM cai a zero (já filtra
+    `Payment.reversed_at IS NULL`, comportamento preservado, nunca
+    tocado nesta correção)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    service_id = _service(session, org_id).id
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 9, 15, 9))
+    order = _closed_order(
+        session, org_id, branch.id, client.id, appt.id,
+        closed_at=_dt(2026, 9, 15, 11), created_at=_dt(2026, 9, 15, 9),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("90")}],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("90")}],
+        cash_register_id=cr.id,
+    )
+    payment = order.payments[0]
+    payment.reversed_at = _dt(2026, 9, 16, 10)
+    session.flush()
+
+    revenue_detail = dashboard_service.get_kpi_detail(
+        session, actor, key="revenue", branch_id=None,
+        date_from=_dt(2026, 9, 15, 0), date_to=_dt(2026, 9, 16, 0),
+        compare_from=None, compare_to=None,
+    )
+    received_detail = dashboard_service.get_kpi_detail(
+        session, actor, key="received", branch_id=None,
+        date_from=_dt(2026, 9, 15, 0), date_to=_dt(2026, 9, 16, 0),
+        compare_from=None, compare_to=None,
+    )
+    assert revenue_detail.kpi.value == Decimal("90")  # Faturamento intocado.
+    assert received_detail.kpi.value == Decimal("0")  # Recebido zera (pagamento revertido).
+
+
+def test_comanda_reaberta_desaparece_do_faturamento_independente_da_data(org_session):
+    """`reopen_order` volta `Order.status` pra `OPEN` — Faturamento
+    filtra `status == CLOSED` (nunca mudado nesta correção), então a
+    comanda simplesmente some do período até ser refechada, qualquer
+    que seja sua competência."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    service_id = _service(session, org_id).id
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 9, 18, 9))
+    order = _closed_order(
+        session, org_id, branch.id, client.id, appt.id,
+        closed_at=_dt(2026, 9, 18, 11), created_at=_dt(2026, 9, 18, 9),
+        items=[{"service_id": service_id, "professional_id": prof.id, "price": Decimal("70")}],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("70")}],
+        cash_register_id=cr.id,
+    )
+    # Simula `reopen_order` (mesma transição de estado, sem chamar o
+    # service inteiro — foco é o efeito no Dashboard, já coberto por
+    # `tests/test_order_reopen.py`).
+    order.status = OrderStatus.OPEN
+    order.closed_at = None
+    session.flush()
+
+    detail = dashboard_service.get_kpi_detail(
+        session, actor, key="revenue", branch_id=None,
+        date_from=_dt(2026, 9, 18, 0), date_to=_dt(2026, 9, 19, 0),
+        compare_from=None, compare_to=None,
+    )
+    assert detail.kpi.value == Decimal("0")
+
+
+def test_comanda_cancelada_nunca_conta_em_faturamento_mesmo_com_created_at_no_periodo(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    service_id = _service(session, org_id).id
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 9, 19, 9))
+    order = Order(
+        organization_id=org_id, order_number=_next_order_number(), appointment_id=appt.id, branch_id=branch.id,
+        client_id=client.id, status=OrderStatus.CANCELLED, created_at=_dt(2026, 9, 19, 9),
+    )
+    session.add(order)
+    session.flush()
+    session.add(OrderItem(
+        organization_id=org_id, order_id=order.id, service_id=service_id, professional_id=prof.id,
+        duration_minutes=60, price=Decimal("60"), service_name="Serviço", professional_name="Profissional",
+    ))
+    session.flush()
+
+    detail = dashboard_service.get_kpi_detail(
+        session, actor, key="revenue", branch_id=None,
+        date_from=_dt(2026, 9, 19, 0), date_to=_dt(2026, 9, 20, 0),
+        compare_from=None, compare_to=None,
+    )
+    assert detail.kpi.value == Decimal("0")
+
+
+def test_beneficio_cortesia_nao_muda_a_competencia_so_reduz_o_valor_exibido(org_session):
+    """Um item com Cortesia/Fidelidade continua pertencendo ao dia em
+    que a COMANDA foi criada — o benefício reduz o Bruto EXIBIDO
+    (`_gross_revenue_after_benefits`, já existente, nunca redesenhado
+    aqui), nunca desloca a comanda pra outro bucket."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    service_id = _service(session, org_id).id
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 9, 21, 9))
+    _closed_order(
+        session, org_id, branch.id, client.id, appt.id,
+        closed_at=_dt(2026, 9, 23, 15),  # fechada em dia diferente do de criação.
+        created_at=_dt(2026, 9, 21, 9),
+        items=[{
+            "service_id": service_id, "professional_id": prof.id, "price": Decimal("130"),
+            "benefit_type": BenefitType.COURTESY, "benefit_amount": Decimal("50"),
+        }],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("80")}],
+        cash_register_id=cr.id,
+    )
+
+    detail = dashboard_service.get_kpi_detail(
+        session, actor, key="revenue", branch_id=None,
+        date_from=_dt(2026, 9, 21, 0), date_to=_dt(2026, 9, 24, 0),
+        compare_from=None, compare_to=None,
+    )
+    by_day = _series_by_local_date(detail)
+    # 130 (econômico) - 50 (cortesia) = 80, no dia de CRIAÇÃO (21/09) —
+    # nunca no dia de fechamento (23/09).
+    assert by_day[date(2026, 9, 21)] == Decimal("80")
+    assert by_day[date(2026, 9, 23)] == Decimal("0")
+
+
+def test_produto_segue_a_mesma_competencia_de_criacao_da_comanda_que_o_servico(org_session):
+    """`OrderProductItem` (produto vendido) precisa respeitar a MESMA
+    competência (`Order.created_at`) que `OrderItem` (serviço) — os
+    dois compõem o mesmo Faturamento, nunca competências diferentes
+    pra linhas da mesma comanda."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    service_id = _service(session, org_id).id
+    product = _product(session, org_id, "Shampoo")
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    appt = _appointment(session, org_id, branch.id, client.id, prof.id, service_id, start_at=_dt(2026, 9, 22, 9))
+    order = _closed_order(
+        session, org_id, branch.id, client.id, appt.id,
+        closed_at=_dt(2026, 9, 23, 15),  # fechada num dia diferente.
+        created_at=_dt(2026, 9, 22, 9),
+        items=[],
+        payments=[{"method": PaymentMethod.PIX, "amount": Decimal("50")}],
+        cash_register_id=cr.id,
+    )
+    _add_product_item(session, org_id, order, product, quantity=Decimal("1"), unit_price=Decimal("50"))
+
+    detail = dashboard_service.get_kpi_detail(
+        session, actor, key="revenue", branch_id=None,
+        date_from=_dt(2026, 9, 22, 0), date_to=_dt(2026, 9, 24, 0),
+        compare_from=None, compare_to=None,
+    )
+    by_day = _series_by_local_date(detail)
+    assert by_day[date(2026, 9, 22)] == Decimal("50")  # dia de CRIAÇÃO, não de fechamento (23/09).
+    assert by_day[date(2026, 9, 23)] == Decimal("0")

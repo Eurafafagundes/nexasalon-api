@@ -92,7 +92,18 @@ class ExtractSaleRow(BaseModel):
     R$ 800 (item 18). `total`/`payment_methods`/`status` são sempre da
     COMANDA inteira — a granularidade por serviço vive só em `items`
     (Etapa N2), que o frontend pode expandir/detalhar sem nunca virar
-    uma segunda "venda"."""
+    uma segunda "venda".
+
+    `date` (correção de competência de venda — item priorizado) é
+    SEMPRE a competência EFETIVA de venda (`services/order_totals.py::
+    sale_competence` — `Order.sale_competence_override` quando a
+    comanda foi regularizada manualmente no fechamento, senão
+    `Order.created_at`), nunca `closed_at`. Antes desta correção havia
+    uma inconsistência real: o FILTRO de período do Extrato
+    (`order_repo.list_for_org`) já usava `created_at`, mas este campo
+    EXIBIDO/exportado usava `closed_at or created_at` — uma comanda
+    filtrada num dia podia aparecer rotulada com outro dia na própria
+    tela. `date` agora usa a MESMA fonte do filtro, sempre."""
 
     order_id: uuid.UUID
     order_number: int
@@ -172,7 +183,11 @@ class ExtractSaleRow(BaseModel):
         return cls(
             order_id=order.id,
             order_number=order.order_number,
-            date=order.closed_at or order.created_at,
+            # Competência de venda EFETIVA (correção priorizada) —
+            # MESMA fonte já usada pelo filtro de período
+            # (`order_repo.list_for_org`), nunca `closed_at` (ver
+            # docstring da classe).
+            date=order_totals.sale_competence(order),
             client_id=order.client_id,
             client_name=client_name,
             services_summary=" + ".join(dict.fromkeys(i.service_name for i in order.items)) or "—",

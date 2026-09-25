@@ -1,7 +1,7 @@
 """Schemas da Comanda/Pagamento — ver `models/order.py` para o
 raciocínio de domínio (3 camadas de preço, `Payment` como lista)."""
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -18,6 +18,7 @@ from nexasalon_api.models.enums import (
     ProductUnit,
 )
 from nexasalon_api.models.order import Order
+from nexasalon_api.services import order_totals
 from nexasalon_api.models.organization import Organization
 from nexasalon_api.services import order_totals
 
@@ -274,9 +275,19 @@ class OrderClose(BaseModel):
     correto de fechar uma comanda com total R$0 (cortesia/gratuita):
     nenhum Payment artificial só pra satisfazer um mínimo (ver
     `services/orders.py::close_order` — soma 0 de uma lista vazia
-    nunca deixa saldo positivo em aberto quando o total já é 0)."""
+    nunca deixa saldo positivo em aberto quando o total já é 0).
+
+    `sale_date` (migration 0055, regularização temporária de vendas
+    antigas) — OPCIONAL, `None` (o normal, todo fechamento do fluxo do
+    dia-a-dia) preserva o comportamento de sempre (competência =
+    `created_at`). Só é enviado quando o usuário conscientemente
+    escolhe uma "Data da venda" diferente da data real do fechamento —
+    grava em `Order.sale_competence_override`, NUNCA em `created_at`/
+    `closed_at`/`Payment.created_at` (ver `services/orders.py::
+    close_order`)."""
 
     payments: list[PaymentCreate] = Field(default_factory=list)
+    sale_date: date | None = None
 
 
 class ConsolidatedOrderClose(BaseModel):
@@ -421,6 +432,17 @@ class OrderRead(BaseModel):
     closed_at: datetime | None
     created_by: uuid.UUID | None
     closed_by: uuid.UUID | None
+    # Migration 0055 (regularização temporária de vendas antigas) —
+    # `sale_competence_override` é o valor CRU salvo (`None` na
+    # grande maioria das comandas, só preenchido quando alguém
+    # regularizou manualmente no fechamento); `sale_competence` é a
+    # competência EFETIVA já resolvida (`services/order_totals.py::
+    # sale_competence` — o mesmo `COALESCE` usado por Faturamento/
+    # Extrato/Dashboard), pra o frontend nunca precisar reimplementar
+    # esse fallback sozinho (ex.: pré-preencher "Data da venda" no
+    # fechamento).
+    sale_competence_override: datetime | None
+    sale_competence: datetime
 
     @classmethod
     def from_order(cls, order: Order) -> "OrderRead":
@@ -453,6 +475,8 @@ class OrderRead(BaseModel):
             closed_at=order.closed_at,
             created_by=order.created_by,
             closed_by=order.closed_by,
+            sale_competence_override=order.sale_competence_override,
+            sale_competence=order_totals.sale_competence(order),
         )
 
 

@@ -151,6 +151,12 @@ def _sale(
     # `benefit_amount == price` (benefício integral) não cria NENHUM
     # Payment — mesmo raciocínio de `payments=[]`.
     benefit_type=None, benefit_amount=None,
+    # Competência de venda (correção priorizada) — `Order.created_at`,
+    # agora a fonte real usada por `services/dashboard.py`. Default =
+    # `closed_at` (comportamento IDÊNTICO ao de antes desta correção
+    # pra todos os testes existentes deste arquivo, que simulam datas
+    # históricas via `closed_at` e nunca precisaram diferenciar as duas).
+    created_at=None,
 ) -> Order:
     appt = Appointment(organization_id=org_id, branch_id=branch_id, client_id=client_id, status=AppointmentStatus.PAID)
     session.add(appt)
@@ -164,6 +170,7 @@ def _sale(
     order = Order(
         organization_id=org_id, order_number=_next_order_number(), appointment_id=appt.id,
         branch_id=branch_id, client_id=client_id, status=OrderStatus.CLOSED, closed_at=closed_at,
+        created_at=created_at if created_at is not None else closed_at,
     )
     session.add(order)
     session.flush()
@@ -259,6 +266,65 @@ def test_formula_completa_com_todos_os_componentes(org_session):
     assert result.available_percent == Decimal("56.00")
     assert result.has_multiple_tax_rates is False
     assert result.single_tax_rate == Decimal("6.00")
+
+
+def test_comissao_do_resultado_disponivel_usa_a_mesma_populacao_da_receita_nunca_a_do_modulo_de_comissoes(org_session):
+    """Auditoria pedida explicitamente (item 11/item 4 do pedido de
+    correção de competência): uma comanda CRIADA no mês 0 mas FECHADA
+    no mês 1 (atravessa a virada do mês) precisa ter receita E comissão
+    do Resultado Disponível contadas no MESMO mês (mês 0, competência
+    de VENDA) — nunca a comissão "vazando" pro mês 1 só porque
+    `services/commissions.py` usa `closed_at`. A Comissão OFICIAL
+    (`commissions_service.get_overview`, usada em Comissões/Resumo
+    Financeiro) CONTINUA em `closed_at`, por decisão de negócio
+    preservada — e por isso, pra este MESMO pedido, ela diverge do
+    Resultado Disponível: é exatamente essa divergência que este teste
+    documenta e prova ser intencional/entendida, não um bug."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    client = _client(session, org_id)
+    professional = _professional(session, org_id, branch.id)
+    service = _service(session, org_id)
+    register = _cash_register(session, org_id, branch.id, actor.user_id)
+
+    tax_rates_service.set_rate(session, actor, TaxRateSet(competence_month=_MONTH_0, tax_rate="6.00"))
+
+    _sale(
+        session, org_id, branch.id, client.id, professional.id, service.id, register.id,
+        # Criada perto do fim do mês 0, mas só FECHADA (closed_at) no
+        # início do mês 1 — o cenário exato que causa a divergência.
+        created_at=_at(_MONTH_0, 25), closed_at=_at(_MONTH_1, 2),
+        price=Decimal("1000.00"),
+        commission_type=CommissionType.PERCENTAGE, commission_value=Decimal("20.00"),
+        commission_amount=Decimal("200.00"), commission_status=CommissionStatus.CALCULATED,
+    )
+
+    overview_month_0 = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+        compare_from=None, compare_to=None,
+    )
+    overview_month_1 = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_at(_MONTH_1, 1), date_to=_at(_MONTH_1, 28),
+        compare_from=None, compare_to=None,
+    )
+    # Receita e comissão do Resultado Disponível SEMPRE juntas, no mês
+    # da competência de VENDA (mês 0) — nunca uma sem a outra.
+    assert overview_month_0.available_result.gross_revenue == Decimal("1000.00")
+    assert overview_month_0.available_result.commissions == Decimal("200.00")
+    assert overview_month_1.available_result.gross_revenue == Decimal("0.00")
+    assert overview_month_1.available_result.commissions == Decimal("0.00")
+
+    # A Comissão OFICIAL (módulo Comissões) diverge de propósito —
+    # continua em `closed_at`, mês 1.
+    official_month_0 = commissions_service.get_overview(
+        session, actor, date_from=_at(_MONTH_0, 1), date_to=_at(_MONTH_1, 1),
+    )
+    official_month_1 = commissions_service.get_overview(
+        session, actor, date_from=_at(_MONTH_1, 1), date_to=_at(_MONTH_1, 28),
+    )
+    assert official_month_0.known_commission_total == Decimal("0.00")
+    assert official_month_1.known_commission_total == Decimal("200.00")
 
 
 def test_pix_com_taxa_configurada_e_deduzido_uma_unica_vez_no_resultado_disponivel(org_session):
@@ -830,6 +896,7 @@ def test_comanda_mista_um_item_com_beneficio_outro_pago_normalmente(org_session)
     order = Order(
         organization_id=org_id, order_number=_next_order_number(), appointment_id=appt.id,
         branch_id=branch.id, client_id=client.id, status=OrderStatus.CLOSED, closed_at=closed_at,
+        created_at=closed_at,  # competência de venda (correção priorizada) — ver `_sale` acima.
     )
     session.add(order)
     session.flush()

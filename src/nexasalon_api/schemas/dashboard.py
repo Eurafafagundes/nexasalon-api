@@ -101,8 +101,9 @@ class ClientPerformanceRow(BaseModel):
     consistente com Top Serviços/Profissionais, que também não incluem
     produto). `orders_count` é nº de comandas FECHADAS deste cliente no
     período (mesma definição de "Atendimentos" usada no resto do
-    Dashboard). `last_visit` é o `Order.closed_at` mais recente do
-    cliente DENTRO do período filtrado (não a última visita da vida
+    Dashboard). `last_visit` é o `Order.created_at` (competência de
+    venda — correção priorizada, nunca mais `closed_at`) mais recente
+    do cliente DENTRO do período filtrado (não a última visita da vida
     inteira dele)."""
 
     client_id: uuid.UUID
@@ -147,7 +148,11 @@ class PaymentMethodPaymentRow(BaseModel):
     SNAPSHOT (nome do cliente no momento do fechamento), mesmo
     raciocínio de `DashboardOrderItemRow`. `method` é o método EXATO
     (não o bucket) — a fatia "Outros" agrupa vários métodos distintos,
-    então o drill-down precisa distinguir qual foi usado em cada linha."""
+    então o drill-down precisa distinguir qual foi usado em cada linha.
+
+    `closed_at` (nome do campo mantido por compatibilidade de contrato
+    de API) carrega `Order.created_at` — competência de venda, correção
+    priorizada — NUNCA mais o `Order.closed_at` real da comanda."""
 
     payment_id: uuid.UUID
     order_id: uuid.UUID
@@ -497,7 +502,11 @@ class DashboardOrderItemRow(BaseModel):
     SNAPSHOT do `OrderItem` (`service_name`/`professional_name`/
     `price`), nunca uma leitura ao vivo de `Service`/`Professional`
     (mesmo raciocínio do Extrato/Comissões: histórico não muda se o
-    cadastro mudar depois)."""
+    cadastro mudar depois).
+
+    `closed_at` (nome do campo mantido por compatibilidade de contrato
+    de API) carrega `Order.created_at` — competência de venda, correção
+    priorizada — NUNCA mais o `Order.closed_at` real da comanda."""
 
     order_item_id: uuid.UUID
     order_id: uuid.UUID
