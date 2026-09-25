@@ -35,15 +35,24 @@ de oferecer o seletor na tela (frontend) e/ou bloquear a permissao de
 enviar um novo valor -- nunca dropar esta coluna.
 
 Revision ID: 0055
-Revises: 0054
+Revises: 0052
 Create Date: 2026-09-25
+
+Nota (2026-09-25): originalmente encadeada em 0054, mas 0053/0054
+("Comissão condicional", feature não relacionada) ainda não foram
+commitadas neste momento -- repontada para 0052 (o head real já
+commitado em origin/main) para não travar o deploy desta feature numa
+outra, independente, ainda em andamento. Quando 0053/0054 forem
+finalizadas e commitadas, a cadeia deve ser reordenada manualmente
+naquele momento (0055 passa a vir depois delas, ou vice-versa,
+dependendo da ordem de deploy).
 """
 import sqlalchemy as sa
 
 from alembic import op
 
 revision = "0055"
-down_revision = "0054"
+down_revision = "0052"
 branch_labels = None
 depends_on = None
 
