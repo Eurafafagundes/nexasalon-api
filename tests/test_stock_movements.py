@@ -155,6 +155,49 @@ def test_motivo_reservado_de_sistema_e_recusado_no_service_mesmo_bypassando_sche
         )
 
 
+def test_movimentacao_de_produto_arquivado_e_recusada(org_session):
+    """Etapa "Arquivamento de Produtos" — `record_movement` é uma
+    escolha NOVA de produto (Entrada/Saída manual), nunca deve aceitar
+    um produto arquivado. Nenhuma linha em `stock_movements`/`StockLevel`
+    é criada pela tentativa recusada."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch_id = _branch(session, org_id)
+    product_id = _product(session, actor)
+    products.set_product_active(session, actor, product_id, False)
+
+    with pytest.raises(ValidationDomainError):
+        stock.record_movement(
+            session, actor, product_id=product_id, branch_id=branch_id,
+            direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE, quantity=Decimal("1"),
+        )
+    assert stock.list_movements(session, actor, product_id=product_id) == []
+
+
+def test_transferencia_de_produto_arquivado_e_recusada(org_session):
+    """Mesmo raciocínio de `record_movement` — transferir é uma escolha
+    NOVA de produto agora, não uma consequência de algo antigo."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    origin = _branch(session, org_id, "Origem")
+    destination = _branch(session, org_id, "Destino")
+    product_id = _product(session, actor)
+    stock.record_movement(
+        session, actor, product_id=product_id, branch_id=origin,
+        direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE, quantity=Decimal("10"),
+    )
+    products.set_product_active(session, actor, product_id, False)
+
+    with pytest.raises(ValidationDomainError):
+        stock.create_transfer(
+            session, actor, product_id=product_id, origin_branch_id=origin,
+            destination_branch_id=destination, quantity=Decimal("1"),
+        )
+    # saldo de origem intacto — a tentativa recusada não moveu nada.
+    origin_level = stock_level_repo.get(session, org_id, product_id, origin)
+    assert origin_level.quantity_on_hand == Decimal("10")
+
+
 def test_movimentacao_de_produto_inexistente_e_404(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)

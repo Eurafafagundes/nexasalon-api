@@ -327,6 +327,38 @@ def test_correcao_de_consumo_gera_movimento_compensatorio_sem_editar_original(or
     assert correction_movement.quantity == Decimal("20")
 
 
+def test_correcao_de_consumo_continua_funcionando_apos_produto_arquivado(org_session):
+    """Etapa "Arquivamento de Produtos" — `record_consumption_correction`
+    é uma consequência/correção de uma operação já em andamento (chamada
+    via `_create_movement`, nunca via `record_movement`), então precisa
+    continuar funcionando mesmo depois do produto arquivado."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    order, branch = _open_order(session, org_id, actor)
+    product = _internal_product(session, actor)
+    _stock_in(session, actor, product.id, branch.id, Decimal("1000"))
+    orders.add_product_item(
+        session, actor, order.id,
+        OrderProductItemCreate(product_id=product.id, quantity=Decimal("180"), item_type=OrderProductItemKind.CONSUMPTION),
+    )
+    closed = _close(session, actor, order)
+    item_id = closed.product_items[0].id
+
+    products.set_product_active(session, actor, product.id, False)
+
+    corrected = orders.correct_consumption(
+        session, actor, order.id, item_id,
+        OrderConsumptionCorrection(
+            quantity_delta=Decimal("20"), reason="Sobrou menos cabelo do que o esperado", idempotency_key=uuid.uuid4()
+        ),
+    )
+    line = next(i for i in corrected.product_items if i.id == item_id)
+    assert line.quantity == Decimal("180")  # linha original continua congelada
+
+    level = stock_level_repo.get(session, org_id, product.id, branch.id)
+    assert level.quantity_on_hand == Decimal("800")  # 1000 - 180 - 20, correção efetivada normalmente
+
+
 def test_correcao_negativa_devolve_estoque(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)

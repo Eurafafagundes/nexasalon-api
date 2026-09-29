@@ -290,6 +290,62 @@ def test_saldos_em_lote_usam_uma_query_e_preservam_tenant(client_as, org_a_actor
     assert all(row["product_id"] not in product_ids for row in response_b.json())
 
 
+# ---------------------------------------------------------------------
+# Etapa "Arquivamento de Produtos" — RBAC e isolamento multi-tenant nas
+# rotas `PATCH .../activate` e `.../deactivate`.
+# ---------------------------------------------------------------------
+
+
+def test_ator_so_com_view_nao_pode_arquivar_produto(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    product = c.post("/api/v1/products", json={"name": "Produto"}).json()
+
+    viewer = _restricted_actor(org_a_actor, permissions={"inventory.view"})
+    resp = client_as(viewer).patch(f"/api/v1/products/{product['id']}/deactivate")
+    assert resp.status_code == 403
+
+    # nunca foi arquivado pela tentativa recusada.
+    still_active = c.get(f"/api/v1/products/{product['id']}")
+    assert still_active.json()["is_active"] is True
+
+
+def test_ator_so_com_view_nao_pode_reativar_produto(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    product = c.post("/api/v1/products", json={"name": "Produto"}).json()
+    assert c.patch(f"/api/v1/products/{product['id']}/deactivate").status_code == 200
+
+    viewer = _restricted_actor(org_a_actor, permissions={"inventory.view"})
+    resp = client_as(viewer).patch(f"/api/v1/products/{product['id']}/activate")
+    assert resp.status_code == 403
+
+
+def test_ator_com_manage_pode_arquivar_e_reativar_produto(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    product = c.post("/api/v1/products", json={"name": "Produto"}).json()
+
+    deactivated = c.patch(f"/api/v1/products/{product['id']}/deactivate")
+    assert deactivated.status_code == 200, deactivated.text
+    assert deactivated.json()["is_active"] is False
+
+    reactivated = c.patch(f"/api/v1/products/{product['id']}/activate")
+    assert reactivated.status_code == 200, reactivated.text
+    assert reactivated.json()["is_active"] is True
+
+
+def test_isolamento_multi_tenant_arquivar_produto(client_as, org_a_actor, org_b_actor):
+    c_a = client_as(org_a_actor)
+    product = c_a.post("/api/v1/products", json={"name": "Produto da Org A"}).json()
+
+    c_b = client_as(org_b_actor)
+    resp = c_b.patch(f"/api/v1/products/{product['id']}/deactivate")
+    assert resp.status_code == 404
+
+    # segue ativo — a tentativa de outra organização nunca teve efeito.
+    c_a = client_as(org_a_actor)
+    still_active = c_a.get(f"/api/v1/products/{product['id']}")
+    assert still_active.json()["is_active"] is True
+
+
 def test_overview_com_branch_filtra_stock_levels_no_sql(client_as, org_a_actor):
     from sqlalchemy import event
 

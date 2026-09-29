@@ -189,7 +189,21 @@ def record_movement(
     combina com `direction` no catálogo GERAL — aqui a checagem é mais
     estreita: só os motivos "manuais" (nunca `TRANSFER_IN`/
     `TRANSFER_OUT`/`INVENTORY_COUNT`, reservados aos fluxos de
-    sistema)."""
+    sistema).
+
+    Etapa "Arquivamento de Produtos" — só ESTA função e `create_transfer`
+    recusam produto arquivado (`is_active=False`): são os dois pontos
+    onde alguém está escolhendo um produto AGORA pra uma operação nova.
+    Deliberadamente NÃO colocado em `_get_product_or_404`/
+    `_create_movement` (compartilhados também por
+    `record_sale_movement`/`record_internal_use_movement`, fechamento de
+    uma comanda aberta ANTES do arquivamento, e por
+    `record_consumption_correction`, correção de histórico) — histórico
+    e consequências de operações antigas precisam continuar funcionando
+    mesmo depois do produto ser arquivado."""
+    product = _get_product_or_404(session, actor.organization_id, product_id)
+    if not product.is_active:
+        raise ValidationDomainError("Produto arquivado não pode receber novas movimentações.")
     allowed = MANUAL_REASONS_BY_DIRECTION[direction]
     if reason not in allowed:
         raise ValidationDomainError(
@@ -392,8 +406,14 @@ def create_transfer(
     (esta função nunca importa/toca `CashMovement`/`Payment`). Se a
     origem não tiver saldo suficiente, `_apply_delta` recusa a SAÍDA e
     a transação inteira (transferência + as duas movimentações) dá
-    rollback — nunca fica "só a saída" sem a entrada correspondente."""
-    _get_product_or_404(session, actor.organization_id, product_id)
+    rollback — nunca fica "só a saída" sem a entrada correspondente.
+
+    Etapa "Arquivamento de Produtos" — recusa produto arquivado, mesmo
+    raciocínio de `record_movement` (ver docstring lá): é uma escolha
+    NOVA de produto, feita agora."""
+    product = _get_product_or_404(session, actor.organization_id, product_id)
+    if not product.is_active:
+        raise ValidationDomainError("Produto arquivado não pode ser transferido entre unidades.")
     _get_branch_or_404(session, actor.organization_id, origin_branch_id)
     _get_branch_or_404(session, actor.organization_id, destination_branch_id)
     if origin_branch_id == destination_branch_id:

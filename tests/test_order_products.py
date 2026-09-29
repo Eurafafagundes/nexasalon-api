@@ -257,6 +257,33 @@ def test_produto_inexistente_404(org_session):
         orders.add_product_item(session, actor, order.id, OrderProductItemCreate(product_id=uuid.uuid4(), quantity=Decimal("1")))
 
 
+def test_fechar_comanda_com_produto_adicionado_antes_de_arquivar_continua_funcionando(org_session):
+    """Etapa "Arquivamento de Produtos" — a proteção de `record_movement`
+    nunca pode alcançar `close_order`. O produto foi escolhido ENQUANTO
+    ativo; arquivar depois não pode travar o fechamento nem a baixa de
+    estoque dessa comanda já em andamento."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    order, appt, branch = _open_order(session, org_id, actor)
+    product = _product(session, actor, sale=Decimal("20.00"))
+    _stock_in(session, actor, product.id, branch.id, Decimal("10"))
+    orders.add_product_item(session, actor, order.id, OrderProductItemCreate(product_id=product.id, quantity=Decimal("2")))
+
+    products.set_product_active(session, actor, product.id, False)
+
+    register = _open_register(session, actor)
+    total = sum((i.price for i in order.items), Decimal("0")) + Decimal("40.00")
+    closed = orders.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method=PaymentMethod.PIX, amount=total, cash_register_id=register.id)]),
+    )
+
+    line = closed.product_items[0]
+    assert line.stock_movement_id is not None
+    level = stock_level_repo.get(session, org_id, product.id, branch.id)
+    assert level.quantity_on_hand == Decimal("8")  # 10 - 2, baixa normal
+
+
 def test_nao_adiciona_produto_em_comanda_fechada(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id)

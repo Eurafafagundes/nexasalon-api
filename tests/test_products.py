@@ -2,6 +2,7 @@
 Mesma abordagem de `test_cash_register.py`: direto no service layer via
 `SessionLocal`, sessão não commitada (rollback no teardown)."""
 import uuid
+from decimal import Decimal
 
 import pytest
 from sqlalchemy import text
@@ -9,11 +10,12 @@ from sqlalchemy import text
 from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.db import SessionLocal
 from nexasalon_api.core.exceptions import ConflictError, NotFoundError
-from nexasalon_api.models.enums import ProductUnit
+from nexasalon_api.models.enums import ProductUnit, StockMovementDirection, StockMovementReason
 from nexasalon_api.models.identity import User
-from nexasalon_api.models.organization import Organization
+from nexasalon_api.models.organization import Branch, Organization
+from nexasalon_api.repositories import stock_level_repo
 from nexasalon_api.schemas.product import ProductCreate, ProductUpdate
-from nexasalon_api.services import products
+from nexasalon_api.services import products, stock
 
 
 @pytest.fixture()
@@ -133,3 +135,99 @@ def test_produto_de_outra_organizacao_e_404(org_session):
 
     with pytest.raises(NotFoundError):
         products.get_product(session, actor_b, product.id)
+
+
+# ---------------------------------------------------------------------
+# Etapa "Arquivamento de Produtos" — preserva estoque/histórico,
+# reativação sem efeito colateral.
+# ---------------------------------------------------------------------
+
+
+def _branch(session, org_id, name="Unidade") -> uuid.UUID:
+    b = Branch(organization_id=org_id, name=name, slug=f"{name.lower()}-{uuid.uuid4().hex[:8]}")
+    session.add(b)
+    session.flush()
+    return b.id
+
+
+def test_arquivar_produto_com_saldo_preserva_stock_level(org_session):
+    """Arquivar NUNCA mexe em `StockLevel` — nem zera, nem altera."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    product = products.create_product(session, actor, ProductCreate(name="Produto"))
+    branch_id = _branch(session, org_id)
+    stock.record_movement(
+        session, actor, product_id=product.id, branch_id=branch_id,
+        direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE, quantity=Decimal("98"),
+    )
+
+    products.set_product_active(session, actor, product.id, False)
+
+    level = stock_level_repo.get(session, org_id, product.id, branch_id)
+    assert level.quantity_on_hand == Decimal("98")
+
+
+def test_arquivar_produto_nao_cria_stock_movement(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    product = products.create_product(session, actor, ProductCreate(name="Produto"))
+    branch_id = _branch(session, org_id)
+    stock.record_movement(
+        session, actor, product_id=product.id, branch_id=branch_id,
+        direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE, quantity=Decimal("10"),
+    )
+    before = len(stock.list_movements(session, actor, product_id=product.id))
+
+    products.set_product_active(session, actor, product.id, False)
+
+    after = stock.list_movements(session, actor, product_id=product.id)
+    assert len(after) == before
+
+
+def test_arquivar_produto_nao_altera_custo(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    product = products.create_product(session, actor, ProductCreate(name="Produto", cost_price="12.50"))
+
+    archived = products.set_product_active(session, actor, product.id, False)
+    assert archived.cost_price == pytest.approx(12.50)
+
+
+def test_reativar_produto_mantem_saldo_e_historico(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    product = products.create_product(session, actor, ProductCreate(name="Produto"))
+    branch_id = _branch(session, org_id)
+    stock.record_movement(
+        session, actor, product_id=product.id, branch_id=branch_id,
+        direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE, quantity=Decimal("50"),
+    )
+    products.set_product_active(session, actor, product.id, False)
+
+    reactivated = products.set_product_active(session, actor, product.id, True)
+
+    assert reactivated.is_active is True
+    level = stock_level_repo.get(session, org_id, product.id, branch_id)
+    assert level.quantity_on_hand == Decimal("50")
+    assert len(stock.list_movements(session, actor, product_id=product.id)) == 1
+    # nenhuma movimentação "de reativação" foi gerada.
+    reasons = {m.reason for m in stock.list_movements(session, actor, product_id=product.id)}
+    assert reasons == {StockMovementReason.PURCHASE}
+
+
+def test_reativar_produto_permite_novas_movimentacoes_de_novo(org_session):
+    """Depois de reativado, o produto volta a passar pela checagem de
+    `record_movement`/`create_transfer` normalmente — nunca fica
+    "preso" arquivado por engano."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    product = products.create_product(session, actor, ProductCreate(name="Produto"))
+    branch_id = _branch(session, org_id)
+    products.set_product_active(session, actor, product.id, False)
+    products.set_product_active(session, actor, product.id, True)
+
+    movement = stock.record_movement(
+        session, actor, product_id=product.id, branch_id=branch_id,
+        direction=StockMovementDirection.IN, reason=StockMovementReason.PURCHASE, quantity=Decimal("5"),
+    )
+    assert movement.quantity == Decimal("5")
