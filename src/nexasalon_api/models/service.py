@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Boolean, ForeignKey, Integer, Numeric, SmallInteger, String, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Integer, Numeric, SmallInteger, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -98,7 +98,18 @@ class ProfessionalService(Base, UUIDPKMixin, TimestampMixin):
     """
 
     __tablename__ = "professional_services"
-    __table_args__ = (UniqueConstraint("professional_id", "service_id"),)
+    __table_args__ = (
+        UniqueConstraint("professional_id", "service_id"),
+        # Etapa "Disponibilidade por profissional x servico no Agendamento
+        # Online" (migration 0056) — um vínculo que o profissional NÃO
+        # realiza mais (`is_active=false`) nunca pode ficar marcado como
+        # disponível online. A regra já é reforçada no Pydantic
+        # (`schemas/professional.py`), isto aqui é o reforço no banco.
+        CheckConstraint(
+            "is_active OR NOT allow_online_booking",
+            name="online_booking_requires_active_service",
+        ),
+    )
 
     professional_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("professionals.id", ondelete="CASCADE"), nullable=False
@@ -107,6 +118,17 @@ class ProfessionalService(Base, UUIDPKMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("services.id", ondelete="CASCADE"), nullable=False
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    # Etapa "Disponibilidade por profissional x serviço no Agendamento
+    # Online" (migration 0056) — quarta camada da mesma decisão (junto de
+    # `Professional.allow_online_booking`/`Service.allow_online_booking`,
+    # mesmo nome nas três por consistência). `false` = o profissional
+    # continua realizando este serviço NORMALMENTE na agenda interna
+    # (nunca lido por `_build_item_snapshot`/agenda interna — só pelo
+    # fluxo público, ver `services/public_booking.py::
+    # is_online_booking_eligible`), só não aparece/não pode ser reservado
+    # no Agendamento Online para ESTA combinação específica. Nunca `true`
+    # quando `is_active=false` (CHECK acima + validado no Pydantic).
+    allow_online_booking: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     duration_override_minutes: Mapped[int | None] = mapped_column(Integer)
     price_override: Mapped[float | None] = mapped_column(Numeric(10, 2))
     commission_type: Mapped[CommissionType | None] = mapped_column(

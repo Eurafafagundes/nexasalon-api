@@ -71,6 +71,12 @@ class WorkingHoursReplaceRequest(BaseModel):
 class ProfessionalServiceItem(BaseModel):
     service_id: uuid.UUID
     is_active: bool = True
+    # Etapa "Disponibilidade por profissional x serviço no Agendamento
+    # Online" — independente de `is_active` ("realiza o serviço"): `false`
+    # só tira esta combinação do fluxo público, a agenda interna nunca lê
+    # este campo. Nunca `true` quando `is_active=false` (ver
+    # `_check_online_booking` abaixo).
+    allow_online_booking: bool = True
     duration_override_minutes: int | None = Field(default=None, gt=0)
     price_override: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     commission_type: CommissionType | None = None
@@ -86,6 +92,20 @@ class ProfessionalServiceItem(BaseModel):
                 raise ValueError("commission_value percentual não pode passar de 100")
         if (self.commission_type is None) != (self.commission_value is None):
             raise ValueError("commission_type e commission_value devem ser preenchidos juntos")
+        return self
+
+    @model_validator(mode="after")
+    def _check_online_booking(self) -> "ProfessionalServiceItem":
+        # Etapa "Disponibilidade por profissional x serviço no Agendamento
+        # Online" — reforço no Pydantic da mesma regra do CHECK em
+        # `models/service.py` (`online_booking_requires_active_service`):
+        # um vínculo que o profissional não realiza mais nunca pode ficar
+        # marcado como disponível online.
+        if not self.is_active and self.allow_online_booking:
+            raise ValueError(
+                "allow_online_booking não pode ser true quando is_active é false "
+                "(profissional não realiza este serviço)."
+            )
         return self
 
 
@@ -113,6 +133,7 @@ class ProfessionalServiceRead(BaseModel):
     professional_id: uuid.UUID
     service_id: uuid.UUID
     is_active: bool
+    allow_online_booking: bool = False
     duration_override_minutes: int | None = None
     price_override: Decimal | None = None
     commission_type: CommissionType | None = None

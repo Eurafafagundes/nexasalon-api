@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from nexasalon_api.core.exceptions import NotFoundError
 from nexasalon_api.models.organization import Branch
 from nexasalon_api.models.professional import Professional
-from nexasalon_api.models.service import Service, ServiceCategory
+from nexasalon_api.models.service import ProfessionalService, Service, ServiceCategory
 from nexasalon_api.repositories import (
     branch_repo,
     organization_repo,
@@ -28,6 +28,36 @@ from nexasalon_api.repositories import (
 )
 from nexasalon_api.services import availability
 from nexasalon_api.services.availability import AvailabilitySlot
+
+
+def is_online_booking_eligible(
+    professional: Professional, service: Service, link: ProfessionalService | None
+) -> bool:
+    """Regra CANÔNICA de elegibilidade de uma combinação
+    profissional+serviço pro Agendamento Online — as 4 condições
+    precisam ser TODAS verdadeiras:
+
+    - `Professional.allow_online_booking`
+    - `Service.allow_online_booking`
+    - `ProfessionalService.is_active` (o vínculo existe e está ativo —
+      "realiza o serviço")
+    - `ProfessionalService.allow_online_booking` (esta combinação
+      específica está habilitada online)
+
+    Usada em TODO ponto do fluxo PÚBLICO que precisa decidir "esta
+    combinação pode aparecer/ser reservada online" —
+    `list_public_professionals` (abaixo) e
+    `services/appointments.py::create_public_appointment`/
+    `create_public_appointment_for_customer` — pra nunca haver uma
+    segunda cópia divergente desta regra.
+
+    NUNCA chamada por `services/appointments.py::_build_item_snapshot`
+    (compartilhado com a agenda interna) — a agenda interna continua
+    ignorando `ProfessionalService.allow_online_booking` por completo,
+    só `is_active` importa lá (item explícito do pedido)."""
+    if link is None or not link.is_active or not link.allow_online_booking:
+        return False
+    return professional.allow_online_booking and service.allow_online_booking
 
 
 def _lead_time_bounds(session: Session, organization_id: uuid.UUID) -> tuple[datetime, datetime]:
@@ -106,21 +136,29 @@ def list_public_professionals(
 ) -> list[Professional]:
     """Só profissionais ATIVOS, `allow_online_booking=true` e com agenda
     própria (`has_schedule=true` — um profissional sem agenda não tem
-    disponibilidade nenhuma pra oferecer). Se `service_id` for informado,
-    filtra ainda pelos que de fato executam esse serviço
-    (`ProfessionalService` ativo) — "profissionais habilitados para
-    online" do pedido, já cruzado com o serviço escolhido no passo
-    anterior do fluxo."""
-    eligible = [
-        p
-        for p in professional_repo.list_all(session, organization_id)
-        if p.allow_online_booking and p.has_schedule
-    ]
+    disponibilidade nenhuma pra oferecer). Sem `service_id`, é só isso —
+    não há vínculo nenhum pra cruzar ainda (ex.: listagem inicial antes de
+    escolher serviço).
+
+    Com `service_id`, a elegibilidade passa a ser a regra CANÔNICA de
+    `is_online_booking_eligible` (inclui, pela primeira vez aqui,
+    `Service.allow_online_booking` — antes esta função nunca checava a
+    flag do SERVIÇO, só a do profissional; um `service_id` de um serviço
+    não público já filtra pra lista vazia agora, em vez de vazar quem o
+    executa)."""
+    professionals = [p for p in professional_repo.list_all(session, organization_id) if p.has_schedule]
     if service_id is None:
-        return eligible
-    links = professional_service_repo.list_for_service(session, organization_id, service_id)
-    linked_ids = {link.professional_id for link in links if link.is_active}
-    return [p for p in eligible if p.id in linked_ids]
+        return [p for p in professionals if p.allow_online_booking]
+    service = service_repo.get(session, organization_id, service_id)
+    if service is None:
+        return []
+    links_by_professional = {
+        link.professional_id: link
+        for link in professional_service_repo.list_for_service(session, organization_id, service_id)
+    }
+    return [
+        p for p in professionals if is_online_booking_eligible(p, service, links_by_professional.get(p.id))
+    ]
 
 
 def get_public_availability(

@@ -51,7 +51,7 @@ from nexasalon_api.schemas.appointment import (
     AppointmentItemUpdate,
     AppointmentReplace,
 )
-from nexasalon_api.services import agenda_access, availability
+from nexasalon_api.services import agenda_access, availability, public_booking
 from nexasalon_api.services import cash_register as cash_register_service
 from nexasalon_api.services.appointment_state_machine import (
     OPERATIONAL_STATUSES,
@@ -785,20 +785,24 @@ def create_public_appointment(
 
     if professional_id is not None:
         professional = professional_repo.get(session, organization_id, professional_id)
-        if professional is None or not professional.is_active or not professional.allow_online_booking:
+        if professional is None or not professional.is_active:
+            raise ValidationDomainError("Este profissional não está disponível para agendamento online.")
+        link = professional_service_repo.get_for_pair(session, organization_id, professional_id, service_id)
+        if not public_booking.is_online_booking_eligible(professional, service, link):
             raise ValidationDomainError("Este profissional não está disponível para agendamento online.")
         eligible_professional_ids = [professional_id]
     else:
-        # "Qualquer profissional": só considera quem está habilitado
-        # online E de fato executa este serviço (mesma checagem de
-        # `professional_service_repo.get_for_pair` usada depois, adiantada
-        # aqui só pra montar a lista de candidatos).
-        links = professional_service_repo.list_for_service(session, organization_id, service_id)
-        linked_ids = {link.professional_id for link in links if link.is_active}
+        # "Qualquer profissional": mesma regra CANÔNICA de elegibilidade
+        # (`is_online_booking_eligible`) usada em `list_public_professionals`
+        # — nunca uma segunda cópia divergente.
+        links_by_professional = {
+            link.professional_id: link
+            for link in professional_service_repo.list_for_service(session, organization_id, service_id)
+        }
         eligible_professional_ids = [
             p.id
             for p in professional_repo.list_all(session, organization_id)
-            if p.id in linked_ids and p.allow_online_booking
+            if public_booking.is_online_booking_eligible(p, service, links_by_professional.get(p.id))
         ]
         if not eligible_professional_ids:
             raise ValidationDomainError("Nenhum profissional disponível para este serviço no momento.")
@@ -866,16 +870,23 @@ def create_public_appointment_for_customer(
 
     if professional_id is not None:
         professional = professional_repo.get(session, organization_id, professional_id)
-        if professional is None or not professional.is_active or not professional.allow_online_booking:
+        if professional is None or not professional.is_active:
+            raise ValidationDomainError("Este profissional não está disponível para agendamento online.")
+        link = professional_service_repo.get_for_pair(session, organization_id, professional_id, service_id)
+        if not public_booking.is_online_booking_eligible(professional, service, link):
             raise ValidationDomainError("Este profissional não está disponível para agendamento online.")
         eligible_professional_ids = [professional_id]
     else:
-        links = professional_service_repo.list_for_service(session, organization_id, service_id)
-        linked_ids = {link.professional_id for link in links if link.is_active}
+        # Mesma regra CANÔNICA de `create_public_appointment` — nunca uma
+        # segunda cópia divergente.
+        links_by_professional = {
+            link.professional_id: link
+            for link in professional_service_repo.list_for_service(session, organization_id, service_id)
+        }
         eligible_professional_ids = [
             p.id
             for p in professional_repo.list_all(session, organization_id)
-            if p.id in linked_ids and p.allow_online_booking
+            if public_booking.is_online_booking_eligible(p, service, links_by_professional.get(p.id))
         ]
         if not eligible_professional_ids:
             raise ValidationDomainError("Nenhum profissional disponível para este serviço no momento.")
