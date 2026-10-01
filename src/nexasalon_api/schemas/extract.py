@@ -227,6 +227,13 @@ class ExtractSaleRow(BaseModel):
 
 
 class ExtractMovementRow(BaseModel):
+    """`date` (Data da despesa/entrada EFETIVA — mesmo raciocínio de
+    `ExtractSaleRow.date`) é sempre `services/cash_register.py::
+    movement_competence` (`CashMovement.competence_override` quando o
+    usuário escolheu uma data diferente ao registrar, senão
+    `created_at`). `created_at` continua exposto à parte, intocado, só
+    para auditoria/detalhe ("Registrada em")."""
+
     id: uuid.UUID
     type: CashMovementType
     amount: Decimal
@@ -234,6 +241,7 @@ class ExtractMovementRow(BaseModel):
     description: str
     method: PaymentMethod
     created_by_name: str
+    date: datetime
     created_at: datetime
 
 

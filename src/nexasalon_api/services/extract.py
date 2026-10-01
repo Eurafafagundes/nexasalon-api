@@ -27,6 +27,7 @@ from nexasalon_api.repositories import (
 )
 from nexasalon_api.schemas.extract import ExtractRowType
 from nexasalon_api.services import order_totals
+from nexasalon_api.services.cash_register import movement_competence
 
 
 @dataclass
@@ -203,9 +204,13 @@ def _sale_item_rows(order: Order, client_name: str, branch_name: str) -> list[li
 def _movement_row(movement: CashMovement, branch_name: str) -> list:
     kind = "Entrada" if movement.type == CashMovementType.SUPPLY else "Despesa"
     signed_amount = movement.amount if movement.type == CashMovementType.SUPPLY else -movement.amount
+    # "Data da despesa" EFETIVA (`movement_competence`), nunca
+    # `created_at` cru — mesma fonte usada na tela do Extrato
+    # (`ExtractMovementRow.date`), pra planilha e tela nunca divergirem.
+    competence = movement_competence(movement)
     return [
-        movement.created_at.date().isoformat(),
-        movement.created_at.strftime("%H:%M"),
+        competence.date().isoformat(),
+        competence.strftime("%H:%M"),
         kind,
         "—",
         "—",

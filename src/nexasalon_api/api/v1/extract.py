@@ -15,6 +15,7 @@ from nexasalon_api.schemas.extract import (
     ExtractSaleRow,
 )
 from nexasalon_api.services import extract as extract_service
+from nexasalon_api.services.cash_register import movement_competence
 
 router = APIRouter(prefix="/extract", tags=["extract"])
 
@@ -46,7 +47,8 @@ def get_extract(
         movements=[
             ExtractMovementRow(
                 id=m.id, type=m.type, amount=m.amount, category=m.category, description=m.description,
-                method=m.method, created_by_name=m.created_by_name, created_at=m.created_at,
+                method=m.method, created_by_name=m.created_by_name,
+                date=movement_competence(m), created_at=m.created_at,
             )
             for m in summary.movements
         ],

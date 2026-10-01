@@ -405,6 +405,53 @@ def test_comanda_regularizada_com_sale_date_aparece_no_extrato_no_dia_escolhido_
     assert row.date.date() == sale_date
 
 
+def test_despesa_regularizada_com_competence_date_aparece_no_extrato_no_dia_escolhido_nao_no_dia_real(org_session):
+    """"Data da despesa" (migration 0057) — mesmo raciocínio de
+    `test_comanda_regularizada_com_sale_date_...` acima, aplicado a uma
+    Entrada/Despesa manual: registrar HOJE uma despesa que ocorreu
+    alguns dias atrás precisa fazer ela contar no período daquele dia
+    (filtro + `expense_total` + a linha exibida/exportada), mesmo com
+    `created_at` real sendo hoje."""
+    from nexasalon_api.schemas.extract import ExtractMovementRow
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    register = _open_register(session, actor)
+    expense_date = (datetime.now(timezone.utc) - timedelta(days=5)).date()
+    cash_register.register_movement(
+        session, actor, register.id, CashMovementType.WITHDRAWAL, Decimal("75.00"), "Compra de shampoo",
+        competence_date=expense_date,
+    )
+
+    # Filtro do dia da DESPESA (5 dias atrás) — o lançamento aparece e
+    # entra no `expense_total`, mesmo criado/registrado hoje de verdade.
+    regularized_from = datetime.combine(expense_date, time.min, tzinfo=_TZ)
+    regularized_to = regularized_from + timedelta(days=1)
+    summary_regularized = extract.get_extract(session, actor, date_from=regularized_from, date_to=regularized_to)
+    assert len(summary_regularized.movements) == 1
+    assert summary_regularized.expense_total == Decimal("75.00")
+
+    # Filtro de HOJE (a data real de `created_at`) — a despesa NÃO
+    # aparece: foi registrada pra outro dia (competência).
+    today_from = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_to = today_from + timedelta(days=1)
+    summary_today = extract.get_extract(session, actor, date_from=today_from, date_to=today_to)
+    assert summary_today.movements == []
+    assert summary_today.expense_total == Decimal("0")
+
+    # A linha exibida/exportada mostra a competência escolhida em
+    # `date`, nunca a data real de criação — `created_at` continua
+    # exposto à parte para auditoria/detalhe.
+    movement = summary_regularized.movements[0]
+    row = ExtractMovementRow(
+        id=movement.id, type=movement.type, amount=movement.amount, category=movement.category,
+        description=movement.description, method=movement.method, created_by_name=movement.created_by_name,
+        date=cash_register.movement_competence(movement), created_at=movement.created_at,
+    )
+    assert row.date.date() == expense_date
+    assert row.created_at.date() != expense_date  # criada hoje de verdade, não há 5 dias.
+
+
 # ---------------------------------------------------------------------
 # Isolamento multiempresa
 # ---------------------------------------------------------------------

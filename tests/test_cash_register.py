@@ -3,8 +3,9 @@ sangria/suprimento, resumo (faturamento x saldo físico) e fechamento.
 Mesma abordagem de `test_orders.py`: direto no service layer via
 `SessionLocal`."""
 import uuid
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
@@ -392,3 +393,112 @@ def test_ticket_medio_conta_por_comanda_paga_nao_por_pagamento(org_session):
     assert summary.orders_count == 1  # não 2, mesmo com 2 pagamentos
     assert summary.total_revenue == Decimal("800.00")
     assert summary.average_ticket == Decimal("800.00")
+
+
+# ---------------------------------------------------------------------
+# "Data da despesa" (migration 0057) — competência da Entrada/Despesa
+# manual, separada de `created_at` (quando foi registrada). Mesmo
+# padrão de `Order.sale_competence_override`.
+# ---------------------------------------------------------------------
+
+
+def test_despesa_sem_data_informada_usa_created_at_como_competencia(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    register = cash_register.open_register(session, actor, branch, Decimal("0"), None)
+
+    cash_register.register_movement(
+        session, actor, register.id, CashMovementType.WITHDRAWAL, Decimal("50.00"), "Compra de produtos",
+    )
+
+    summary = cash_register.get_register_summary(session, actor, register.id)
+    movement = summary.movements[0]
+    assert movement.competence_override is None
+    assert cash_register.movement_competence(movement) == movement.created_at
+
+
+def test_despesa_com_data_anterior_grava_competence_override_sem_alterar_created_at(org_session):
+    """Hoje cadastrando uma despesa que ocorreu há 6 dias: `created_at`
+    continua sendo AGORA (auditoria — quando foi de fato registrada no
+    sistema, nunca a data escolhida); `competence_override`/
+    `movement_competence(...)` passam a refletir a data escolhida,
+    meio-dia LOCAL da unidade (nunca meia-noite/UTC puro, pra nunca
+    deslocar o dia escolhido por causa do fuso)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    register = cash_register.open_register(session, actor, branch, Decimal("0"), None)
+    expense_date = (datetime.now(timezone.utc) - timedelta(days=6)).date()
+
+    cash_register.register_movement(
+        session, actor, register.id, CashMovementType.WITHDRAWAL, Decimal("75.00"), "Compra de shampoo",
+        competence_date=expense_date,
+    )
+
+    summary = cash_register.get_register_summary(session, actor, register.id)
+    movement = summary.movements[0]
+    # created_at NUNCA falsificado — continua "hoje" (o dia real de
+    # criação), nunca o dia da despesa escolhida (6 dias atrás).
+    assert movement.created_at.date() != expense_date
+    assert movement.competence_override is not None
+    competence = cash_register.movement_competence(movement)
+    assert competence.date() == expense_date  # competência EFETIVA é o dia escolhido.
+    # Meio-dia LOCAL da unidade (América/São_Paulo, padrão da
+    # organização) — nunca meia-noite/UTC puro. O valor volta do banco
+    # rotulado em GMT (equivalente a UTC), então reconvertemos pro fuso
+    # local antes de comparar a hora.
+    assert competence.astimezone(ZoneInfo("America/Sao_Paulo")).hour == 12
+
+
+def test_despesa_com_data_de_hoje_e_aceita(org_session):
+    """Hoje não é "futuro" — só datas estritamente posteriores a hoje
+    (no fuso da unidade) são recusadas."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    register = cash_register.open_register(session, actor, branch, Decimal("0"), None)
+    today_local = datetime.now(timezone.utc).date()
+
+    cash_register.register_movement(
+        session, actor, register.id, CashMovementType.WITHDRAWAL, Decimal("10.00"), "Despesa de hoje",
+        competence_date=today_local,
+    )
+
+    summary = cash_register.get_register_summary(session, actor, register.id)
+    assert cash_register.movement_competence(summary.movements[0]).date() == today_local
+
+
+def test_despesa_com_data_futura_e_recusada(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    register = cash_register.open_register(session, actor, branch, Decimal("0"), None)
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date()
+
+    with pytest.raises(ValidationDomainError, match="não pode ser no futuro"):
+        cash_register.register_movement(
+            session, actor, register.id, CashMovementType.WITHDRAWAL, Decimal("10.00"), "Despesa inválida",
+            competence_date=tomorrow,
+        )
+
+    summary = cash_register.get_register_summary(session, actor, register.id)
+    assert summary.movements == []  # nada foi persistido.
+
+
+def test_entrada_tambem_aceita_data_informada_mesmo_mecanismo_da_despesa(org_session):
+    """O campo vive na `CashMovement` genérica (Entrada OU Despesa) —
+    uma Entrada regularizada usa exatamente o mesmo mecanismo."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    register = cash_register.open_register(session, actor, branch, Decimal("0"), None)
+    past_date = (datetime.now(timezone.utc) - timedelta(days=2)).date()
+
+    cash_register.register_movement(
+        session, actor, register.id, CashMovementType.SUPPLY, Decimal("20.00"), "Aporte atrasado",
+        competence_date=past_date,
+    )
+
+    summary = cash_register.get_register_summary(session, actor, register.id)
+    assert cash_register.movement_competence(summary.movements[0]).date() == past_date

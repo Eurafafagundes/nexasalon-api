@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, ForeignKey, Numeric, String, Text
+from sqlalchemy import CheckConstraint, ColumnElement, ForeignKey, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -153,5 +153,30 @@ class CashMovement(Base, UUIDPKMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
     created_by_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # "Data da despesa" (migration 0057) — mesmo padrão de
+    # `Order.sale_competence_override` (`models/order.py`): camada
+    # OPCIONAL por cima de `created_at`, NUNCA o substitui/edita.
+    # Competência efetiva = `COALESCE(competence_override, created_at)`
+    # — ver `competence_expr` abaixo e `services/cash_register.py::
+    # movement_competence`. `NULL` (toda `CashMovement` já existente, e
+    # toda nova do fluxo normal do dia) = comportamento idêntico a antes
+    # desta coluna existir. Só é preenchida quando o usuário escolhe
+    # explicitamente uma "Data da despesa" diferente de hoje ao
+    # registrar o lançamento (`services/cash_register.py::
+    # register_movement`) — nunca em massa, sempre auditado (`AuditLog`,
+    # `entity_type="cash_movement"`).
+    competence_override: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
     cash_register: Mapped["CashRegister"] = relationship(back_populates="movements")
+
+
+def cash_movement_competence_expr() -> ColumnElement[datetime]:
+    """Competência EFETIVA de uma Entrada/Despesa manual, em SQL —
+    `COALESCE(competence_override, created_at)`. Fonte única usada por
+    toda agregação de Extrato/Dashboard/Resultado disponível
+    (`repositories/cash_movement_repo.py`) — nunca reimplementar este
+    `COALESCE` inline num segundo lugar. Para código que já tem uma
+    `CashMovement` carregada em Python, use `services/cash_register.py::
+    movement_competence` — mesma fonte, mesma regra, só a forma (SQL x
+    Python) muda."""
+    return func.coalesce(CashMovement.competence_override, CashMovement.created_at)

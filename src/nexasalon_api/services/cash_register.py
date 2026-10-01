@@ -10,7 +10,7 @@ segunda tabela.
 """
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -66,6 +66,18 @@ def _reload(session: Session, organization_id: uuid.UUID, register_id: uuid.UUID
 
 def _operational_date(moment: datetime, tz: ZoneInfo):
     return moment.astimezone(tz).date()
+
+
+def movement_competence(movement: CashMovement) -> datetime:
+    """Fonte CANÔNICA (Python, pra código que já tem a `CashMovement`
+    carregada — ex. `services/extract.py`) da "Data da despesa" EFETIVA:
+    `competence_override` quando preenchido (usuário escolheu uma data
+    diferente ao registrar), senão `created_at` (o padrão, sempre). Todo
+    consumidor que precisar de "em que dia esta entrada/despesa conta"
+    deve chamar esta função (ou `cash_movement_competence_expr` em SQL),
+    nunca ler `movement.created_at` direto. Mesmo padrão de
+    `services/order_totals.py::sale_competence`."""
+    return movement.competence_override or movement.created_at
 
 
 def _stale_open_register(
@@ -251,10 +263,25 @@ def register_movement(
     financial_category_id: uuid.UUID | None = None,
     fixed_expense_id: uuid.UUID | None = None,
     method: PaymentMethod = PaymentMethod.CASH,
+    competence_date: date | None = None,
 ) -> CashRegister:
     register = _get_register_or_404(session, actor.organization_id, register_id)
     if register.status != CashRegisterStatus.OPEN:
         raise ValidationDomainError("Só é possível registrar entrada/despesa em um caixa aberto.")
+
+    # "Data da despesa" — mesmo padrão de `Order.sale_competence_override`
+    # (`services/orders.py::close_order`): combina a data escolhida com
+    # MEIO-DIA local da unidade (nunca meia-noite, nunca UTC puro) —
+    # evita a data cair na borda de um bucket por causa do fuso. NUNCA
+    # permite data futura (ao contrário da venda, que é regularização de
+    # dias PASSADOS, a despesa pode ser cadastrada só até hoje).
+    competence_override: datetime | None = None
+    if competence_date is not None:
+        tz = effective_timezone(session, actor.organization_id, register.branch_id)
+        today_local = datetime.now(timezone.utc).astimezone(tz).date()
+        if competence_date > today_local:
+            raise ValidationDomainError("A data da despesa não pode ser no futuro.")
+        competence_override = datetime.combine(competence_date, time(12, 0), tzinfo=tz)
 
     resolved_category_name = category
     if fixed_expense_id is not None:
@@ -299,9 +326,27 @@ def register_movement(
         method=method,
         created_by=actor.user_id,
         created_by_name=name,
+        competence_override=competence_override,
     )
     session.flush()
 
+    audit_values = {
+        "type": movement_type.value,
+        "amount": str(amount),
+        "description": description,
+        "category": resolved_category_name,
+        "financial_category_id": str(financial_category_id) if financial_category_id else None,
+        "fixed_expense_id": str(fixed_expense_id) if fixed_expense_id else None,
+        "method": method.value,
+        "cash_register_id": str(register_id),
+    }
+    # Registro EXPLÍCITO do ajuste manual de competência (item "nunca
+    # falsificar timestamp silenciosamente") — só aparece quando
+    # `competence_date` foi de fato informado; nunca inventa uma entrada
+    # de auditoria pro lançamento normal do dia a dia.
+    if competence_override is not None:
+        audit_values["competence_override"] = competence_override.isoformat()
+        audit_values["competence_override_reason"] = "data_da_despesa_informada_manualmente"
     audit_log_repo.create(
         session,
         organization_id=actor.organization_id,
@@ -309,16 +354,7 @@ def register_movement(
         entity_type="cash_movement",
         entity_id=movement.id,
         action=AuditAction.CREATE,
-        new_values={
-            "type": movement_type.value,
-            "amount": str(amount),
-            "description": description,
-            "category": resolved_category_name,
-            "financial_category_id": str(financial_category_id) if financial_category_id else None,
-            "fixed_expense_id": str(fixed_expense_id) if fixed_expense_id else None,
-            "method": method.value,
-            "cash_register_id": str(register_id),
-        },
+        new_values=audit_values,
     )
     return _reload(session, actor.organization_id, register_id)
 

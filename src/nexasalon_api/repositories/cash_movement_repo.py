@@ -5,7 +5,7 @@ from decimal import Decimal
 from sqlalchemy import func, select, tuple_
 from sqlalchemy.orm import Session
 
-from nexasalon_api.models.cash_register import CashMovement, CashRegister
+from nexasalon_api.models.cash_register import CashMovement, CashRegister, cash_movement_competence_expr
 from nexasalon_api.models.enums import CashMovementType, ExpenseNature, PaymentMethod
 from nexasalon_api.models.finance import FinancialCategory
 
@@ -28,15 +28,22 @@ def list_for_org(
     date_to: datetime | None = None,
 ) -> list[CashMovement]:
     """Extrato (item "Movimentações") — todas as entradas/despesas
-    manuais da organização num período, independente de qual caixa."""
+    manuais da organização num período, independente de qual caixa.
+    Filtro por "Data da despesa" EFETIVA (`cash_movement_competence_expr`
+    — `COALESCE(competence_override, created_at)`), nunca `created_at`
+    cru — uma despesa regularizada pra um dia anterior precisa
+    entrar/sair do filtro pelo dia ESCOLHIDO, não pelo dia real de
+    criação da linha. Ver `models/cash_register.py::
+    cash_movement_competence_expr`."""
+    competence = cash_movement_competence_expr()
     stmt = select(CashMovement).where(CashMovement.organization_id == organization_id)
     if type is not None:
         stmt = stmt.where(CashMovement.type == type)
     if date_from is not None:
-        stmt = stmt.where(CashMovement.created_at >= date_from)
+        stmt = stmt.where(competence >= date_from)
     if date_to is not None:
-        stmt = stmt.where(CashMovement.created_at <= date_to)
-    return list(session.scalars(stmt.order_by(CashMovement.created_at.desc())).all())
+        stmt = stmt.where(competence <= date_to)
+    return list(session.scalars(stmt.order_by(competence.desc())).all())
 
 
 def create(
@@ -53,6 +60,7 @@ def create(
     financial_category_id: uuid.UUID | None = None,
     fixed_expense_id: uuid.UUID | None = None,
     method: PaymentMethod = PaymentMethod.CASH,
+    competence_override: datetime | None = None,
 ) -> CashMovement:
     movement = CashMovement(
         organization_id=organization_id,
@@ -66,6 +74,7 @@ def create(
         method=method,
         created_by=created_by,
         created_by_name=created_by_name,
+        competence_override=competence_override,
     )
     session.add(movement)
     session.flush()
@@ -80,14 +89,19 @@ def sum_withdrawals_by_nature(
     """Soma de `CashMovement` tipo WITHDRAWAL no período, agrupada pela
     NATUREZA da `FinancialCategory` vinculada — usada pelo painel
     "Resultado disponível" (Dashboard) pras linhas "(-) Custos
-    variáveis"/"(-) Despesas fixas". Mesma janela de período
-    (`created_at >= date_from AND created_at <= date_to`) já usada por
-    `list_for_org` (fonte de `FinancialSummary.expenses`) — nunca uma
+    variáveis"/"(-) Despesas fixas". Mesma janela de período (Data da
+    despesa EFETIVA) já usada por `list_for_org` (fonte de
+    `FinancialSummary.expenses`) — nunca uma
     segunda definição de "despesa do período".
 
     Lançamentos sem `financial_category_id` (todo o histórico anterior
     a esta feature, ou qualquer lançamento novo deixado sem categoria)
-    ficam em `"unclassified"` — nunca contam como fixo nem variável."""
+    ficam em `"unclassified"` — nunca contam como fixo nem variável.
+
+    Janela de período pela "Data da despesa" EFETIVA (`cash_movement_
+    competence_expr`), mesma fonte de `list_for_org` — nunca uma
+    segunda definição de "despesa do período"."""
+    competence = cash_movement_competence_expr()
     stmt = (
         select(FinancialCategory.nature, CashMovement.fixed_expense_id.is_not(None), func.coalesce(func.sum(CashMovement.amount), 0))
         .select_from(CashMovement)
@@ -96,8 +110,8 @@ def sum_withdrawals_by_nature(
         .where(
             CashMovement.organization_id == organization_id,
             CashMovement.type == CashMovementType.WITHDRAWAL,
-            CashMovement.created_at >= date_from,
-            CashMovement.created_at <= date_to,
+            competence >= date_from,
+            competence <= date_to,
         )
         .group_by(FinancialCategory.nature, CashMovement.fixed_expense_id.is_not(None))
     )
