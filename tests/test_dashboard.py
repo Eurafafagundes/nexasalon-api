@@ -45,6 +45,7 @@ from nexasalon_api.models.professional import Professional
 from nexasalon_api.models.service import Service
 from nexasalon_api.schemas.dashboard import PaymentMethodBucket
 from nexasalon_api.services import dashboard as dashboard_service
+from nexasalon_api.services import professionals
 
 _TZ = timezone(timedelta(hours=-3))
 
@@ -887,6 +888,42 @@ def test_desempenho_por_profissional_agrega_clientes_servicos_faturamento_e_tick
     assert by_name["Ianka"].ticket_average == Decimal("150.00")
     assert by_name["Duda"].revenue == Decimal("90")
     assert by_name["Duda"].ticket_average == Decimal("90.00")
+
+
+def test_desempenho_por_profissional_continua_apos_desativacao(org_session):
+    """Etapa "Arquivamento de Profissional" — teste de regressão
+    explícito do exemplo do pedido: John produz R$12.500 em setembro,
+    é desativado em outubro, e o Dashboard de setembro continua
+    mostrando John normalmente. `_professionals`/`get_overview` nunca
+    fazem JOIN com `Professional` nem filtram `is_active` — leem
+    inteiramente de `OrderItem.professional_id`/`professional_name`
+    (snapshot), então isto precisa continuar valendo mesmo depois da
+    desativação real (não só na ausência de filtro)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    john = _professional(session, org_id, branch.id, name="John")
+    cr = _cash_register(session, org_id, branch.id, actor.user_id)
+    service_id = _service(session, org_id).id
+    client = _client(session, org_id, name="Cliente do John")
+    _sale(
+        session, org_id, branch.id, client.id, john.id, service_id, cr.id,
+        closed_at=_dt(2026, 9, 15), price=Decimal("12500"), professional_name="John",
+    )
+
+    professionals.set_professional_active(session, org_id, john.id, False)
+
+    overview = dashboard_service.get_overview(
+        session, actor, branch_id=None, date_from=_dt(2026, 9, 1, 0), date_to=_dt(2026, 10, 1, 0),
+        compare_from=None, compare_to=None,
+    )
+    by_name = {row.professional_name: row for row in overview.professionals}
+    assert by_name["John"].revenue == Decimal("12500")
+
+    detail = dashboard_service.get_professional_detail(
+        session, actor, john.id, branch_id=None, date_from=_dt(2026, 9, 1, 0), date_to=_dt(2026, 10, 1, 0),
+    )
+    assert detail.professional_name == "John"
 
 
 def test_formas_de_pagamento_agrupa_metodos_pouco_usados_em_outros(org_session):

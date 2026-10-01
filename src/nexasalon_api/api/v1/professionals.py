@@ -113,7 +113,7 @@ def activate_professional(
     actor: ActorContext = Depends(_manage),
 ) -> ProfessionalRead:
     professional = professionals_service.set_professional_active(
-        session, actor.organization_id, professional_id, True
+        session, actor.organization_id, professional_id, True, user_id=actor.user_id
     )
     return ProfessionalRead.model_validate(professional)
 
@@ -127,7 +127,7 @@ def deactivate_professional(
     actor: ActorContext = Depends(_manage),
 ) -> ProfessionalRead:
     professional = professionals_service.set_professional_active(
-        session, actor.organization_id, professional_id, False
+        session, actor.organization_id, professional_id, False, user_id=actor.user_id
     )
     return ProfessionalRead.model_validate(professional)
 

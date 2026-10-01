@@ -513,6 +513,33 @@ def test_servico_desabilitado_para_online_nao_aparece_nem_aceita_reserva(client_
     assert resp.status_code == 422, resp.text
 
 
+def test_profissional_desativado_nao_aparece_nem_aceita_reserva(client_as, org_a_actor):
+    """Etapa "Arquivamento de Profissional" — mesmo raciocínio do teste
+    de serviço desabilitado acima: profissional desativado nunca é
+    listado como opção pública, nem aceita reserva por bypass direto de
+    API (mesmo enviando o `professional_id` explicitamente)."""
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c)
+    _branch, professionals, svc = _setup_service_and_professional(c)
+    prof = professionals[0]
+    c.patch(f"/api/v1/professionals/{prof['id']}/deactivate")
+    p = _public()
+
+    listed = p.get(f"/api/v1/public/booking/{org['slug']}/professionals", params={"service_id": svc["id"]}).json()
+    assert all(item["id"] != prof["id"] for item in listed)
+
+    start_at = _iso(
+        (datetime.now(timezone.utc) + timedelta(days=15)).replace(hour=9, minute=0, second=0, microsecond=0)
+    )
+    token = _register_customer(p, name="Cliente Y", phone="61900004444")
+    resp = p.post(
+        f"/api/v1/public/booking/{org['slug']}",
+        json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 422, resp.text
+
+
 # ---------------------------------------------------------------------
 # Segurança — nenhum schema público vaza dado interno/financeiro/privado
 # ---------------------------------------------------------------------

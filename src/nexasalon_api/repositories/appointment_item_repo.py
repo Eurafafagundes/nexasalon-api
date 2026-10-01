@@ -147,6 +147,35 @@ def list_busy_for_professional_on_range(
     return list(session.scalars(stmt).all())
 
 
+def count_future_occupying(
+    session: Session,
+    organization_id: uuid.UUID,
+    *,
+    professional_id: uuid.UUID,
+    from_dt: datetime,
+) -> int:
+    """Quantos itens FUTUROS (`start_at > from_dt`) deste profissional
+    ainda representam compromisso real — MESMA `OCCUPYING_STATUSES` já
+    usada por disponibilidade/conflito acima (nunca uma segunda
+    definição de "o que conta como agendamento ativo"); cancelado/
+    finalizado nunca conta. Usado por
+    `services/professionals.py::set_professional_active` (decisão
+    aprovada: bloquear desativação enquanto houver agenda futura ativa,
+    nunca cancelar/transferir nada automaticamente)."""
+    effective_status = func.coalesce(AppointmentItem.status, Appointment.status)
+    stmt = (
+        select(func.count(AppointmentItem.id))
+        .join(Appointment, Appointment.id == AppointmentItem.appointment_id)
+        .where(
+            AppointmentItem.organization_id == organization_id,
+            AppointmentItem.professional_id == professional_id,
+            effective_status.in_(_OCCUPYING_STATUS_VALUES),
+            AppointmentItem.start_at > from_dt,
+        )
+    )
+    return int(session.scalar(stmt) or 0)
+
+
 def create(
     session: Session,
     organization_id: uuid.UUID,

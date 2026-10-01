@@ -16,6 +16,7 @@ from nexasalon_api.models.organization import Organization
 from nexasalon_api.models.professional import Professional, WorkingHours
 from nexasalon_api.models.service import ProfessionalService
 from nexasalon_api.repositories import (
+    appointment_item_repo,
     audit_log_repo,
     branch_repo,
     professional_repo,
@@ -136,12 +137,51 @@ def set_professional_active(
     organization_id: uuid.UUID,
     professional_id: uuid.UUID,
     is_active: bool,
+    *,
+    user_id: uuid.UUID | None = None,
 ) -> Professional:
     """Desativar não apaga o profissional nem seu histórico de
-    atendimentos/comissões (FK é RESTRICT, não CASCADE)."""
+    atendimentos/comissões (FK é RESTRICT, não CASCADE) — nunca cria um
+    novo `Professional`, nunca reutiliza o cadastro pra outra pessoa.
+
+    Etapa "Arquivamento de Profissional" (decisão A aprovada na
+    auditoria) — desativar (nunca reativar) é bloqueado enquanto
+    existir agendamento FUTURO que ainda representa compromisso real
+    (`appointment_item_repo.count_future_occupying`, MESMA lista
+    `OCCUPYING_STATUSES` já usada por disponibilidade/conflito — nunca
+    uma segunda definição de "o que conta como agendamento ativo";
+    cancelado/finalizado nunca bloqueia). Nunca cancela, transfere ou
+    apaga agendamento nenhum automaticamente — só recusa a desativação
+    até o próprio salão resolver a agenda antes.
+
+    Gera AuditLog nos dois sentidos (ativar/desativar), mesmo padrão de
+    `services/products.py::set_product_active`."""
     professional = get_professional(session, organization_id, professional_id)
+    if not is_active:
+        future_count = appointment_item_repo.count_future_occupying(
+            session, organization_id, professional_id=professional_id, from_dt=datetime.now(timezone.utc),
+        )
+        if future_count > 0:
+            word = "agendamento futuro" if future_count == 1 else "agendamentos futuros"
+            verb = "Existe" if future_count == 1 else "Existem"
+            raise ValidationDomainError(
+                f"{verb} {future_count} {word}. Reagende ou cancele esses horários antes de desativar o profissional.",
+                {"future_appointments_count": future_count},
+            )
+    old_is_active = professional.is_active
     professional.is_active = is_active
-    return professional_repo.save(session, professional)
+    professional = professional_repo.save(session, professional)
+    audit_log_repo.create(
+        session,
+        organization_id=organization_id,
+        user_id=user_id,
+        entity_type="professional",
+        entity_id=professional.id,
+        action=AuditAction.UPDATE,
+        old_values={"is_active": old_is_active},
+        new_values={"change_type": "set_active", "is_active": is_active},
+    )
+    return professional
 
 
 def list_working_hours(
