@@ -119,6 +119,46 @@ def test_reopen_volta_comanda_para_open_e_reverte_pagamento(client_as, org_a_act
     ).status_code == 200
 
 
+def test_reopen_com_pagamento_dividido_reverte_todos_os_payments(client_as, org_a_actor):
+    """Etapa "Pagamento Dividido" — gap identificado na auditoria: todos
+    os testes de reabertura existentes fecham com UM único Payment.
+    Fechamento com Pix+Crédito (R$100+R$160) reaberto precisa reverter
+    os DOIS lançamentos, nunca só o primeiro/último — `reopen_order` já
+    itera `active_payments` genericamente, este teste prova isso."""
+    c = client_as(org_a_actor)
+    appt, *_ = _setup_finished_appointment(c, price="260.00")
+    register = c.post("/api/v1/cash-registers", json={"branch_id": appt["branch_id"], "initial_amount": "0"}).json()
+    order = c.post("/api/v1/orders", json={"appointment_id": appt["id"]}).json()
+    closed = c.post(
+        f"/api/v1/orders/{order['id']}/close",
+        json={"payments": [
+            {"method": "pix", "amount": "100.00", "cash_register_id": register["id"]},
+            {"method": "credit", "amount": "160.00", "card_brand": "visa", "cash_register_id": register["id"]},
+        ]},
+    ).json()
+    assert len(closed["payments"]) == 2
+
+    resp = c.post(f"/api/v1/orders/{closed['id']}/reopen", json={"reason": "Cliente pediu para refazer o pagamento"})
+    assert resp.status_code == 200, resp.text
+    reopened = resp.json()
+    assert reopened["status"] == "open"
+    assert len(reopened["payments"]) == 2
+    assert all(p["reversed_at"] is not None for p in reopened["payments"])
+
+    # Caixa não soma mais nenhum dos dois pagamentos revertidos.
+    summary = c.get(f"/api/v1/cash-registers/{register['id']}").json()
+    assert Decimal(summary["total_revenue"]) == Decimal("0")
+
+    # Refechar com uma forma só (R$260 em Dinheiro) funciona normalmente
+    # — a reabertura não deixa a comanda "presa" a pagamento dividido.
+    refechada = c.post(
+        f"/api/v1/orders/{reopened['id']}/close",
+        json={"payments": [{"method": "cash", "amount": "260.00", "cash_register_id": register["id"]}]},
+    )
+    assert refechada.status_code == 200, refechada.text
+    assert len(refechada.json()["payments"]) == 3  # histórico íntegro: 2 revertidos + 1 novo ativo.
+
+
 def test_reopen_reverte_baixa_de_estoque_de_produto_vendido(client_as, org_a_actor):
     c = client_as(org_a_actor)
     appt, branch, *_ = _setup_finished_appointment(c)
