@@ -176,6 +176,34 @@ def count_future_occupying(
     return int(session.scalar(stmt) or 0)
 
 
+def count_future_occupying_for_client(
+    session: Session,
+    organization_id: uuid.UUID,
+    *,
+    client_id: uuid.UUID,
+    from_dt: datetime,
+) -> int:
+    """Quantos AGENDAMENTOS distintos deste cliente ainda têm algum item
+    FUTURO (`start_at > from_dt`) em status que ocupa agenda — mesma
+    `OCCUPYING_STATUSES` de `count_future_occupying` (profissional), nunca
+    uma segunda definição. Usado por `services/clients.py::set_client_active`
+    pra bloquear o arquivamento enquanto houver compromisso real pendente."""
+    effective_status = func.coalesce(AppointmentItem.status, Appointment.status)
+    stmt = (
+        select(func.count(func.distinct(Appointment.id)))
+        .select_from(AppointmentItem)
+        .join(Appointment, Appointment.id == AppointmentItem.appointment_id)
+        .where(
+            AppointmentItem.organization_id == organization_id,
+            Appointment.organization_id == organization_id,
+            Appointment.client_id == client_id,
+            effective_status.in_(_OCCUPYING_STATUS_VALUES),
+            AppointmentItem.start_at > from_dt,
+        )
+    )
+    return int(session.scalar(stmt) or 0)
+
+
 def create(
     session: Session,
     organization_id: uuid.UUID,

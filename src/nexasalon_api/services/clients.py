@@ -1,17 +1,20 @@
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.actor import ActorContext
-from nexasalon_api.core.exceptions import ConflictError, NotFoundError
+from nexasalon_api.core.exceptions import ConflictError, NotFoundError, ValidationDomainError
 from nexasalon_api.models.appointment import Appointment
 from nexasalon_api.models.client import Client
-from nexasalon_api.models.enums import AppointmentStatus
+from nexasalon_api.models.enums import AppointmentStatus, AuditAction
 from nexasalon_api.models.order import Order
 from nexasalon_api.repositories import (
+    appointment_item_repo,
     appointment_repo,
+    audit_log_repo,
     client_repo,
     customer_account_repo,
     order_repo,
@@ -115,13 +118,46 @@ def update_client(
 
 
 def set_client_active(
-    session: Session, organization_id: uuid.UUID, client_id: uuid.UUID, is_active: bool
+    session: Session,
+    organization_id: uuid.UUID,
+    client_id: uuid.UUID,
+    is_active: bool,
+    *,
+    user_id: uuid.UUID | None = None,
 ) -> Client:
-    """Desativar não apaga o cliente nem seu histórico de agendamentos
-    (FK Appointment.client_id é RESTRICT)."""
+    """"Excluir cliente" na UI = desativar (arquivar). Nunca apaga a linha
+    nem qualquer histórico (FKs Appointment/Order/CustomerAccount são
+    RESTRICT). Bloqueia a desativação enquanto houver agendamento FUTURO
+    que ainda ocupa agenda (mesma regra de arquivamento de profissional —
+    nunca cancela/transfere nada automaticamente). Idempotente: estado
+    já igual ao pedido não gera nova entrada de auditoria."""
     client = get_client(session, organization_id, client_id)
+    if client.is_active == is_active:
+        return client
+    if not is_active:
+        future_count = appointment_item_repo.count_future_occupying_for_client(
+            session, organization_id, client_id=client_id, from_dt=datetime.now(timezone.utc)
+        )
+        if future_count > 0:
+            word = "agendamento futuro" if future_count == 1 else "agendamentos futuros"
+            raise ValidationDomainError(
+                f"Este cliente possui {future_count} {word}. Cancele ou conclua esses agendamentos antes de excluir o cliente.",
+                {"future_appointments_count": future_count},
+            )
+    old_is_active = client.is_active
     client.is_active = is_active
-    return client_repo.save(session, client)
+    client = client_repo.save(session, client)
+    audit_log_repo.create(
+        session,
+        organization_id=organization_id,
+        user_id=user_id,
+        entity_type="client",
+        entity_id=client.id,
+        action=AuditAction.UPDATE,
+        old_values={"is_active": old_is_active},
+        new_values={"change_type": "set_active", "is_active": is_active},
+    )
+    return client
 
 
 @dataclass

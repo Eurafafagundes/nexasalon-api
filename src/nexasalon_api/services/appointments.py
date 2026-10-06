@@ -529,8 +529,11 @@ def _audit_force_overlap(session: Session, actor: ActorContext, appointment_id: 
 def _assert_branch_and_client(session: Session, organization_id: uuid.UUID, branch_id: uuid.UUID, client_id: uuid.UUID) -> None:
     if not branch_repo.exists(session, organization_id, branch_id):
         raise NotFoundError("Unidade não encontrada.")
-    if client_repo.get(session, organization_id, client_id) is None:
+    client = client_repo.get(session, organization_id, client_id)
+    if client is None:
         raise NotFoundError("Cliente não encontrado.")
+    if not client.is_active:
+        raise ValidationDomainError("Este cliente está arquivado. Restaure o cadastro para agendar.")
 
 
 def create_appointment(session: Session, actor: ActorContext, data: AppointmentCreate) -> Appointment:
@@ -863,6 +866,10 @@ def create_public_appointment_for_customer(
     profissional", conflito transacional) é EXATAMENTE o mesmo motor de
     `create_public_appointment` — não uma segunda lógica de agenda."""
     organization_id = organization.id
+
+    client = client_repo.get(session, organization_id, client_id)
+    if client is None or not client.is_active:
+        raise ValidationDomainError("Seu cadastro não está disponível para agendamento online. Fale com o salão.")
 
     service = service_repo.get(session, organization_id, service_id)
     if service is None or not service.is_active or not service.allow_online_booking:

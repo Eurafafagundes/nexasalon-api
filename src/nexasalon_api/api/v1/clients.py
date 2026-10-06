@@ -197,17 +197,21 @@ def activate_client(
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_manage),
 ) -> ClientRead:
-    client = clients_service.set_client_active(session, actor.organization_id, client_id, True)
+    client = clients_service.set_client_active(session, actor.organization_id, client_id, True, user_id=actor.user_id)
     can_view_contact = client_can_view_contact(actor.permissions)
     return apply_client_contact_masking(ClientRead.model_validate(client), can_view_contact=can_view_contact)
 
 
-@router.patch("/{client_id}/deactivate", response_model=ClientRead, summary="Desativar cliente")
+@router.patch(
+    "/{client_id}/deactivate",
+    response_model=ClientRead,
+    summary="Excluir cliente (arquivar) — bloqueia se houver agendamento futuro ativo (422)",
+)
 def deactivate_client(
     client_id: uuid.UUID,
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_manage),
 ) -> ClientRead:
-    client = clients_service.set_client_active(session, actor.organization_id, client_id, False)
+    client = clients_service.set_client_active(session, actor.organization_id, client_id, False, user_id=actor.user_id)
     can_view_contact = client_can_view_contact(actor.permissions)
     return apply_client_contact_masking(ClientRead.model_validate(client), can_view_contact=can_view_contact)
