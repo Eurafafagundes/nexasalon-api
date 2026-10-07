@@ -812,7 +812,48 @@ def test_recepcao_confirma_agendamento_online_depois_e_origem_permanece_online(c
 # ---------------------------------------------------------------------
 
 
-def test_servicos_do_agendamento_online_respeitam_display_order_nao_ordem_alfabetica(client_as, org_a_actor):
+def test_servicos_do_agendamento_online_ordenam_por_preco_crescente_dentro_da_categoria(client_as, org_a_actor):
+    """Rodada "preço no Agendamento Online" — dentro da mesma categoria,
+    o critério PRIMÁRIO passou a ser `default_price` crescente (o valor
+    que `PublicServiceRead.default_price` efetivamente exibe pro
+    cliente), nunca `display_order`/nome isolados. Nomes e
+    `display_order` de propósito EM ORDEM CONTRÁRIA ao preço — prova
+    que preço vence, nunca inferido por regex/nome (ex.: "1 Tela",
+    "2 Telas")."""
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c)
+    category = c.post("/api/v1/service-categories", json={"name": "Categoria Preço"}).json()
+    caro = c.post(
+        "/api/v1/services",
+        json={
+            "name": "A Primeiro Alfabeticamente", "category_id": category["id"],
+            "default_duration_minutes": 30, "default_price": "500.00", "display_order": 0,
+        },
+    ).json()
+    barato = c.post(
+        "/api/v1/services",
+        json={
+            "name": "Z Último Alfabeticamente", "category_id": category["id"],
+            "default_duration_minutes": 30, "default_price": "130.00", "display_order": 1,
+        },
+    ).json()
+    medio = c.post(
+        "/api/v1/services",
+        json={
+            "name": "M Meio Alfabeticamente", "category_id": category["id"],
+            "default_duration_minutes": 30, "default_price": "260.00", "display_order": 2,
+        },
+    ).json()
+
+    p = _public()
+    services = p.get(
+        f"/api/v1/public/booking/{org['slug']}/services", params={"category_id": category["id"]}
+    ).json()
+    ids_in_order = [s["id"] for s in services]
+    assert ids_in_order == [barato["id"], medio["id"], caro["id"]]  # 130 < 260 < 500, nunca por nome/display_order.
+
+
+def test_empate_de_preco_usa_display_order_como_desempate(client_as, org_a_actor):
     c = client_as(org_a_actor)
     org = _enable_online_booking(c)
     # Nomes de propósito "fora de ordem alfabética" em relação ao
@@ -829,4 +870,83 @@ def test_servicos_do_agendamento_online_respeitam_display_order_nao_ordem_alfabe
     p = _public()
     services = p.get(f"/api/v1/public/booking/{org['slug']}/services").json()
     ids_in_order = [s["id"] for s in services if s["id"] in {svc_z["id"], svc_a["id"]}]
-    assert ids_in_order == [svc_z["id"], svc_a["id"]]  # display_order (1, 2), nunca "A Segundo" antes por nome.
+    assert ids_in_order == [svc_z["id"], svc_a["id"]]  # mesmo preço (50.00) -> display_order (1, 2) decide.
+
+
+def test_empate_de_preco_e_display_order_usa_nome_como_desempate_final_estavel(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c)
+    svc_b = c.post(
+        "/api/v1/services",
+        json={"name": "B Depois", "default_duration_minutes": 30, "default_price": "75.00", "display_order": 5},
+    ).json()
+    svc_a = c.post(
+        "/api/v1/services",
+        json={"name": "A Antes", "default_duration_minutes": 30, "default_price": "75.00", "display_order": 5},
+    ).json()
+
+    p = _public()
+    services = p.get(f"/api/v1/public/booking/{org['slug']}/services").json()
+    ids_in_order = [s["id"] for s in services if s["id"] in {svc_b["id"], svc_a["id"]}]
+    # Mesmo preço E mesmo display_order -> nome decide ("A Antes" < "B Depois").
+    assert ids_in_order == [svc_a["id"], svc_b["id"]]
+
+
+def test_ordenacao_por_preco_e_independente_entre_categorias_diferentes(client_as, org_a_actor):
+    """Cada categoria ordena pelo PRÓPRIO preço — um serviço caro de uma
+    categoria nunca "pula" pra perto de um barato de outra categoria."""
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c)
+    cat_1 = c.post("/api/v1/service-categories", json={"name": "Categoria 1", "display_order": 0}).json()
+    cat_2 = c.post("/api/v1/service-categories", json={"name": "Categoria 2", "display_order": 1}).json()
+
+    c1_caro = c.post(
+        "/api/v1/services",
+        json={"name": "C1 Caro", "category_id": cat_1["id"], "default_duration_minutes": 30, "default_price": "300.00"},
+    ).json()
+    c1_barato = c.post(
+        "/api/v1/services",
+        json={"name": "C1 Barato", "category_id": cat_1["id"], "default_duration_minutes": 30, "default_price": "100.00"},
+    ).json()
+    c2_caro = c.post(
+        "/api/v1/services",
+        json={"name": "C2 Caro", "category_id": cat_2["id"], "default_duration_minutes": 30, "default_price": "400.00"},
+    ).json()
+    c2_barato = c.post(
+        "/api/v1/services",
+        json={"name": "C2 Barato", "category_id": cat_2["id"], "default_duration_minutes": 30, "default_price": "50.00"},
+    ).json()
+
+    p = _public()
+    slug = org["slug"]
+    services_cat_1 = p.get(f"/api/v1/public/booking/{slug}/services", params={"category_id": cat_1["id"]}).json()
+    services_cat_2 = p.get(f"/api/v1/public/booking/{slug}/services", params={"category_id": cat_2["id"]}).json()
+
+    assert [s["id"] for s in services_cat_1] == [c1_barato["id"], c1_caro["id"]]
+    assert [s["id"] for s in services_cat_2] == [c2_barato["id"], c2_caro["id"]]
+
+
+def test_servico_indisponivel_para_online_fica_fora_mesmo_sendo_o_mais_barato(client_as, org_a_actor):
+    """O filtro `allow_online_booking`/`is_active` (já existente) é
+    aplicado ANTES da ordenação por preço — um serviço desabilitado
+    pro online nunca aparece na lista, mesmo sendo o mais barato de
+    todos."""
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c)
+    caro_online = c.post(
+        "/api/v1/services",
+        json={"name": "Caro Online", "default_duration_minutes": 30, "default_price": "200.00"},
+    ).json()
+    barato_offline = c.post(
+        "/api/v1/services",
+        json={
+            "name": "Barato Fora do Online", "default_duration_minutes": 30, "default_price": "10.00",
+            "allow_online_booking": False,
+        },
+    ).json()
+
+    p = _public()
+    services = p.get(f"/api/v1/public/booking/{org['slug']}/services").json()
+    ids = [s["id"] for s in services]
+    assert caro_online["id"] in ids
+    assert barato_offline["id"] not in ids

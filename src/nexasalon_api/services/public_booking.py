@@ -104,13 +104,24 @@ def list_public_services(
     Etapa M — "Categoria → Serviço": `category_id` filtra por categoria
     escolhida; `uncategorized_only` filtra pela pseudo-categoria
     "Outros serviços" (`category_id IS NULL`, ver
-    `list_public_categories`). Os dois nunca são usados juntos."""
+    `list_public_categories`). Os dois nunca são usados juntos.
+
+    Ordenação DENTRO da categoria (rodada "preço no Agendamento
+    Online"): `(default_price, display_order, name)` — preço crescente
+    primeiro (o que o cliente realmente vê na lista, `PublicServiceRead.
+    default_price`, espelho direto de `Service.default_price` — nunca
+    um preço diferente do exibido), `display_order` como desempate de
+    preço igual, `name` como desempate final estável. Isso SÓ existe
+    aqui (camada pública) — nunca em `service_repo.list_all`, que
+    continua ordenada por `(display_order, name)` pro catálogo INTERNO
+    (`GET /services`), que este módulo só reaproveita pra filtrar
+    (ativo/online/categoria), nunca pra ordenar."""
     services = [s for s in service_repo.list_all(session, organization_id) if s.allow_online_booking]
     if uncategorized_only:
-        return [s for s in services if s.category_id is None]
-    if category_id is not None:
-        return [s for s in services if s.category_id == category_id]
-    return services
+        services = [s for s in services if s.category_id is None]
+    elif category_id is not None:
+        services = [s for s in services if s.category_id == category_id]
+    return sorted(services, key=lambda s: (s.default_price, s.display_order, s.name))
 
 
 def list_public_categories(
