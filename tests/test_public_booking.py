@@ -659,3 +659,174 @@ def test_origem_public_booking_aparece_na_listagem_da_agenda(client_as, org_a_ac
 
     assert items_by_appointment[internal_appt["id"]]["source"] == "internal"
     assert items_by_appointment[public_appointment_id]["source"] == "public_booking"
+
+
+# ---------------------------------------------------------------------
+# "Agendamento Online deve nascer como Agendado" — `online_booking_
+# auto_confirm=False` é o NOVO padrão pra organização criada a partir de
+# agora (`repositories/organization_repo.py::create`); quem já tinha o
+# toggle ligado continua confirmando automaticamente (ver
+# `test_fluxo_completo_ate_confirmacao` acima, inalterado). Estes testes
+# cobrem o caminho NOVO explicitamente, sempre passando
+# `online_booking_auto_confirm=False` pra `_enable_online_booking`.
+# ---------------------------------------------------------------------
+
+
+def test_reserva_publica_nasce_agendada_e_nunca_confirmada_automaticamente(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c, online_booking_auto_confirm=False)
+    _branch, professionals, svc = _setup_service_and_professional(c)
+    prof = professionals[0]
+    p = _public()
+    slug = org["slug"]
+
+    start_at = _iso(
+        (datetime.now(timezone.utc) + timedelta(days=14)).replace(hour=9, minute=0, second=0, microsecond=0)
+    )
+    token = _register_customer(p, name="Cliente Agendada", phone="61911119001")
+    booking = p.post(
+        f"/api/v1/public/booking/{slug}",
+        json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at},
+        headers=_auth(token),
+    )
+    assert booking.status_code == 201, booking.text
+    assert booking.json()["status"] == "scheduled"
+
+    # Origem continua PUBLIC_BOOKING, igual ao fluxo com auto-confirm ligado.
+    appt = c.get(f"/api/v1/appointments/{booking.json()['id']}").json()
+    assert appt["source"] == "public_booking"
+    assert appt["status"] == "scheduled"
+
+
+def test_agendado_online_ocupa_horario_e_some_da_disponibilidade_publica(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c, online_booking_auto_confirm=False)
+    _branch, professionals, svc = _setup_service_and_professional(c)
+    prof = professionals[0]
+    p = _public()
+    slug = org["slug"]
+
+    target_date = (datetime.now(timezone.utc) + timedelta(days=17)).date().isoformat()
+    before = p.get(
+        f"/api/v1/public/booking/{slug}/availability",
+        params={"service_id": svc["id"], "professional_id": prof["id"], "date": target_date},
+    ).json()
+    assert len(before) > 0
+    start_at = before[0]["start_at"]
+
+    token = _register_customer(p, name="Cliente Ocupa", phone="61911119002")
+    booking = p.post(
+        f"/api/v1/public/booking/{slug}",
+        json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at},
+        headers=_auth(token),
+    )
+    assert booking.status_code == 201, booking.text
+    assert booking.json()["status"] == "scheduled"
+
+    # Mesmo nunca confirmado, o horário some da listagem pública — item
+    # crítico: "Agendado" ocupa agenda exatamente como "Confirmado".
+    after = p.get(
+        f"/api/v1/public/booking/{slug}/availability",
+        params={"service_id": svc["id"], "professional_id": prof["id"], "date": target_date},
+    ).json()
+    assert start_at not in {slot["start_at"] for slot in after}
+
+    # Outro cliente não consegue reservar o mesmo horário.
+    token2 = _register_customer(p, name="Segunda Cliente Agendada", phone="61911119003")
+    second = p.post(
+        f"/api/v1/public/booking/{slug}",
+        json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at},
+        headers=_auth(token2),
+    )
+    assert second.status_code == 409, second.text
+
+
+def test_qualquer_profissional_respeita_ocupacao_de_reserva_agendada(client_as, org_a_actor):
+    """Com status "Agendado" (sem auto-confirm), "Qualquer profissional"
+    continua enxergando a ocupação — não oferece de novo um profissional
+    que já está ocupado naquele horário só porque o agendamento dele
+    ainda não foi confirmado."""
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c, online_booking_auto_confirm=False)
+    _branch, _professionals, svc = _setup_service_and_professional(c, professionals_count=1)
+    p = _public()
+    slug = org["slug"]
+
+    target_date = (datetime.now(timezone.utc) + timedelta(days=18)).date().isoformat()
+    availability = p.get(
+        f"/api/v1/public/booking/{slug}/availability", params={"service_id": svc["id"], "date": target_date}
+    ).json()
+    start_at = availability[0]["start_at"]
+
+    token1 = _register_customer(p, name="Primeira Qualquer", phone="61911119004")
+    first = p.post(
+        f"/api/v1/public/booking/{slug}",
+        json={"service_id": svc["id"], "professional_id": None, "start_at": start_at},
+        headers=_auth(token1),
+    )
+    assert first.status_code == 201, first.text
+    assert first.json()["status"] == "scheduled"
+
+    # Único profissional já ocupado àquela hora (mesmo que Agendado, não
+    # Confirmado) — "Qualquer profissional" não tem mais ninguém elegível.
+    token2 = _register_customer(p, name="Segunda Qualquer", phone="61911119005")
+    second = p.post(
+        f"/api/v1/public/booking/{slug}",
+        json={"service_id": svc["id"], "professional_id": None, "start_at": start_at},
+        headers=_auth(token2),
+    )
+    assert second.status_code in (409, 422), second.text
+
+
+def test_recepcao_confirma_agendamento_online_depois_e_origem_permanece_online(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c, online_booking_auto_confirm=False)
+    _branch, professionals, svc = _setup_service_and_professional(c)
+    prof = professionals[0]
+    p = _public()
+    slug = org["slug"]
+
+    start_at = _iso(
+        (datetime.now(timezone.utc) + timedelta(days=19)).replace(hour=9, minute=0, second=0, microsecond=0)
+    )
+    token = _register_customer(p, name="Cliente Confirmável", phone="61911119006")
+    booking = p.post(
+        f"/api/v1/public/booking/{slug}",
+        json={"service_id": svc["id"], "professional_id": prof["id"], "start_at": start_at},
+        headers=_auth(token),
+    ).json()
+    assert booking["status"] == "scheduled"
+
+    status_resp = c.patch(f"/api/v1/appointments/{booking['id']}/status", json={"status": "confirmed"})
+    assert status_resp.status_code == 200, status_resp.text
+
+    appt = c.get(f"/api/v1/appointments/{booking['id']}").json()
+    assert appt["status"] == "confirmed"
+    assert appt["source"] == "public_booking"  # origem nunca muda por causa do status.
+
+
+# ---------------------------------------------------------------------
+# Ordenação de serviços no Agendamento Online — mesma fonte canônica
+# (`Service.display_order`) já usada pelo catálogo interno
+# (`service_repo.py::list_all`), nunca ordem alfabética.
+# ---------------------------------------------------------------------
+
+
+def test_servicos_do_agendamento_online_respeitam_display_order_nao_ordem_alfabetica(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c)
+    # Nomes de propósito "fora de ordem alfabética" em relação ao
+    # `display_order` desejado — nunca inferido por regex/nome.
+    svc_z = c.post(
+        "/api/v1/services",
+        json={"name": "Z Primeiro", "default_duration_minutes": 30, "default_price": "50.00", "display_order": 1},
+    ).json()
+    svc_a = c.post(
+        "/api/v1/services",
+        json={"name": "A Segundo", "default_duration_minutes": 30, "default_price": "50.00", "display_order": 2},
+    ).json()
+
+    p = _public()
+    services = p.get(f"/api/v1/public/booking/{org['slug']}/services").json()
+    ids_in_order = [s["id"] for s in services if s["id"] in {svc_z["id"], svc_a["id"]}]
+    assert ids_in_order == [svc_z["id"], svc_a["id"]]  # display_order (1, 2), nunca "A Segundo" antes por nome.

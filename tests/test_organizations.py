@@ -190,3 +190,34 @@ def test_upload_de_logo_excede_tamanho_maximo(client_as, org_a_actor):
         assert fake.uploads == []
     finally:
         app.dependency_overrides.pop(get_storage_backend, None)
+
+
+def test_organization_repo_create_sem_override_nasce_com_auto_confirm_desligado_mas_aceita_override_explicito():
+    """`organization_repo.create` (único ponto canônico de criação de
+    `Organization`) só aplica o novo padrão (`online_booking_auto_
+    confirm=False`) quando o chamador NÃO informou o campo — quem
+    precisar ligar explicitamente (ex.: um script de migração de dados,
+    ou um teste) continua no controle, nunca sobrescrito."""
+    import uuid
+
+    from sqlalchemy import text
+
+    from nexasalon_api.core.db import SessionLocal
+    from nexasalon_api.repositories import organization_repo
+
+    with SessionLocal() as session:
+        org_id = uuid.uuid4()
+        session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_id)})
+        organization = organization_repo.create(
+            session, id=org_id, name="Sem override", slug=f"sem-override-{org_id.hex[:8]}",
+        )
+        assert organization.online_booking_auto_confirm is False
+
+        org_id2 = uuid.uuid4()
+        session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_id2)})
+        organization2 = organization_repo.create(
+            session, id=org_id2, name="Com override", slug=f"com-override-{org_id2.hex[:8]}",
+            online_booking_auto_confirm=True,
+        )
+        assert organization2.online_booking_auto_confirm is True
+        session.rollback()

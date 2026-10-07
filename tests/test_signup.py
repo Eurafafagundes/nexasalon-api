@@ -93,6 +93,30 @@ def test_signup_cria_tenant_owner_branch_trial_e_sessao(client):
     assert me.json()["membership"]["role_name"] == "OWNER"
 
 
+def test_signup_organizacao_nova_nasce_com_auto_confirm_online_desligado(client):
+    """"Agendamento Online deve nascer como Agendado" — toda organização
+    criada a partir de agora (via signup público, `organization_repo.py::
+    create`) nasce com `online_booking_auto_confirm=False`, nunca o
+    `server_default=true` da coluna (preservado só por compatibilidade
+    com quem já tinha o toggle ligado antes desta mudança — nenhuma
+    migration, nenhuma organização existente é afetada)."""
+    # CPF PRÓPRIO, nunca repetido em nenhum outro teste deste arquivo —
+    # todos compartilham o mesmo Postgres descartável, sem rollback por
+    # teste, então cada CPF literal usado aqui é um recurso global
+    # consumido pro resto da execução (ver os outros já usados:
+    # "111.444.777-35", "529.982.247-25", "123.456.789-00").
+    _payload, tokens = _signup(client, cpf="987.654.321-00")
+    organization_id = uuid.UUID(tokens["organization_id"])
+
+    with SessionLocal() as session:
+        session.execute(
+            text("SELECT set_config('app.current_org_id', :oid, true)"),
+            {"oid": str(organization_id)},
+        )
+        organization = session.get(Organization, organization_id)
+        assert organization.online_booking_auto_confirm is False
+
+
 def test_signup_rejeita_email_duplicado(client):
     email = f"duplicado-{uuid.uuid4().hex[:8]}@example.com"
     _signup(client, email)

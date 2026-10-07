@@ -410,6 +410,52 @@ def test_reagendamento_em_status_terminal_e_recusado(client_as, org_a_actor):
 
 
 # ---------------------------------------------------------------------
+# "Agendamento Online deve nascer como Agendado" — cancelamento/
+# reagendamento pelo cliente não podem regredir pra quem reservou com
+# `online_booking_auto_confirm=False` (o novo padrão). `SCHEDULED` já
+# está em `_CANCELLABLE_FROM`/`_RESCHEDULABLE_FROM`
+# (`appointment_state_machine.py`) — isto só comprova que o motor
+# realmente aceita o status novo, sem exigir Confirmado primeiro.
+# ---------------------------------------------------------------------
+
+
+def test_cancelamento_com_status_agendado_continua_funcionando(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c, online_booking_auto_confirm=False)
+    _enable_change_settings(c)
+    _branch, prof, svc = _setup_service_and_professional(c)
+    p = _public()
+    token = _register_customer(p, name="Maria", phone="61911110020")
+    booking = _book(p, org["slug"], svc, prof, _in_days(10), token)
+    assert booking["status"] == "scheduled"  # nunca confirmado automaticamente.
+
+    resp = p.post(
+        f"/api/v1/public/booking/{org['slug']}/me/appointments/{booking['id']}/cancel",
+        json={}, headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_reagendamento_com_status_agendado_continua_funcionando(client_as, org_a_actor):
+    c = client_as(org_a_actor)
+    org = _enable_online_booking(c, online_booking_auto_confirm=False)
+    _enable_change_settings(c)
+    _branch, prof, svc = _setup_service_and_professional(c)
+    p = _public()
+    token = _register_customer(p, name="Maria", phone="61911110021")
+    booking = _book(p, org["slug"], svc, prof, _in_days(10), token)
+    assert booking["status"] == "scheduled"
+
+    resp = p.patch(
+        f"/api/v1/public/booking/{org['slug']}/me/appointments/{booking['id']}/reschedule",
+        json={"start_at": _in_days(11).isoformat()}, headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    # Reagendado continua Agendado (reagendar não confirma sozinho).
+    assert c.get(f"/api/v1/appointments/{booking['id']}").json()["status"] == "scheduled"
+
+
+# ---------------------------------------------------------------------
 # 14/15/16/17/18/20 — motor de disponibilidade reaproveitado
 # ---------------------------------------------------------------------
 

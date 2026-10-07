@@ -964,6 +964,12 @@ def _finalize_public_appointment(
 
     if organization.online_booking_auto_confirm:
         appointment.status = AppointmentStatus.CONFIRMED
+    # else: nasce `AppointmentStatus.SCHEDULED` (server_default da
+    # coluna, nunca sobrescrito aqui) — "Agendado", nunca "Confirmado"
+    # automaticamente. `SCHEDULED` já está em `OCCUPYING_STATUSES`
+    # (`appointment_item_repo.py`), então o horário continua ocupando a
+    # agenda normalmente — ver `organization_repo.create` pro novo
+    # padrão (`online_booking_auto_confirm=False` pra organização nova).
     session.flush()
 
     audit_log_repo.create(

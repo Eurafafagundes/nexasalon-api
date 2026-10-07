@@ -35,7 +35,19 @@ def list_by_ids(session: Session, organization_id: uuid.UUID, service_ids: set[u
 
 
 def list_all(session: Session, organization_id: uuid.UUID, include_inactive: bool = False) -> list[Service]:
-    stmt = select(Service).where(Service.organization_id == organization_id).order_by(Service.name)
+    """Ordenado por `display_order` (a "Posição/ordem" já editável no
+    formulário de serviço — `schemas/service.py::ServiceBase.display_order`
+    — nunca inventar uma segunda fonte de ordenação) e, só como critério
+    de desempate (serviços ainda com o mesmo `display_order`, ex.: todos
+    em `0`, o padrão), por `name`. Usado tanto pelo catálogo interno
+    quanto pelo Agendamento Online (`services/public_booking.py::
+    list_public_services`, que reaproveita esta função e só filtra em
+    Python depois, preservando a ordem)."""
+    stmt = (
+        select(Service)
+        .where(Service.organization_id == organization_id)
+        .order_by(Service.display_order, Service.name)
+    )
     if not include_inactive:
         stmt = stmt.where(Service.is_active.is_(True))
     return list(session.scalars(stmt).all())

@@ -22,8 +22,21 @@ def get_by_slug(session: Session, slug: str) -> Organization | None:
 
 
 def create(session: Session, **fields) -> Organization:
-    """Sem rota HTTP hoje (não existe fluxo de signup) — usado só pelo
-    CLI de bootstrap (`cli/bootstrap_owner.py`, Etapa 3C)."""
+    """Usado pelo CLI de bootstrap (`cli/bootstrap_owner.py`, Etapa 3C) e
+    pelo signup público (`services/signup.py`) — ÚNICO ponto canônico de
+    criação de `Organization` na aplicação (nunca instanciar `Organization`
+    direto num service/rota nova).
+
+    `online_booking_auto_confirm` nasce `False` ("Agendado", nunca
+    "Confirmado" automaticamente) pra toda organização NOVA — item
+    "Agendamento Online deve nascer como Agendado" — SEM migration: o
+    `server_default` da coluna continua `true` só por compatibilidade
+    com quem já tinha o toggle ligado antes desta mudança (organizações
+    existentes mantêm o valor que já estava gravado; só quem cria uma
+    organização a partir de agora recebe o novo padrão). Quem chamar
+    `create(...)` passando `online_booking_auto_confirm` explicitamente
+    continua no controle — nunca sobrescreve um valor informado."""
+    fields.setdefault("online_booking_auto_confirm", False)
     organization = Organization(**fields)
     session.add(organization)
     session.flush()
