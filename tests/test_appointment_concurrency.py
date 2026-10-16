@@ -246,9 +246,14 @@ def test_force_overlap_com_permissao_funciona_sob_concorrencia_real(scenario):
 
 def test_force_overlap_sem_permissao_e_recusado_mesmo_sob_concorrencia(scenario):
     """Desta vez pela CAMADA DE SERVIÇO completa (`appointments.create_appointment`),
-    com dois atores concorrentes: um dono normal e um SEM
-    `agenda.force_overlap` mandando `force_overlap=true` mesmo assim —
-    o pedido nunca deve funcionar, com ou sem corrida real de por trás.
+    com dois atores concorrentes: um dono normal e um SEM `agenda.
+    force_overlap` NEM `agenda.edit` mandando `force_overlap=true` mesmo
+    assim — o pedido nunca deve funcionar, com ou sem corrida real de
+    por trás. (Rodada "encaixe pra quem edita a agenda": qualquer uma
+    das duas permissions já basta — ver `test_appointments.py::
+    test_force_overlap_com_agenda_edit_mas_sem_agenda_force_overlap_
+    funciona_e_audita` — então este teste de restrição precisa remover
+    as DUAS pra continuar testando um 403 genuíno.)
 
     Ajuste pós-revisão: a checagem de permissão do force_overlap agora
     acontece ANTES de qualquer leitura/validação (ver
@@ -268,7 +273,7 @@ def test_force_overlap_sem_permissao_e_recusado_mesmo_sob_concorrencia(scenario)
     restricted_actor = ActorContext(
         organization_id=scenario["org_id"], user_id=scenario["user_id"], membership_id=uuid.uuid4(),
         role_id=uuid.uuid4(), role_name="Restrito",
-        permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap"}, professional_id=None,
+        permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap", "agenda.edit"}, professional_id=None,
     )
 
     def _thread1():

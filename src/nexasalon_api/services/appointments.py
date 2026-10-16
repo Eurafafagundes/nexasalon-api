@@ -429,20 +429,40 @@ def check_item_availability(
 
 
 def _resolve_force_overlap(actor: ActorContext, requested: bool) -> bool:
-    """`force_overlap=true` exige a permission `agenda.force_overlap`.
+    """`force_overlap=true` exige `agenda.force_overlap` OU `agenda.edit`.
 
-    Ajuste pós-revisão: NÃO ignora mais em silêncio quando o ator não
-    tem a permission — levanta 403 explícito. Um pedido de encaixe sem
-    autorização é uma tentativa de burlar uma trava de negócio, não um
-    "no-op" inofensivo que deveria só cair de volta pro caminho normal;
-    o cliente precisa saber que o pedido foi recusado por falta de
-    permissão, não descobrir isso indiretamente via um 409 de conflito
-    (que também aconteceria mesmo sem nenhum `force_overlap` envolvido)."""
+    Rodada "Encaixe disponível pra quem edita a agenda, não só pra
+    Master" — auditoria encontrou que os 4 roles de sistema (migration
+    0007, JÁ aplicada em produção — nunca editada) dão `agenda.edit`
+    pra RECEPTIONIST e PROFESSIONAL, mas `agenda.force_overlap` só pra
+    OWNER/ADMIN. Resultado: quem já tem autorização de editar a agenda
+    (mover/trocar profissional/criar com conflito) ficava bloqueado
+    especificamente na EXCEÇÃO de sobreposição (conflito de horário,
+    fora da jornada, fora do horário de funcionamento, bloqueio de
+    agenda — as 4 regras que esta função cobre), tendo que depender do
+    Usuário Master pra concluir um encaixe que o próprio sistema já
+    deixa ele fazer em qualquer outro aspecto. `agenda.force_overlap`
+    continua existindo como permission própria (quem só tem ELA, sem
+    `agenda.edit`, também seria capaz de forçar — hoje nenhum role de
+    sistema cria esse caso, mas a checagem permanece correta pra roles
+    personalizadas) — isto só AMPLIA quem já pode, nunca restringe.
+    Nenhuma permissão financeira/administrativa nova é concedida: a
+    checagem continua sendo só sobre as duas permissions de agenda já
+    existentes, nunca `organization.manage`/`finance.*`/etc.
+
+    Ajuste pós-revisão (mantido): NÃO ignora mais em silêncio quando o
+    ator não tem nenhuma das duas — levanta 403 explícito. Um pedido de
+    encaixe sem autorização é uma tentativa de burlar uma trava de
+    negócio, não um "no-op" inofensivo que deveria só cair de volta pro
+    caminho normal; o cliente precisa saber que o pedido foi recusado
+    por falta de permissão, não descobrir isso indiretamente via um 409
+    de conflito (que também aconteceria mesmo sem nenhum `force_overlap`
+    envolvido)."""
     if not requested:
         return False
-    if FORCE_OVERLAP_PERMISSION not in actor.permissions:
+    if FORCE_OVERLAP_PERMISSION not in actor.permissions and "agenda.edit" not in actor.permissions:
         raise ForbiddenError(
-            f"Permissão '{FORCE_OVERLAP_PERMISSION}' é necessária para usar force_overlap=true."
+            f"Permissão '{FORCE_OVERLAP_PERMISSION}' ou 'agenda.edit' é necessária para usar force_overlap=true."
         )
     return True
 

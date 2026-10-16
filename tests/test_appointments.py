@@ -386,15 +386,18 @@ def test_conflito_com_agendamento_existente_gera_409(org_session):
     assert exc_info.value.details["reason"] == "conflict"
 
 
-def test_force_overlap_sem_permissao_gera_403_mesmo_sem_conflito_real(org_session):
-    """Ajuste pós-revisão: `force_overlap=true` sem a permission é
-    recusado com 403 EXPLÍCITO — mesmo quando não há NENHUM conflito de
-    verdade (ou seja, não é o 409 de conflito que está pegando isso por
-    acidente; é uma checagem de permissão dedicada, e a mais cedo
-    possível)."""
+def test_force_overlap_sem_nenhuma_das_duas_permissoes_gera_403_mesmo_sem_conflito_real(org_session):
+    """Ajuste pós-revisão: `force_overlap=true` sem `agenda.force_overlap`
+    NEM `agenda.edit` é recusado com 403 EXPLÍCITO — mesmo quando não há
+    NENHUM conflito de verdade (ou seja, não é o 409 de conflito que
+    está pegando isso por acidente; é uma checagem de permissão
+    dedicada, e a mais cedo possível). Item "usuário somente leitura
+    continua bloqueado" (rodada "encaixe pra quem edita a agenda")."""
     session, org_id = org_session
     branch, prof, service, client = _setup_basic(session, org_id)
-    actor_sem_forcar = _actor(session, org_id, permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap"})
+    actor_sem_forcar = _actor(
+        session, org_id, permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap", "agenda.edit"}
+    )
 
     data = AppointmentCreate(
         branch_id=branch.id, client_id=client.id, force_overlap=True,
@@ -408,7 +411,7 @@ def test_force_overlap_sem_permissao_gera_403_mesmo_sem_conflito_real(org_sessio
     assert logs == []
 
 
-def test_force_overlap_sem_permissao_com_conflito_real_tambem_e_403(org_session):
+def test_force_overlap_sem_nenhuma_das_duas_permissoes_com_conflito_real_tambem_e_403(org_session):
     """Com conflito real de verdade envolvido, o erro ainda é 403 (falha
     de permissão) — não 409 (conflito) — porque a checagem de permissão
     acontece antes da checagem de conflito."""
@@ -421,13 +424,71 @@ def test_force_overlap_sem_permissao_com_conflito_real_tambem_e_403(org_session)
     )
     appointments.create_appointment(session, actor_full, first)
 
-    actor_sem_forcar = _actor(session, org_id, permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap"})
+    actor_sem_forcar = _actor(
+        session, org_id, permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap", "agenda.edit"}
+    )
     second = AppointmentCreate(
         branch_id=branch.id, client_id=client.id, force_overlap=True,
         items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 30))],
     )
     with pytest.raises(ForbiddenError):
         appointments.create_appointment(session, actor_sem_forcar, second)
+
+
+def test_force_overlap_com_agenda_edit_mas_sem_agenda_force_overlap_funciona_e_audita(org_session):
+    """Causa raiz da rodada "encaixe pra quem edita a agenda, não só pra
+    Master": os roles de sistema RECEPTIONIST/PROFESSIONAL (migration
+    0007, já aplicada em produção) têm `agenda.edit` mas NUNCA
+    `agenda.force_overlap`. `force_overlap=true` agora funciona com
+    QUALQUER uma das duas permissions — exatamente o cenário da
+    Recepcionista, que antes recebia 403 só por faltar
+    `agenda.force_overlap`, mesmo já podendo editar a agenda em
+    qualquer outro aspecto."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor_full = _actor(session, org_id)
+    first = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appointments.create_appointment(session, actor_full, first)
+
+    actor_recepcionista = _actor(session, org_id, permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap"})
+    second_data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id, force_overlap=True,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 30))],
+    )
+    second = appointments.create_appointment(session, actor_recepcionista, second_data)
+    assert len(second.items) == 1
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == second.id
+    ).all()
+    change_types = {log.new_values.get("change_type") for log in logs if log.new_values}
+    assert "force_overlap" in change_types
+
+
+def test_force_overlap_com_agenda_force_overlap_mas_sem_agenda_edit_continua_funcionando(org_session):
+    """Guarda de regressão: `agenda.force_overlap` sozinha (sem
+    `agenda.edit`) continua valendo — a mudança desta rodada só AMPLIA
+    quem pode forçar, nunca restringe quem já podia (nenhum role de
+    sistema cria esse caso hoje, mas uma role personalizada poderia)."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)
+    actor_full = _actor(session, org_id)
+    first = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 0))],
+    )
+    appointments.create_appointment(session, actor_full, first)
+
+    actor_so_force_overlap = _actor(session, org_id, permissions=_ALL_AGENDA_PERMS - {"agenda.edit"})
+    second_data = AppointmentCreate(
+        branch_id=branch.id, client_id=client.id, force_overlap=True,
+        items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(14, 30))],
+    )
+    second = appointments.create_appointment(session, actor_so_force_overlap, second_data)
+    assert len(second.items) == 1
 
 
 def test_force_overlap_false_com_conflito_real_continua_409(org_session):
@@ -1945,9 +2006,14 @@ def test_adicionar_item_conflito_com_force_autorizado_cria_e_audita(org_session)
 
 
 def test_adicionar_item_force_nao_autorizado_bloqueia(org_session):
+    """`agenda.edit` TAMBÉM autoriza `force_overlap=true` (rodada
+    "encaixe pra quem edita a agenda") — pra continuar testando um 403
+    genuíno aqui, o ator precisa ficar sem as DUAS permissions."""
     session, org_id = org_session
     branch, prof, service, client = _setup_basic(session, org_id)
-    actor_sem_forcar = _actor(session, org_id, permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap"})
+    actor_sem_forcar = _actor(
+        session, org_id, permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap", "agenda.edit"}
+    )
     appt = appointments.create_appointment(
         session, actor_sem_forcar,
         AppointmentCreate(
@@ -2234,6 +2300,45 @@ def test_update_item_fora_da_jornada_com_force_autorizado_reagenda_e_audita(org_
 
     updated = appointments.update_appointment_item(
         session, actor, appt.id, appt.items[0].id,
+        AppointmentItemUpdate(start_at=_dt(20, 0), force_overlap=True),
+    )
+    assert updated.items[0].start_at == _dt(20, 0)
+
+    logs = session.query(AuditLog).filter(
+        AuditLog.organization_id == org_id, AuditLog.entity_id == appt.id,
+    ).all()
+    forced = [log for log in logs if log.new_values and log.new_values.get("change_type") == "force_overlap"]
+    assert len(forced) == 1
+    assert forced[0].new_values["items"][0]["reason"] == "professional_hours"
+
+
+def test_update_item_fora_da_jornada_com_agenda_edit_mas_sem_force_overlap_reagenda_e_audita(org_session):
+    """Cenário EXATO do pedido: Recepcionista (`agenda.edit`, sem
+    `agenda.force_overlap`) arrasta um agendamento (`update_appointment_
+    item`, mesmo caminho do drag-and-drop) para um horário que
+    ultrapassa a jornada do profissional — item 3 "manter a confirmação
+    quando ultrapassar a jornada profissional" precisa continuar
+    funcionando pra quem edita a agenda, não só pro Usuário Master."""
+    session, org_id = org_session
+    branch, prof, service, client = _setup_basic(session, org_id)  # jornada 09-18.
+    actor_full = _actor(session, org_id)
+    appt = appointments.create_appointment(
+        session, actor_full,
+        AppointmentCreate(
+            branch_id=branch.id, client_id=client.id,
+            items=[AppointmentItemCreate(professional_id=prof.id, service_id=service.id, start_at=_dt(9, 0))],
+        ),
+    )
+
+    actor_recepcionista = _actor(session, org_id, permissions=_ALL_AGENDA_PERMS - {"agenda.force_overlap"})
+    with pytest.raises(ValidationDomainError):
+        appointments.update_appointment_item(
+            session, actor_recepcionista, appt.id, appt.items[0].id,
+            AppointmentItemUpdate(start_at=_dt(20, 0)),
+        )
+
+    updated = appointments.update_appointment_item(
+        session, actor_recepcionista, appt.id, appt.items[0].id,
         AppointmentItemUpdate(start_at=_dt(20, 0), force_overlap=True),
     )
     assert updated.items[0].start_at == _dt(20, 0)
