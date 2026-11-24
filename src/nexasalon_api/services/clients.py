@@ -94,6 +94,7 @@ def update_client(
     data: ClientUpdate,
     *,
     can_view_contact: bool = True,
+    user_id: uuid.UUID | None = None,
 ) -> Client:
     """`can_view_contact=False` (ator sem `clients.view_contact_data`)
     ignora por completo os campos de contato do payload — preserva o
@@ -104,7 +105,19 @@ def update_client(
     tocar nesses campos gravaria o placeholder como se fosse o dado
     real. Continua permitindo editar nome/nascimento/gênero/
     observações normalmente — só o que exige VER o dado pra editar com
-    segurança fica de fora."""
+    segurança fica de fora.
+
+    Auditoria de `notes` (central de observações do cliente, migration
+    0058): este PUT continua sendo o full-replace genérico do cadastro
+    — a nova aba Observações do perfil NÃO usa mais este caminho pra
+    observação geral (passou a usar `ClientObservation`, múltiplos
+    registros independentes), mas o campo `notes` legado continua
+    tecnicamente presente no schema/tabela (nunca apagamos dado
+    histórico). Pra fechar a lacuna "nenhum caminho pode alterar uma
+    observação sem registrar revisão" (item explícito do pedido), toda
+    alteração de `notes` que ainda passe por aqui é auditada — mesmo
+    idioma (`change_type`) usado em `appointments.update_notes`/
+    `orders.update_observation`."""
     client = get_client(session, organization_id, client_id)
     updates = data.model_dump()
     if not can_view_contact:
@@ -112,9 +125,24 @@ def update_client(
             updates.pop(field, None)
     else:
         _assert_cpf_not_duplicated(session, organization_id, data.cpf, exclude_client_id=client.id)
+
+    old_notes = client.notes
     for field, value in updates.items():
         setattr(client, field, value)
-    return client_repo.save(session, client)
+    saved = client_repo.save(session, client)
+
+    if "notes" in updates and updates["notes"] != old_notes:
+        audit_log_repo.create(
+            session,
+            organization_id=organization_id,
+            user_id=user_id,
+            entity_type="client",
+            entity_id=client.id,
+            action=AuditAction.UPDATE,
+            old_values={"notes": old_notes},
+            new_values={"notes": updates["notes"], "change_type": "notes_edit"},
+        )
+    return saved
 
 
 def set_client_active(

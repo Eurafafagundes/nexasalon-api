@@ -43,6 +43,7 @@ from nexasalon_api.repositories import (
     professional_service_repo,
     schedule_block_repo,
     service_repo,
+    user_repo,
 )
 from nexasalon_api.schemas.appointment import (
     AppointmentCreate,
@@ -1115,7 +1116,13 @@ def _apply_status_change(
         _auto_cancel_order_for_no_show(session, actor, appointment_id)
 
 
-def update_notes(session: Session, actor: ActorContext, appointment_id: uuid.UUID, notes: str) -> Appointment:
+def update_notes(
+    session: Session,
+    actor: ActorContext,
+    appointment_id: uuid.UUID,
+    notes: str,
+    expected_notes_version: int,
+) -> Appointment:
     """PATCH pontual — altera EXCLUSIVAMENTE `Appointment.notes`, sem
     revalidar serviços/disponibilidade/profissional/data/horário (item
     explícito do pedido: nunca reaproveitar o PUT completo de
@@ -1125,21 +1132,42 @@ def update_notes(session: Session, actor: ActorContext, appointment_id: uuid.UUI
     usar exclusivamente `orders.update_observation`/`Order.observation`
     (este endpoint continua tecnicamente utilizável depois disso, mas
     deixa de ser a fonte exibida em qualquer lugar — nunca sincronizado
-    de volta pra `Order.observation`, nem o inverso)."""
+    de volta pra `Order.observation`, nem o inverso).
+
+    Concorrência (migration 0058, central de observações do cliente):
+    `expected_notes_version` OBRIGATÓRIO, mesmo padrão de
+    `orders.update_observation`/`expected_observation_version` — recusa
+    com 409 ANTES de qualquer outra decisão (inclusive antes do atalho
+    "nada mudou" abaixo), mesmo quando o texto enviado coincide por
+    acaso com o valor atual."""
     appointment = get_appointment(session, actor, appointment_id)
     _assert_can_edit(actor, {item.professional_id for item in appointment.items})
+
+    if expected_notes_version != appointment.notes_version:
+        raise ConflictError(
+            "Esta observação foi alterada por outro usuário. Atualize o conteúdo antes de salvar novamente."
+        )
 
     old_notes = appointment.notes
     new_notes = notes.strip() or None
     if new_notes == old_notes:
         return appointment
 
+    actor_user = user_repo.get(session, actor.user_id)
+    actor_name = actor_user.name if actor_user is not None else None
+    now = datetime.now(timezone.utc)
+
     appointment.notes = new_notes
     appointment.updated_by = actor.user_id
+    appointment.notes_version = appointment.notes_version + 1
+    appointment.notes_updated_at = now
+    appointment.notes_updated_by = actor.user_id
+    appointment.notes_updated_by_name = actor_name
     session.flush()
 
     audit_log_repo.create(
-        session, organization_id=actor.organization_id, user_id=actor.user_id, entity_type="appointment",
+        session, organization_id=actor.organization_id, user_id=actor.user_id, user_name=actor_name,
+        entity_type="appointment",
         entity_id=appointment_id, action=AuditAction.UPDATE,
         old_values={"notes": old_notes},
         new_values={"notes": new_notes, "change_type": "notes_edit"},

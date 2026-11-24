@@ -186,7 +186,7 @@ def update_client(
     # quem PRECISA corrigir um telefone precisa primeiro poder VÊ-LO.
     can_view_contact = client_can_view_contact(actor.permissions)
     client = clients_service.update_client(
-        session, actor.organization_id, client_id, payload, can_view_contact=can_view_contact
+        session, actor.organization_id, client_id, payload, can_view_contact=can_view_contact, user_id=actor.user_id
     )
     return apply_client_contact_masking(ClientRead.model_validate(client), can_view_contact=can_view_contact)
 

@@ -92,9 +92,15 @@ class AppointmentNotesUpdate(BaseModel):
     revalidar branch/cliente/TODOS os itens/disponibilidade — desenhado
     pro fluxo de Reagendar, não pra uma edição pontual de texto livre).
     `notes=""` (ou só espaços) limpa a observação — mesmo tratamento
-    dado a `Order.observation`."""
+    dado a `Order.observation`.
+
+    `expected_notes_version` OBRIGATÓRIO (migration 0058, central de
+    observações do cliente) — mesmo padrão de concorrência otimista de
+    `OrderObservationUpdate.expected_observation_version`: o service
+    recusa com 409 se não bater com `Appointment.notes_version` atual."""
 
     notes: str = Field(default="", max_length=255)
+    expected_notes_version: int = Field(ge=0)
 
 
 class AppointmentStatusUpdate(BaseModel):
@@ -188,6 +194,9 @@ class AppointmentRead(BaseModel):
     status: AppointmentStatus
     source: AppointmentSource
     notes: str | None
+    notes_version: int
+    notes_updated_at: datetime | None
+    notes_updated_by_name: str | None
     fit_in: bool
     starts_at: datetime | None
     ends_at: datetime | None

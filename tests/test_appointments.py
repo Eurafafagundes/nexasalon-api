@@ -1267,7 +1267,7 @@ def test_update_notes_salva_a_observacao(org_session):
     )
     assert appt.notes is None
 
-    updated = appointments.update_notes(session, actor, appt.id, "Cliente pediu para usar só 180g de cabelo.")
+    updated = appointments.update_notes(session, actor, appt.id, "Cliente pediu para usar só 180g de cabelo.", 0)
 
     assert updated.notes == "Cliente pediu para usar só 180g de cabelo."
 
@@ -1285,7 +1285,7 @@ def test_update_notes_aceita_string_vazia_e_limpa(org_session):
     )
     assert appt.notes == "Observação original."
 
-    updated = appointments.update_notes(session, actor, appt.id, "")
+    updated = appointments.update_notes(session, actor, appt.id, "", 0)
 
     assert updated.notes is None
 
@@ -1310,7 +1310,7 @@ def test_update_notes_nao_altera_itens_data_status_nem_outros_campos(org_session
     original_branch_id = appt.branch_id
     original_client_id = appt.client_id
 
-    updated = appointments.update_notes(session, actor, appt.id, "Só a observação muda.")
+    updated = appointments.update_notes(session, actor, appt.id, "Só a observação muda.", 0)
 
     assert len(updated.items) == 1
     assert updated.items[0].id == original_item_id
@@ -1334,7 +1334,7 @@ def test_update_notes_registra_auditoria(org_session):
         ),
     )
 
-    appointments.update_notes(session, actor, appt.id, "Nova observação.")
+    appointments.update_notes(session, actor, appt.id, "Nova observação.", 0)
 
     logs = session.query(AuditLog).filter(
         AuditLog.organization_id == org_id, AuditLog.entity_id == appt.id
@@ -1364,7 +1364,7 @@ def test_update_notes_de_outra_organizacao_gera_404(org_session):
     other_actor = _actor(session, other_org_id)
 
     with pytest.raises(NotFoundError):
-        appointments.update_notes(session, other_actor, appt.id, "Tentativa de outra organização.")
+        appointments.update_notes(session, other_actor, appt.id, "Tentativa de outra organização.", 0)
 
 
 def test_update_notes_recusado_para_ator_sem_permissao_de_editar_este_profissional(org_session):
@@ -1391,7 +1391,7 @@ def test_update_notes_recusado_para_ator_sem_permissao_de_editar_este_profission
     )
 
     with pytest.raises(ForbiddenError):
-        appointments.update_notes(session, restricted, appt.id, "Tentativa sem permissão de edição.")
+        appointments.update_notes(session, restricted, appt.id, "Tentativa sem permissão de edição.", 0)
 
 
 def test_update_notes_nao_afeta_order_observation_ja_existente(org_session):
@@ -1417,7 +1417,7 @@ def test_update_notes_nao_afeta_order_observation_ja_existente(org_session):
     order = orders.create_order(session, actor, appt.id)
     assert order.observation == "Observação original da visita."
 
-    appointments.update_notes(session, actor, appt.id, "Editado depois que a Order já existia.")
+    appointments.update_notes(session, actor, appt.id, "Editado depois que a Order já existia.", 0)
 
     session.refresh(order)
     assert order.observation == "Observação original da visita."

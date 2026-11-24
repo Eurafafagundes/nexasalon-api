@@ -120,7 +120,9 @@ def update_appointment_notes(
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_edit),
 ) -> AppointmentRead:
-    appointment = appointments_service.update_notes(session, actor, appointment_id, payload.notes)
+    appointment = appointments_service.update_notes(
+        session, actor, appointment_id, payload.notes, payload.expected_notes_version
+    )
     return AppointmentRead.model_validate(appointment)
 
 

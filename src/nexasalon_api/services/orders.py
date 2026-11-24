@@ -496,6 +496,7 @@ def update_observation(
         session,
         organization_id=organization_id,
         user_id=actor.user_id,
+        user_name=actor_user.name if actor_user is not None else None,
         entity_type="order",
         entity_id=order.id,
         action=AuditAction.UPDATE,

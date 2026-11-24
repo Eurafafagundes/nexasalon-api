@@ -9,6 +9,7 @@ from . import (
     branches,
     cash_register_config,
     cash_registers,
+    client_observations,
     clients,
     commissions,
     customer_auth,
@@ -42,6 +43,7 @@ api_v1_router.include_router(professionals.router)
 api_v1_router.include_router(services.router)
 api_v1_router.include_router(service_categories.router)
 api_v1_router.include_router(clients.router)
+api_v1_router.include_router(client_observations.router)
 api_v1_router.include_router(users.router)
 api_v1_router.include_router(roles.router)
 api_v1_router.include_router(agenda.router)

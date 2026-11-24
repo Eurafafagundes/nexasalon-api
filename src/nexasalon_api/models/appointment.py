@@ -119,6 +119,21 @@ class Appointment(Base, UUIDPKMixin, TimestampMixin):
     updated_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
+    # Auditoria DEDICADA da observação da visita (item "Observações de
+    # agendamentos", central de observações do cliente) — NUNCA
+    # reaproveita `updated_by`/`updated_at` genéricos acima (mudam por
+    # reagendar/trocar status/etc., não só pela observação). Mesmo
+    # padrão de `Order.observation_updated_at/_by/_by_name` (migration
+    # 0039): snapshot capturado na edição, nunca um join a `users`.
+    # Concorrência otimista por contador explícito (nasce em `0`), mesmo
+    # raciocínio de `Order.observation_version` — ver
+    # `services/appointments.py::update_notes`.
+    notes_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    notes_updated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    notes_updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    notes_updated_by_name: Mapped[str | None] = mapped_column(String(160))
 
     items: Mapped[list["AppointmentItem"]] = relationship(
         back_populates="appointment", cascade="all, delete-orphan"
