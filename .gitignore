@@ -9,6 +9,8 @@ __pycache__/
 .pgdata_test/
 .pgdata_test_*/
 .pgdata_migration_test/
+.pgdata_demo/
+.demo_backend*.log
 .venv312_test/
 .pytest_cache/
 *.pem
