@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from nexasalon_api.models.enums import AppointmentStatus
 
@@ -93,6 +93,11 @@ class PublicBookingCreate(BaseModel):
     service_id: uuid.UUID
     professional_id: uuid.UUID | None = None
     start_at: datetime
+    # NexaLink — atribuição opcional (nunca bloqueia o agendamento se
+    # ausente/inválido). Propagado pelo frontend desde a página pública
+    # (`?nxat=...`), validado no backend ANTES de contar como conversão
+    # — ver `services/public_page_events.py::resolve_attribution`.
+    attribution_token: str | None = Field(default=None, max_length=64)
 
     @field_validator("start_at")
     @classmethod

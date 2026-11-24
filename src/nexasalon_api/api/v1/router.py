@@ -19,11 +19,13 @@ from . import (
     fixed_expenses,
     inventory_counts,
     orders,
+    organization_public_page,
     organizations,
     payment_fee_rules,
     products,
     professionals,
     public_booking,
+    public_page,
     roles,
     schedule_blocks,
     service_categories,
@@ -38,6 +40,7 @@ api_v1_router = APIRouter(prefix="/api/v1")
 api_v1_router.include_router(auth.router)
 api_v1_router.include_router(signup.router)
 api_v1_router.include_router(organizations.router)
+api_v1_router.include_router(organization_public_page.router)
 api_v1_router.include_router(branches.router)
 api_v1_router.include_router(professionals.router)
 api_v1_router.include_router(services.router)
@@ -65,4 +68,5 @@ api_v1_router.include_router(products.router)
 api_v1_router.include_router(stock.router)
 api_v1_router.include_router(inventory_counts.router)
 api_v1_router.include_router(public_booking.router)
+api_v1_router.include_router(public_page.router)
 api_v1_router.include_router(customer_auth.router)

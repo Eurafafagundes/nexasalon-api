@@ -8,6 +8,9 @@ importado aqui, senão fica invisível para o autogenerate.
 from .base import Base  # noqa: F401
 from .auth import RefreshToken  # noqa: F401
 from .organization import Organization, Branch  # noqa: F401
+from .organization_public_page import OrganizationPublicPage  # noqa: F401
+from .organization_public_link import OrganizationPublicLink  # noqa: F401
+from .public_page_event import PublicPageEvent  # noqa: F401
 from .rbac import Role, Permission, RolePermission  # noqa: F401
 from .identity import User, OrganizationMembership, MembershipPermissionOverride  # noqa: F401
 from .agenda_access import MembershipAgendaGrant  # noqa: F401
@@ -33,6 +36,9 @@ __all__ = [
     "Base",
     "RefreshToken",
     "Organization",
+    "OrganizationPublicPage",
+    "OrganizationPublicLink",
+    "PublicPageEvent",
     "Branch",
     "Role",
     "Permission",

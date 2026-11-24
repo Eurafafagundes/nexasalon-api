@@ -216,6 +216,25 @@ class Settings(BaseSettings):
     rate_limit_public_booking_window_seconds: int = 60
     rate_limit_public_booking_create_max_attempts: int = 5
     rate_limit_public_booking_create_window_seconds: int = 300
+    # NexaLink — página pública (`/public/s/{slug}`). Mesmo raciocínio
+    # acima: `_max_attempts`/`_window_seconds` (sem sufixo) cobre a
+    # NAVEGAÇÃO (GET da config pública); `_event_*` cobre o POST de
+    # eventos de clique/visualização — mais permissivo que o de CRIAR
+    # agendamento (cliques são esperados em volume maior que reservas),
+    # mas suficiente pra impedir flood automatizado/inflação de métrica.
+    rate_limit_public_page_max_attempts: int = 60
+    rate_limit_public_page_window_seconds: int = 60
+    rate_limit_public_page_event_max_attempts: int = 120
+    rate_limit_public_page_event_window_seconds: int = 60
+
+    # --- NexaLink — retenção de eventos (LGPD) ---
+    # `public_page_events` não guarda IP/telefone/CPF (ver docstring do
+    # model), mas ainda é tráfego de visitante — retenção limitada por
+    # padrão, mesmo sem dado pessoal direto. Sem scheduler automático
+    # nesta rodada (nenhuma infra de cron existe no projeto ainda) —
+    # `services/public_page_events.py::purge_events_older_than` é
+    # chamável manualmente/por tarefa futura, usando este valor.
+    public_page_events_retention_days: int = 90
 
     # --- Storage de arquivos (Etapa D — logo do estabelecimento) ---
     # Nenhuma infraestrutura de storage existia no projeto antes desta

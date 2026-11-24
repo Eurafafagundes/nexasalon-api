@@ -50,6 +50,20 @@ def is_valid_cpf(cpf_digits: str) -> bool:
     return cpf_digits[9] == str(d1) and cpf_digits[10] == str(d2)
 
 
+def normalize_whatsapp_number(raw: str) -> str:
+    """Número COM DDI, só dígitos — formato exigido por `wa.me/{numero}`
+    (diferente de `normalize_phone`, que REMOVE o DDI 55 de propósito
+    pra convergir busca/dedup interno). Assume Brasil (único mercado
+    deste produto hoje): se não começar com "55" e tiver o comprimento
+    de um número brasileiro sem DDI (10-11 dígitos, DDD+número), prefixa
+    "55". Números já com DDI (12-13 dígitos começando em "55") ficam
+    como estão."""
+    digits = _DIGITS.sub("", raw)
+    if not digits.startswith("55") and len(digits) in (10, 11):
+        digits = "55" + digits
+    return digits
+
+
 def normalize_slug(raw: str) -> str:
     """Slug de URL (Etapa K — Agendamento Online): minúsculo, só
     `[a-z0-9-]`, hífens colapsados/sem sobra nas pontas. `"Salão da

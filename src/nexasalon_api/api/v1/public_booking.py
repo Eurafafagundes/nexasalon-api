@@ -39,6 +39,7 @@ from nexasalon_api.schemas.public_booking import (
 from nexasalon_api.services import appointments as appointments_service
 from nexasalon_api.services import customer_accounts as customer_accounts_service
 from nexasalon_api.services import public_booking as public_booking_service
+from nexasalon_api.services import public_page_events as public_page_events_service
 
 router = APIRouter(prefix="/public/booking/{organization_slug}", tags=["public-booking"])
 
@@ -172,6 +173,13 @@ def create_booking(
         service_id=payload.service_id,
         start_at=payload.start_at,
         client_id=client_id,
+    )
+    # NexaLink — atribuição opcional, NUNCA bloqueia/afeta a criação do
+    # agendamento em si (token ausente/inválido só não gera o evento de
+    # conversão; ver `services/public_page_events.py::
+    # record_booking_completed`, que valida o token antes de aceitar).
+    public_page_events_service.record_booking_completed(
+        ctx.session, ctx.organization.id, appointment.id, payload.attribution_token
     )
     # Item 3 da Etapa M — tela "Agendamento confirmado!" mostra
     # serviço/profissional de verdade, inclusive quando a cliente

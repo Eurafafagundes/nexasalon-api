@@ -485,6 +485,87 @@ def get_public_context(
         session.close()
 
 
+@dataclass
+class PublicPageContext:
+    """Sessão + organização resolvida pra uma request da página pública
+    NexaLink (`api/v1/public_page.py`) — mesmo papel de
+    `PublicBookingContext`, dependency própria (nunca reaproveita
+    `get_public_context`, que é especificamente do Agendamento Online e
+    checa `online_booking_enabled`, uma flag DIFERENTE de
+    `OrganizationPublicPage.is_enabled`)."""
+
+    session: Session
+    organization: Organization
+
+
+def get_public_page_context(
+    organization_slug: str, request: Request
+) -> Generator[PublicPageContext, None, None]:
+    """Dependency-raiz das rotas PÚBLICAS do NexaLink — mesmo mecanismo
+    de `get_public_context` (flag de sessão `app.public_booking_lookup`
+    pra resolver a organização por slug sob RLS, depois `app.
+    current_org_id` normal). A condição de 404 aqui é só sobre o slug
+    existir — `OrganizationPublicPage.is_enabled` é checado DEPOIS, em
+    `services/public_page.py::get_public_page` (mesma mensagem de erro,
+    anti-enumeração: slug inexistente e página desativada são
+    estruturalmente indistinguíveis por fora).
+
+    DELIBERADAMENTE sem rate limit embutido aqui (diferente de
+    `get_public_context`) — esta MESMA dependency serve tanto o `GET`
+    (navegação, limite mais apertado) quanto o `POST /events` (cliques,
+    limite bem mais generoso); embutir um limite aqui faria o mais
+    apertado sempre vencer no endpoint de eventos, por mais que o
+    específico fosse maior. Cada rota chama explicitamente o limite
+    certo (`rate_limit_public_page_nav`/`rate_limit_public_page_event`,
+    abaixo) ANTES de depender disto."""
+    session = SessionLocal()
+    try:
+        session.execute(text("SELECT set_config('app.public_booking_lookup', 'true', true)"))
+        organization = organization_repo.get_by_slug(session, organization_slug)
+        session.execute(text("SELECT set_config('app.public_booking_lookup', 'false', true)"))
+
+        if organization is None:
+            raise NotFoundError("Página não encontrada.")
+
+        session.execute(
+            text("SELECT set_config('app.current_org_id', :oid, true)"), {"oid": str(organization.id)}
+        )
+        yield PublicPageContext(session=session, organization=organization)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def rate_limit_public_page_nav(request: Request) -> None:
+    """Rate limit da NAVEGAÇÃO (`GET /public/s/{slug}`) — chamado
+    explicitamente pela rota (`api/v1/public_page.py::get_public_page`),
+    nunca embutido em `get_public_page_context` (ver docstring lá)."""
+    if not settings.rate_limit_enabled:
+        return
+    rate_limiter.hit(
+        f"public_page:{_client_ip(request)}",
+        max_attempts=settings.rate_limit_public_page_max_attempts,
+        window_seconds=settings.rate_limit_public_page_window_seconds,
+    )
+
+
+def rate_limit_public_page_event(request: Request) -> None:
+    """Rate limit do POST de eventos (clique/visualização) — mais
+    permissivo que o de criar agendamento (cliques são esperados em
+    volume maior que reservas), mas suficiente pra impedir flood
+    automatizado/inflação de métrica."""
+    if not settings.rate_limit_enabled:
+        return
+    rate_limiter.hit(
+        f"public_page_event:{_client_ip(request)}",
+        max_attempts=settings.rate_limit_public_page_event_max_attempts,
+        window_seconds=settings.rate_limit_public_page_event_window_seconds,
+    )
+
+
 def get_db(actor: ActorContext = Depends(get_current_actor)) -> Generator[Session, None, None]:
     """Sessão por request. Seta `app.current_org_id` (e `app.current_user_id`,
     para as poucas policies com cláusula de auto-acesso) via `SET LOCAL` —

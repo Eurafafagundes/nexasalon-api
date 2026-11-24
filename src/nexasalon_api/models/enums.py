@@ -324,6 +324,33 @@ class PermissionEffect(str, Enum):
     DENY = "deny"
 
 
+class PublicPageButtonStyle(str, Enum):
+    ROUNDED = "rounded"
+    PILL = "pill"
+    SQUARE = "square"
+
+
+class PublicLinkKind(str, Enum):
+    """4 nativos (sempre uma linha cada, nunca deletável) + `CUSTOM` (N
+    linhas livres) — ver docstring de `OrganizationPublicLink`."""
+
+    BOOKING = "booking"
+    WHATSAPP = "whatsapp"
+    INSTAGRAM = "instagram"
+    LOCATION = "location"
+    CUSTOM = "custom"
+
+
+class PublicPageEventType(str, Enum):
+    PAGE_VIEW = "page_view"
+    BOOKING_CLICK = "booking_click"
+    WHATSAPP_CLICK = "whatsapp_click"
+    INSTAGRAM_CLICK = "instagram_click"
+    MAPS_CLICK = "maps_click"
+    CUSTOM_LINK_CLICK = "custom_link_click"
+    BOOKING_COMPLETED = "booking_completed"
+
+
 class AgendaAccessScope(str, Enum):
     """Escopo de VISUALIZAÇÃO/EDIÇÃO de agenda por profissional, além (não
     em vez) das permissions `agenda.view_own`/`agenda.view_all`/
