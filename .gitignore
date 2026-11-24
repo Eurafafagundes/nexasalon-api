@@ -7,6 +7,9 @@ __pycache__/
 *.egg-info/
 .pgdata/
 .pgdata_test/
+.pgdata_test_*/
+.pgdata_migration_test/
+.venv312_test/
 .pytest_cache/
 *.pem
 *.key

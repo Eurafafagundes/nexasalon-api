@@ -1,20 +1,77 @@
+"""Migration 0049 — Despesas Fixas (`fixed_expenses`/`organization_tax_rates`).
+
+Isolamento (correção pós-NexaLink): este teste fazia `alembic
+downgrade 0048` + `alembic upgrade 0049` diretamente no banco
+COMPARTILHADO da suíte (`NEXASALON_DATABASE_URL`, o mesmo que
+`conftest.py` já sobe migrado até `heads` pra TODOS os outros testes).
+Isso deixava o banco compartilhado PARADO na revisão 0049 pro resto da
+sessão — qualquer teste de outro arquivo que rodasse depois, na mesma
+sessão pytest, perdia todo o schema de 0050 em diante (ex.: as tabelas
+novas do NexaLink, `organization_public_pages`/`organization_public_
+links`/`public_page_events`, ou colunas como `audit_logs.user_name`),
+causando `UndefinedTable`/`UndefinedColumn` em massa só quando a suíte
+COMPLETA rodava numa única sessão — nunca quando um arquivo rodava
+isolado ou em combinações menores (por isso o problema só apareceu ao
+rodar `pytest` sem filtro).
+
+Corrigido pelo MESMO padrão já usado em `test_migration_0014_backfill.py`:
+Postgres descartável PRÓPRIO (`pgserver`, diretório `.pgdata_test_0049`
+dedicado, nunca reaproveitando `.pgdata_test`/`.pgdata_migration_test`
+de outro arquivo), destruído no fim do módulo. O banco compartilhado da
+suíte principal nunca é tocado por este teste."""
 import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 from urllib.parse import urlsplit
 
+import pgserver
 import psycopg
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+_PGDATA = str(REPO_ROOT / ".pgdata_test_0049")
 
 
-def test_migration_0049_downgrade_upgrade_and_catalog():
-    app_url = urlsplit(os.environ["NEXASALON_DATABASE_URL"].replace("postgresql+psycopg", "postgresql"))
-    admin_url = f"postgresql://postgres:@{app_url.hostname}:{app_url.port}/nexasalon_test"
+@pytest.fixture(scope="module")
+def migration_db():
+    shutil.rmtree(_PGDATA, ignore_errors=True)
+    srv = pgserver.get_server(_PGDATA)
+    try:
+        srv.psql("CREATE DATABASE nexasalon_migration_0049_test;")
+    except Exception:
+        pass
+
+    u = urlsplit(srv.get_uri())
+    admin_url = (
+        f"postgresql://postgres:@{u.hostname or '127.0.0.1'}:{u.port or 5432}/nexasalon_migration_0049_test"
+    )
     env = os.environ.copy()
     env["NEXASALON_DATABASE_URL"] = admin_url.replace("postgresql://", "postgresql+psycopg://")
+    env.pop("NEXASALON_MIGRATIONS_DATABASE_URL", None)
+
+    # Sobe o schema completo (mesma lógica de `heads` do conftest.py
+    # principal) ANTES do downgrade — precisa de um estado real de
+    # onde descer até 0048, isolado do banco compartilhado.
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "heads"],
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"falha ao subir heads no banco isolado:\n{result.stdout}\n{result.stderr}"
+
+    yield admin_url, env
+
+    srv.cleanup()
+    shutil.rmtree(_PGDATA, ignore_errors=True)
+
+
+def test_migration_0049_downgrade_upgrade_and_catalog(migration_db):
+    admin_url, env = migration_db
 
     def alembic(*args: str) -> str:
         result = subprocess.run(
-            [sys.executable, "-m", "alembic", *args], env=env,
+            [sys.executable, "-m", "alembic", *args], cwd=str(REPO_ROOT), env=env,
             capture_output=True, text=True, check=True,
         )
         return result.stdout + result.stderr
