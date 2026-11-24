@@ -432,7 +432,12 @@ def test_attribution_token_valido_gera_booking_completed_sem_duplicar_sob_retry(
             event_type=PublicPageEventType.PAGE_VIEW,
             attribution_token="token-valido",
         )
-        session.add(page_view)
+        booking_click = PublicPageEvent(
+            organization_id=org_a_actor.organization_id,
+            event_type=PublicPageEventType.BOOKING_CLICK,
+            attribution_token="token-valido",
+        )
+        session.add_all([page_view, booking_click])
         session.flush()
 
         assert public_page_events_service.resolve_attribution(session, org_a_actor.organization_id, "token-valido") is True
@@ -449,6 +454,28 @@ def test_attribution_token_valido_gera_booking_completed_sem_duplicar_sob_retry(
             {"aid": str(appointment_id)},
         ).scalar()
         assert count == 1
+
+
+def test_token_com_page_view_mas_sem_booking_click_nunca_conta_como_conversao(org_a_actor):
+    """Revisão pós-implantação: exigir SÓ `page_view` deixava passar um
+    agendamento criado por qualquer OUTRO caminho (nunca clicando em
+    "Agendar" na página NexaLink) desde que carregasse um token antigo
+    de alguma visita anterior — `booking_click` com o MESMO token
+    agora é exigido também, fechando essa lacuna."""
+    with SessionLocal() as session:
+        session.execute(
+            text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_a_actor.organization_id)}
+        )
+        page_view = PublicPageEvent(
+            organization_id=org_a_actor.organization_id,
+            event_type=PublicPageEventType.PAGE_VIEW,
+            attribution_token="token-sem-clique",
+        )
+        session.add(page_view)
+        session.flush()
+
+        valid = public_page_events_service.resolve_attribution(session, org_a_actor.organization_id, "token-sem-clique")
+        assert valid is False
 
 
 def test_token_ausente_ou_invalido_nunca_bloqueia_fluxo_apenas_nao_atribui(org_a_actor):

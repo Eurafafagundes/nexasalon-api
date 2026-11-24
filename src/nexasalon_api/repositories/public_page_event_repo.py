@@ -15,21 +15,26 @@ def create(session: Session, event: PublicPageEvent) -> PublicPageEvent:
     return event
 
 
-def find_page_view_by_token(
-    session: Session, organization_id: uuid.UUID, attribution_token: str
+def find_event_by_token(
+    session: Session,
+    organization_id: uuid.UUID,
+    attribution_token: str,
+    event_type: PublicPageEventType,
 ) -> PublicPageEvent | None:
     """Usado SÓ pra validar um `attribution_token` recebido na criação de
     agendamento (`services/public_page_events.py::resolve_attribution`)
     — nunca aceita o token às cegas: ele só conta como atribuição válida
-    se corresponder a um `page_view` de fato registrado PARA ESTA MESMA
+    se corresponder a um evento de fato registrado PARA ESTA MESMA
     organização (nunca de outra, nunca um valor fabricado pelo
-    cliente)."""
+    cliente). `resolve_attribution` chama isto duas vezes — uma pra
+    `page_view`, outra pra `booking_click` — exige as DUAS, nunca só a
+    visualização (ver docstring de `resolve_attribution`)."""
     stmt = (
         select(PublicPageEvent)
         .where(
             PublicPageEvent.organization_id == organization_id,
             PublicPageEvent.attribution_token == attribution_token,
-            PublicPageEvent.event_type == PublicPageEventType.PAGE_VIEW,
+            PublicPageEvent.event_type == event_type,
         )
         .order_by(PublicPageEvent.created_at.desc())
         .limit(1)

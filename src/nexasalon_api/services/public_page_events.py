@@ -81,17 +81,37 @@ def resolve_attribution(
     """Valida um `attribution_token` recebido na criação de agendamento —
     NUNCA aceito às cegas (item explícito "validar a origem, organização
     e validade do attribution_token, evitando conversões falsas ou
-    duplicadas"). Só é válido se corresponder a um `page_view` registrado
-    para ESTA MESMA organização (nunca de outra — um token fabricado ou
-    copiado de outra página nunca engana a atribuição) e dentro da
-    janela de validade. Token ausente/inválido/expirado → `False`,
-    NUNCA bloqueia o agendamento em si (atribuição é só analytics)."""
+    duplicadas"). Exige DOIS eventos reais, registrados para ESTA MESMA
+    organização e com o MESMO token (nunca de outra organização, nunca
+    um valor fabricado/copiado):
+
+      1. um `page_view` — confirma que o token corresponde a um
+         carregamento real da página NexaLink;
+      2. um `booking_click` — confirma que a visita de fato terminou num
+         clique no botão "Agendar" (fecha a lacuna de só exigir
+         `page_view`: sem isto, qualquer agendamento criado por OUTRO
+         caminho, carregando um token antigo de uma visita anterior,
+         seria contado como conversão do NexaLink mesmo sem a pessoa
+         nunca ter clicado em agendar a partir de lá).
+
+    Ambos dentro da janela de validade (a partir do `page_view`, sempre
+    o mais antigo dos dois no fluxo real). Token ausente/inválido/
+    expirado/sem o clique → `False`, NUNCA bloqueia o agendamento em si
+    (atribuição é só analytics, nunca uma condição pra criar a
+    reserva)."""
     if not attribution_token:
         return False
-    page_view = public_page_event_repo.find_page_view_by_token(session, organization_id, attribution_token)
+    page_view = public_page_event_repo.find_event_by_token(
+        session, organization_id, attribution_token, PublicPageEventType.PAGE_VIEW
+    )
     if page_view is None:
         return False
-    return datetime.now(timezone.utc) - page_view.created_at <= _ATTRIBUTION_TOKEN_MAX_AGE
+    if datetime.now(timezone.utc) - page_view.created_at > _ATTRIBUTION_TOKEN_MAX_AGE:
+        return False
+    booking_click = public_page_event_repo.find_event_by_token(
+        session, organization_id, attribution_token, PublicPageEventType.BOOKING_CLICK
+    )
+    return booking_click is not None
 
 
 def record_booking_completed(
