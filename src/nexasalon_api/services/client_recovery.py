@@ -46,6 +46,7 @@ from decimal import Decimal
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from nexasalon_api.core.actor import ActorContext
@@ -635,11 +636,16 @@ def log_contact(
     `expected_version` não é exigido aqui: diferente de uma EDIÇÃO de
     conteúdo existente, registrar contato é sempre uma ação NOVA
     (sempre um `INSERT` em `client_recovery_events`), não há "versão
-    anterior" que outra pessoa possa ter sobrescrito por engano — a
-    única concorrência real (duas recepcionistas criando dois ciclos
-    pro mesmo cliente ao mesmo tempo) já é resolvida pelo índice único
-    parcial do banco, que faria a segunda tentativa falhar com erro de
-    integridade; `get_for_update`/lock do cliente evita até isso."""
+    anterior" que outra pessoa possa ter sobrescrito por engano. A
+    concorrência real (duas recepcionistas registrando o PRIMEIRO
+    contato do mesmo cliente ao mesmo tempo, nenhuma linha ainda pra
+    `FOR UPDATE` travar) é resolvida em duas camadas: o índice único
+    parcial do banco (`uq_client_recovery_cycles_org_client_active`,
+    cobrindo `pending`/`in_progress`/`scheduled` desde a migration
+    0062) decide quem "ganha"; quem perde é tratado explicitamente
+    abaixo (`IntegrityError` → relê o ciclo já criado pela outra
+    transação e aplica a mesma transição nele) — nunca um 500/409
+    genérico nem um contato perdido."""
     client = client_repo.get(session, actor.organization_id, client_id)
     if client is None:
         raise NotFoundError("Cliente não encontrado.")
@@ -672,12 +678,41 @@ def log_contact(
             assigned_user_id=actor.user_id,
             assigned_user_name=actor_name,
         )
-        client_recovery_repo.create(session, cycle)
-        _record_event(
-            session, actor, cycle, event_type=RecoveryEventType.CREATED,
-            previous_status=None, new_status=RecoveryCycleStatus.PENDING, now=now,
-        )
-        previous_status = RecoveryCycleStatus.PENDING
+        try:
+            # `get_active_for_client_for_update` acima usa `SELECT ...
+            # FOR UPDATE`, mas quando NÃO EXISTE nenhuma linha pra
+            # travar (nenhum ciclo ativo ainda), esse lock não protege
+            # nada — duas recepcionistas registrando o PRIMEIRO contato
+            # do MESMO cliente ao mesmo tempo passam as duas por aqui
+            # vendo `existing=None`. É o índice único parcial do banco
+            # (`uq_client_recovery_cycles_org_client_active`) quem
+            # arbitra a corrida de verdade. `begin_nested` (SAVEPOINT)
+            # isola só este INSERT — uma falha aqui nunca derruba o
+            # resto da transação da request.
+            with session.begin_nested():
+                client_recovery_repo.create(session, cycle)
+        except IntegrityError:
+            # Perdeu a corrida: a outra requisição já criou o ciclo.
+            # Nunca um erro genérico de conflito pro usuário, nunca
+            # perde o contato que estava sendo registrado — relê o
+            # ciclo (agora existe, agora SIM travável) e aplica a MESMA
+            # transição nele, como se tivesse encontrado o ciclo ativo
+            # desde o início.
+            existing = client_recovery_repo.get_active_for_client_for_update(
+                session, actor.organization_id, client_id
+            )
+            if existing is None:
+                raise ConflictError(
+                    "Não foi possível registrar o contato — tente novamente."
+                ) from None
+            cycle = existing
+            previous_status = cycle.status
+        else:
+            _record_event(
+                session, actor, cycle, event_type=RecoveryEventType.CREATED,
+                previous_status=None, new_status=RecoveryCycleStatus.PENDING, now=now,
+            )
+            previous_status = RecoveryCycleStatus.PENDING
     else:
         cycle = existing
         previous_status = cycle.status

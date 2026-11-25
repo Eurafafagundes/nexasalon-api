@@ -4,6 +4,7 @@ Direto no service layer via `SessionLocal`, construindo Appointment/Order/
 OrderItem diretamente pelo ORM — MESMO motivo de `test_dashboard.py`:
 estes testes precisam de "dias sem retorno" controlados (`Order.closed_at`
 no passado), e `close_order` real sempre usa `datetime.now()`."""
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -444,6 +445,104 @@ def test_nao_permite_dois_ciclos_ativos_para_o_mesmo_cliente(org_session):
     )
     cycles = client_recovery_repo.list_all_for_clients(session, org_id, [client.id])
     assert len(cycles) == 1
+
+
+def test_concorrencia_real_entre_duas_recepcionistas_criando_o_primeiro_ciclo(org_session):
+    """Corrida real com DUAS conexões/threads de verdade (não só duas
+    chamadas sequenciais na mesma sessão, que nunca exercitam o
+    `IntegrityError`) — auditoria pós-V3: `get_active_for_client_for_
+    update` com `FOR UPDATE` não trava nada quando não existe NENHUMA
+    linha pra travar, então duas recepcionistas registrando o PRIMEIRO
+    contato do MESMO cliente ao mesmo tempo passam as duas por
+    `existing is None`. A thread B é deliberadamente forçada a tentar o
+    próprio INSERT enquanto a thread A já deu `flush` mas ainda não
+    comitou — o Postgres bloqueia o INSERT de B no índice único parcial
+    até A comitar, e só então B descobre a violação de verdade. Prova
+    que o tratamento em `log_contact` funciona sob concorrência real
+    (nunca 2 ciclos, nunca uma excessão não tratada, nunca perde o
+    contato de quem "perde" a corrida)."""
+    session, org_id = org_session
+    client, *_ = _eligible_client(session, org_id)
+    # Captura o id ANTES do commit (nunca depois): `commit()` expira os
+    # atributos do objeto, e um reacesso posterior obrigaria a sessão a
+    # reconectar/reler a linha — sob pool de conexões real (suíte
+    # completa, muita concorrência), essa releitura pode cair numa
+    # conexão física diferente, sem o `app.current_org_id` da RLS
+    # setado, e o SELECT simplesmente não encontra a linha
+    # (`ObjectDeletedError`, nunca um delete de verdade). Cada worker
+    # usa só este id puro — nunca o objeto ORM, que não é thread-safe.
+    client_id = client.id
+    session.commit()  # visível pras outras conexões/threads (MVCC)
+
+    results: dict[str, object] = {}
+    errors: dict[str, Exception] = {}
+    a_flushed = threading.Event()
+    a_may_commit = threading.Event()
+
+    def worker_a() -> None:
+        try:
+            with SessionLocal() as s:
+                s.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_id)})
+                actor_a = _actor(s, org_id)
+                cycle = recovery_service.log_contact(
+                    s, actor_a, client_id, contact_channel=None,
+                    contact_result=RecoveryContactResult.AWAITING_RESPONSE, notes="recepcionista A",
+                    next_contact_at=_NOW + timedelta(days=3), linked_appointment_id=None,
+                )
+                results["a_cycle_id"] = cycle.id
+                a_flushed.set()
+                a_may_commit.wait(timeout=10)
+                s.commit()
+        except Exception as exc:  # pragma: no cover - diagnóstico se travar/falhar
+            errors["a"] = exc
+            a_flushed.set()
+
+    def worker_b() -> None:
+        try:
+            assert a_flushed.wait(timeout=10), "thread A nunca sinalizou o flush — timeout"
+            with SessionLocal() as s:
+                s.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_id)})
+                actor_b = _actor(s, org_id)
+                # Libera o commit da A só depois de dar tempo da B já
+                # estar bloqueada tentando o próprio INSERT no lock da
+                # linha (ainda não comitada) da A.
+                threading.Timer(0.3, a_may_commit.set).start()
+                cycle = recovery_service.log_contact(
+                    s, actor_b, client_id, contact_channel=None,
+                    contact_result=RecoveryContactResult.NOT_INTERESTED, notes="recepcionista B",
+                    next_contact_at=None, linked_appointment_id=None,
+                )
+                results["b_cycle_id"] = cycle.id
+                s.commit()
+        except Exception as exc:
+            errors["b"] = exc
+            a_may_commit.set()
+
+    t_a = threading.Thread(target=worker_a)
+    t_b = threading.Thread(target=worker_b)
+    t_a.start()
+    t_b.start()
+    t_a.join(timeout=20)
+    t_b.join(timeout=20)
+
+    assert not errors, f"erro inesperado numa das threads (nunca deveria propagar): {errors}"
+    assert results.get("a_cycle_id") is not None
+    assert results.get("b_cycle_id") is not None
+    assert results["a_cycle_id"] == results["b_cycle_id"]  # MESMO ciclo, nunca duplicado
+
+    # Verificação final numa sessão NOVA (nunca reaproveitando `session`
+    # depois do commit acima) — garante o contexto de RLS correto
+    # independentemente de qual conexão física o pool devolveria.
+    with SessionLocal() as verify_session:
+        verify_session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_id)})
+        cycles = client_recovery_repo.list_all_for_clients(verify_session, org_id, [client_id])
+        assert len(cycles) == 1
+        events = client_recovery_repo.list_events_for_cycle(verify_session, org_id, cycles[0].id)
+    # As duas recepcionistas tiveram o próprio contato registrado de
+    # verdade — quem "perdeu" a corrida nunca foi descartada em
+    # silêncio nem precisou tentar de novo manualmente.
+    notes_recorded = {e.notes for e in events if e.notes}
+    assert notes_recorded == {"recepcionista A", "recepcionista B"}
 
 
 def test_sem_interesse_aplica_pausa_e_bloqueia_reentrada_ate_o_prazo(org_session):
