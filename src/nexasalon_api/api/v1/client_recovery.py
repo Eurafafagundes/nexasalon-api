@@ -130,10 +130,14 @@ def list_recovery_queue(
 def get_recovery_summary(
     date_from: datetime = Query(...),
     date_to: datetime = Query(...),
+    min_days: int | None = Query(default=None, ge=0),
+    max_days: int | None = Query(default=None, ge=0),
     session: Session = Depends(get_db),
     actor: ActorContext = Depends(_view),
 ) -> RecoverySummaryRead:
-    summary = client_recovery_service.get_recovery_summary(session, actor, date_from=date_from, date_to=date_to)
+    summary = client_recovery_service.get_recovery_summary(
+        session, actor, date_from=date_from, date_to=date_to, min_days=min_days, max_days=max_days,
+    )
     return RecoverySummaryRead(
         pending_count=summary.pending_count, in_progress_count=summary.in_progress_count,
         recovered_count=summary.recovered_count, not_interested_count=summary.not_interested_count,

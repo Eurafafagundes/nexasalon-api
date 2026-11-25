@@ -361,10 +361,7 @@ def list_recovery_queue(
             can_view_team=can_view_team, actor_user_id=actor.user_id,
         )
 
-    if min_days is not None:
-        rows = [r for r in rows if r.days_since_last_visit is not None and r.days_since_last_visit >= min_days]
-    if max_days is not None:
-        rows = [r for r in rows if r.days_since_last_visit is not None and r.days_since_last_visit <= max_days]
+    rows = _apply_day_filters(rows, min_days, max_days)
     if last_procedure_service_id is not None:
         rows = [r for r in rows if last_procedure_service_id in r.last_service_ids]
     if last_professional_id is not None:
@@ -376,6 +373,22 @@ def list_recovery_queue(
     start = (page - 1) * page_size
     page_items = rows[start : start + page_size]
     return RecoveryQueueResult(items=page_items, total=total, page=page, page_size=page_size)
+
+
+def _apply_day_filters(
+    rows: list[RecoveryQueueRow], min_days: int | None, max_days: int | None
+) -> list[RecoveryQueueRow]:
+    """Mesmo filtro de "dias sem retorno" usado pela listagem
+    (`list_recovery_queue`) e pelos indicadores (`get_recovery_summary`)
+    — extraído pra uma única função, nunca duplicado, pra garantir que
+    o card/contador da aba e a listagem SEMPRE concordem (correção do
+    bug relatado: Pendentes mostrava o universo elegível inteiro,
+    ignorando o filtro de dias que a listagem já aplicava)."""
+    if min_days is not None:
+        rows = [r for r in rows if r.days_since_last_visit is not None and r.days_since_last_visit >= min_days]
+    if max_days is not None:
+        rows = [r for r in rows if r.days_since_last_visit is not None and r.days_since_last_visit <= max_days]
+    return rows
 
 
 def _sort_rows(rows: list[RecoveryQueueRow], sort: str) -> list[RecoveryQueueRow]:
@@ -596,44 +609,42 @@ class RecoverySummary:
 
 
 def get_recovery_summary(
-    session: Session, actor: ActorContext, *, date_from: datetime, date_to: datetime
+    session: Session, actor: ActorContext, *, date_from: datetime, date_to: datetime,
+    min_days: int | None = None, max_days: int | None = None,
 ) -> RecoverySummary:
     """4 indicadores (item 3 do pedido). Pendentes/Em acompanhamento são
-    ESTOQUE atual (nunca dependem do período); Recuperados/Sem
-    interesse/`concluded_count` são HISTÓRICOS (ciclos cujo `closed_at`
-    cai dentro do período informado) — nunca misturados na mesma conta,
-    exatamente como pedido."""
+    ESTOQUE atual (nunca dependem do período `date_from`/`date_to`, que
+    só vale pros indicadores históricos abaixo) — mas RESPEITAM o
+    mesmo filtro de "dias sem retorno" (`min_days`/`max_days`) que a
+    listagem usa, pelo MESMO motivo de nunca duplicar regra: antes,
+    Pendentes/Acompanhamento contavam o universo elegível INTEIRO,
+    ignorando esse filtro — resultando no card mostrando 249 clientes
+    enquanto a listagem (com o filtro de 60+ dias aplicado) mostrava só
+    13. Agora os dois caminhos usam a MESMA `_list_pending_or_in_progress`
+    + `_apply_day_filters`, garantindo que card/contador da aba/listagem
+    sempre concordem pra qualquer valor de `min_days` (30/60/90/120/
+    personalizado). Recuperados/Sem interesse/`concluded_count` SÃO
+    HISTÓRICOS (ciclos cujo `closed_at` cai dentro do período
+    informado) — nunca misturados com o filtro de dias, que a UI nem
+    oferece pra Concluídos."""
     organization_id = actor.organization_id
     can_view_team = "clients.recovery.view_team" in actor.permissions
     assigned_user_id = None if can_view_team else actor.user_id
-
-    active_cycles = client_recovery_repo.list_by_org(
-        session, organization_id, statuses=_ACTIVE_CYCLE_STATUSES, assigned_user_id=assigned_user_id
-    )
     now = datetime.now(timezone.utc)
-    pending_count = 0
-    in_progress_count = 0
-    for cycle in active_cycles:
-        if _classify_subtab(cycle, now) == "pending":
-            pending_count += 1
-        else:
-            in_progress_count += 1
+    tz = _organization_timezone(session, organization_id)
 
-    # Clientes elegíveis SEM nenhum ciclo ainda também contam como
-    # "Pendentes" (item "calculado pelo backend, nunca pela página
-    # atual") — reaproveita a mesma listagem, só a contagem total.
-    pending_count += len(
-        [
-            r
-            for r in _list_pending_or_in_progress(
-                session, organization_id, subtab="pending", now=now,
-                tz=_organization_timezone(session, organization_id), search=None,
-                assigned_user_id=assigned_user_id, has_phone=None, overdue_only=False,
-                can_view_team=can_view_team, actor_user_id=actor.user_id,
-            )
-            if r.cycle is None
-        ]
+    pending_rows = _list_pending_or_in_progress(
+        session, organization_id, subtab="pending", now=now, tz=tz, search=None,
+        assigned_user_id=assigned_user_id, has_phone=None, overdue_only=False,
+        can_view_team=can_view_team, actor_user_id=actor.user_id,
     )
+    in_progress_rows = _list_pending_or_in_progress(
+        session, organization_id, subtab="in_progress", now=now, tz=tz, search=None,
+        assigned_user_id=assigned_user_id, has_phone=None, overdue_only=False,
+        can_view_team=can_view_team, actor_user_id=actor.user_id,
+    )
+    pending_count = len(_apply_day_filters(pending_rows, min_days, max_days))
+    in_progress_count = len(_apply_day_filters(in_progress_rows, min_days, max_days))
 
     closed_counts = client_recovery_repo.count_by_status_in_period(
         session, organization_id, date_from, date_to, assigned_user_id=assigned_user_id,

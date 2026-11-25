@@ -1396,6 +1396,142 @@ def test_mascaramento_financeiro_oculta_total_spent_sem_permissao(org_session):
 
 
 # ---------------------------------------------------------------------------
+# Consistência entre os cards/contadores e a listagem (bug relatado em
+# produção: card Pendentes mostrava o universo elegível inteiro — 249 —
+# enquanto a listagem, com o filtro de 60+ dias, mostrava só 13)
+# ---------------------------------------------------------------------------
+
+
+def test_card_pendentes_sem_filtro_conta_todo_o_universo_elegivel(org_session):
+    """Comportamento ORIGINAL preservado quando nenhum filtro de dias é
+    passado (compatibilidade — `min_days=None` continua devolvendo o
+    total irrestrito, igual antes do bug ser corrigido)."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    for days in (20, 65, 150):
+        _eligible_client(session, org_id, days=days)
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    listing = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=0)
+    assert summary.pending_count == 3
+    assert listing.total == 3
+
+
+@pytest.mark.parametrize("threshold", [30, 60, 90, 120])
+def test_card_pendentes_respeita_o_filtro_de_dias_selecionado(org_session, threshold):
+    """Card/contador da aba e listagem precisam SEMPRE concordar, pra
+    qualquer um dos atalhos oferecidos na UI (30/60/90/120) — nunca o
+    card mostrando o universo inteiro enquanto a listagem já filtra."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    # Clientes espalhados nos dois lados de cada um dos 4 limiares.
+    days_values = [10, 25, 35, 55, 65, 85, 95, 115, 125, 200]
+    for days in days_values:
+        _eligible_client(session, org_id, days=days)
+    expected = len([d for d in days_values if d >= threshold])
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+        min_days=threshold,
+    )
+    listing = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=threshold)
+
+    assert summary.pending_count == expected
+    assert listing.total == expected
+    assert summary.pending_count == listing.total  # a asserção central do bug relatado
+
+
+def test_card_pendentes_respeita_filtro_personalizado(org_session):
+    """"Personalizado" na UI é só um `min_days` arbitrário — precisa
+    funcionar igual aos atalhos fixos, pra qualquer valor digitado."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    days_values = [40, 47, 48, 70, 100]
+    for days in days_values:
+        _eligible_client(session, org_id, days=days)
+    custom_threshold = 48
+    expected = len([d for d in days_values if d >= custom_threshold])
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+        min_days=custom_threshold,
+    )
+    listing = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=custom_threshold)
+    assert summary.pending_count == expected == listing.total
+
+
+def test_card_acompanhamento_tambem_respeita_o_filtro_de_dias(org_session):
+    """Mesma consistência pro card "Em acompanhamento" — a linha "Sem
+    retorno há pelo menos" da UI também filtra a aba Acompanhamento,
+    nunca só Pendentes."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    days_values = [40, 70, 100]
+    for days in days_values:
+        client, *_ = _eligible_client(session, org_id, days=days)
+        recovery_service.log_contact(
+            session, actor, client.id, contact_channel=None,
+            contact_result=RecoveryContactResult.AWAITING_RESPONSE, notes=None,
+            next_contact_at=_NOW + timedelta(days=3), linked_appointment_id=None,
+        )
+    threshold = 60
+    expected = len([d for d in days_values if d >= threshold])
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+        min_days=threshold,
+    )
+    listing = recovery_service.list_recovery_queue(session, actor, subtab="in_progress", min_days=threshold)
+    assert summary.in_progress_count == expected == listing.total
+
+
+def test_contador_pendentes_considera_total_filtrado_independente_da_paginacao(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    for _ in range(5):
+        _eligible_client(session, org_id, days=65)
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+        min_days=60,
+    )
+    listing_page1 = recovery_service.list_recovery_queue(
+        session, actor, subtab="pending", min_days=60, page=1, page_size=2,
+    )
+    assert summary.pending_count == 5
+    assert listing_page1.total == 5  # total da população filtrada, nunca só os 2 da página
+    assert len(listing_page1.items) == 2  # a página em si continua paginada normalmente
+
+
+def test_indicadores_historicos_nunca_sao_afetados_pelo_filtro_de_dias(org_session):
+    """Recuperados/Sem interesse/Concluídos usam só `date_from`/
+    `date_to` — a UI nem oferece o filtro de dias pra essa aba, e
+    passar `min_days` nunca pode alterar esses 3 números."""
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    _recover_with_order(session, actor, org_id, price=Decimal("80.00"))
+    client2, *_ = _eligible_client(session, org_id)
+    recovery_service.log_contact(
+        session, actor, client2.id, contact_channel=None,
+        contact_result=RecoveryContactResult.NOT_INTERESTED, notes=None,
+        next_contact_at=None, linked_appointment_id=None,
+    )
+
+    summary_sem_filtro = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    summary_com_filtro = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+        min_days=60,
+    )
+    assert summary_sem_filtro.recovered_count == summary_com_filtro.recovered_count == 1
+    assert summary_sem_filtro.not_interested_count == summary_com_filtro.not_interested_count == 1
+    assert summary_sem_filtro.concluded_count == summary_com_filtro.concluded_count == 2
+
+
+# ---------------------------------------------------------------------------
 # Filtros por procedimento/profissional (aplicados antes da paginação)
 # ---------------------------------------------------------------------------
 
