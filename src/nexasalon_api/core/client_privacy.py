@@ -36,6 +36,15 @@ def client_can_view_contact(permissions: frozenset[str] | set[str]) -> bool:
     return CONTACT_PERMISSION in permissions
 
 
+def mask_phone_for_display(value: str | None) -> str | None:
+    """Wrapper público de `_mask_phone` — Central de Recuperação de
+    Clientes (`services/client_recovery.py`) não devolve um `ClientRead`
+    inteiro na linha da fila (schema próprio, mais enxuto), então não
+    passa por `apply_client_contact_masking`, mas precisa da MESMA
+    fórmula de máscara, nunca uma reimplementação paralela."""
+    return _mask_phone(value)
+
+
 def _mask_phone(value: str | None) -> str | None:
     """Mantém só os 4 últimos dígitos (`core/normalize.py` já garante
     que o valor armazenado é só dígitos) — suficiente pra reconhecer

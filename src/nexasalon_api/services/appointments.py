@@ -54,6 +54,7 @@ from nexasalon_api.schemas.appointment import (
 )
 from nexasalon_api.services import agenda_access, availability, public_booking
 from nexasalon_api.services import cash_register as cash_register_service
+from nexasalon_api.services import client_recovery as client_recovery_service
 from nexasalon_api.services.appointment_state_machine import (
     OPERATIONAL_STATUSES,
     assert_cancellable,
@@ -1114,6 +1115,9 @@ def _apply_status_change(
     )
     if new_status == AppointmentStatus.NO_SHOW:
         _auto_cancel_order_for_no_show(session, actor, appointment_id)
+        client_recovery_service.reopen_cycle_if_linked_appointment_cancelled(
+            session, actor.organization_id, appointment_id
+        )
 
 
 def update_notes(
@@ -1315,6 +1319,9 @@ def cancel_appointment(session: Session, actor: ActorContext, appointment_id: uu
         old_values={"status": old_status.value},
         new_values={"status": AppointmentStatus.CANCELLED.value, "change_type": "cancel"},
     )
+    client_recovery_service.reopen_cycle_if_linked_appointment_cancelled(
+        session, actor.organization_id, appointment_id
+    )
     return _reload(session, actor.organization_id, appointment_id)
 
 
@@ -1359,6 +1366,9 @@ def cancel_appointment_for_order_cancel(session: Session, actor: ActorContext, a
         new_values={
             "status": AppointmentStatus.CANCELLED.value, "change_type": "cancel_via_order_cancel",
         },
+    )
+    client_recovery_service.reopen_cycle_if_linked_appointment_cancelled(
+        session, actor.organization_id, appointment_id
     )
 
 
@@ -1817,6 +1827,7 @@ def cancel_by_customer(
             "customer_account_id": str(account_id), "reason": reason,
         },
     )
+    client_recovery_service.reopen_cycle_if_linked_appointment_cancelled(session, organization_id, appointment_id)
     return _reload(session, organization_id, appointment_id)
 
 

@@ -1,11 +1,17 @@
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from nexasalon_api.models.enums import OrderStatus
-from nexasalon_api.models.order import Order, sale_competence_expr
+from nexasalon_api.models.order import (
+    Order,
+    OrderItem,
+    OrderProductItem,
+    sale_competence_expr,
+)
 
 
 def get(session: Session, organization_id: uuid.UUID, order_id: uuid.UUID) -> Order | None:
@@ -100,6 +106,61 @@ def list_closed_for_clients(session: Session, organization_id: uuid.UUID, client
         .order_by(Order.closed_at.desc())
     )
     return list(session.scalars(stmt).all())
+
+
+def sum_charged_total_by_client(
+    session: Session, organization_id: uuid.UUID, client_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, Decimal]:
+    """"Total gasto" (Central de Recuperação de Clientes) em LOTE, uma
+    agregação SQL por tabela — nunca carregando `Order`/`OrderItem`
+    inteiros em Python pra organizações com milhares de clientes.
+    Replica em SQL a MESMA fórmula de `services/order_totals.py::
+    order_charged_total` (preço − benefício para serviços + quantidade*
+    preço unitário para produtos) — nunca `order_total()` (que ignora
+    benefício): "Total gasto" deve respeitar cortesia/fidelidade (nunca
+    contar como gasto do cliente a parte que foi concedida de graça).
+
+    Duas queries agrupadas (uma por `OrderItem`, outra por
+    `OrderProductItem`) em vez de uma só com JOIN das duas tabelas —
+    um JOIN direto multiplicaria linhas (fan-out) e inflaria a soma.
+    Resultado combinado em Python, por `client_id` (poucas linhas,
+    1 por cliente elegível — nunca por comanda/item)."""
+    if not client_ids:
+        return {}
+
+    services_stmt = (
+        select(
+            Order.client_id,
+            func.sum(OrderItem.price - func.coalesce(OrderItem.benefit_amount, 0)).label("total"),
+        )
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .where(
+            Order.organization_id == organization_id,
+            Order.client_id.in_(client_ids),
+            Order.status == OrderStatus.CLOSED,
+        )
+        .group_by(Order.client_id)
+    )
+    products_stmt = (
+        select(
+            Order.client_id,
+            func.sum(OrderProductItem.quantity * OrderProductItem.unit_price).label("total"),
+        )
+        .join(OrderProductItem, OrderProductItem.order_id == Order.id)
+        .where(
+            Order.organization_id == organization_id,
+            Order.client_id.in_(client_ids),
+            Order.status == OrderStatus.CLOSED,
+        )
+        .group_by(Order.client_id)
+    )
+
+    totals: dict[uuid.UUID, Decimal] = {}
+    for client_id, total in session.execute(services_stmt).all():
+        totals[client_id] = totals.get(client_id, Decimal(0)) + (total or Decimal(0))
+    for client_id, total in session.execute(products_stmt).all():
+        totals[client_id] = totals.get(client_id, Decimal(0)) + (total or Decimal(0))
+    return totals
 
 
 def _next_order_number(session: Session, organization_id: uuid.UUID) -> int:

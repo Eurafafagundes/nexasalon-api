@@ -26,6 +26,15 @@ class MembershipStatus(str, Enum):
 class CommissionType(str, Enum):
     PERCENTAGE = "percentage"
     FIXED = "fixed"
+    # Etapa "Comissão condicional" (migration 0053/0054) — só válido em
+    # `ProfessionalService.commission_type` (config); NUNCA aparece em
+    # `OrderItem.commission_type_snapshot` (o snapshot sempre grava o
+    # SUB-TIPO resolvido, `fixed`/`percentage`, nunca `conditional` —
+    # ver `services/commissions.py::resolve_commission`) nem em
+    # `Service.deposit_type` (bloqueado no schema, ver
+    # `schemas/service.py`). Mesmo enum Postgres reaproveitado nos 3
+    # lugares — `conditional` só tem significado real no primeiro.
+    CONDITIONAL = "conditional"
 
 
 class CommissionStatus(str, Enum):
@@ -479,6 +488,70 @@ class InventoryCountStatus(str, Enum):
 
     OPEN = "open"
     CLOSED = "closed"
+
+
+class RecoveryCycleStatus(str, Enum):
+    """Estado operacional ATUAL de um `ClientRecoveryCycle` — item
+    "Central de Recuperação de Clientes". `PENDING`/`IN_PROGRESS` são os
+    dois únicos status considerados ATIVOS (índice único parcial em
+    `client_recovery_cycles` garante no banco que só existe 1 ciclo
+    ativo por cliente/organização); todos os demais são terminais —
+    encerram o ciclo (`closed_at` preenchido), mas o cliente pode
+    reentrar na fila depois com um ciclo NOVO (nunca reabrindo o mesmo),
+    exceto `OPTED_OUT`, que bloqueia reentrada automática até alteração
+    explícita da preferência no próprio `Client`.
+
+    `SCHEDULED` nunca é alcançado só escolhendo a opção manualmente —
+    exige `linked_appointment_id` apontando pra um `Appointment` real
+    (ver `services/client_recovery.py::schedule_return`). Só vira
+    `RECOVERED` quando esse agendamento é efetivamente atendido (comanda
+    fecha); se for cancelado/virar falta antes disso, o ciclo volta
+    automaticamente pra `PENDING` (nunca fica preso em `SCHEDULED`)."""
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    SCHEDULED = "scheduled"
+    RECOVERED = "recovered"
+    LOST = "lost"
+    INVALID_PHONE = "invalid_phone"
+    OPTED_OUT = "opted_out"
+    CANCELLED = "cancelled"
+
+
+class RecoveryEventType(str, Enum):
+    """Tipo de cada linha IMUTÁVEL em `client_recovery_events` — histórico
+    append-only, nunca update/delete (mesmo padrão de `AuditLog`)."""
+
+    CREATED = "created"
+    CONTACT_LOGGED = "contact_logged"
+    REASSIGNED = "reassigned"
+    STATUS_CHANGED = "status_changed"
+    APPOINTMENT_LINKED = "appointment_linked"
+    REOPENED = "reopened"
+    CLOSED = "closed"
+
+
+class RecoveryContactChannel(str, Enum):
+    WHATSAPP = "whatsapp"
+    CALL = "call"
+    INSTAGRAM = "instagram"
+    IN_PERSON = "in_person"
+    OTHER = "other"
+
+
+class RecoveryContactResult(str, Enum):
+    """Resultado escolhido no modal "Registrar contato" — cada valor
+    determina a transição de `RecoveryCycleStatus` em
+    `services/client_recovery.py::log_contact` (seção 12 do pedido)."""
+
+    AWAITING_RESPONSE = "awaiting_response"
+    INTERESTED = "interested"
+    CALL_LATER = "call_later"
+    RETURN_SCHEDULED = "return_scheduled"
+    NOT_INTERESTED = "not_interested"
+    INVALID_PHONE = "invalid_phone"
+    OPTED_OUT = "opted_out"
+    UNREACHABLE = "unreachable"
 
 
 def pg_enum(enum_cls, name: str):

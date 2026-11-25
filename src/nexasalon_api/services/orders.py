@@ -96,6 +96,7 @@ from nexasalon_api.schemas.order import (
 from nexasalon_api.services import appointments as appointments_service
 from nexasalon_api.services import availability as availability_service
 from nexasalon_api.services import cash_register as cash_register_service
+from nexasalon_api.services import client_recovery as client_recovery_service
 from nexasalon_api.services import commissions as commissions_service
 from nexasalon_api.services import order_totals
 from nexasalon_api.services import payment_fees as payment_fees_service
@@ -1055,6 +1056,13 @@ def close_order(session: Session, actor: ActorContext, order_id: uuid.UUID, data
     order.closed_at = datetime.now(timezone.utc)
     order.closed_by = actor.user_id
 
+    # Central de Recuperação de Clientes — se este Appointment é o
+    # retorno vinculado a um ciclo `scheduled`, fechar a comanda é o
+    # momento em que o atendimento foi de fato REALIZADO (nunca só
+    # agendado) — só agora o ciclo vira `recovered`. Nunca faz nada se
+    # não houver ciclo vinculado (caminho comum).
+    client_recovery_service.mark_recovered_if_linked_appointment_completed(session, actor, order.appointment_id)
+
     # Regularização temporária de vendas antigas (migration 0055) —
     # `data.sale_date` só vem preenchido quando o usuário
     # conscientemente escolheu uma "Data da venda" diferente da data
@@ -1294,6 +1302,7 @@ def close_orders_consolidated(
         order.status = OrderStatus.CLOSED
         order.closed_at = now
         order.closed_by = actor.user_id
+        client_recovery_service.mark_recovered_if_linked_appointment_completed(session, actor, order.appointment_id)
     session.flush()
 
     sibling_numbers = [o.order_number for o in orders_by_number]

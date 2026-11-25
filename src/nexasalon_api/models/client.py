@@ -1,8 +1,8 @@
 import uuid
-from datetime import date
+from datetime import date, datetime
 
 from sqlalchemy import Boolean, Date, ForeignKey, Index, String
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import TIMESTAMP, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, TimestampMixin, UUIDPKMixin
@@ -90,3 +90,14 @@ class Client(Base, UUIDPKMixin, TimestampMixin):
     address_number: Mapped[str | None] = mapped_column(String(20))
     complement: Mapped[str | None] = mapped_column(String(120))
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    # Preferência de "não receber contatos comerciais" (Central de
+    # Recuperação de Clientes) — pertence ao CLIENTE, não a um ciclo de
+    # recuperação específico (item explícito do pedido): um ciclo
+    # encerrado como "opted_out" fica preso no passado, mas a preferência
+    # em si precisa sobreviver a qualquer ciclo futuro, bloqueando nova
+    # abordagem comercial até alteração explícita e auditada (nunca
+    # confundir com `is_active`/arquivamento do cliente, nem com bloqueio
+    # de mensagens TRANSACIONAIS necessárias ao atendimento — ex.:
+    # confirmação do próprio agendamento, que continua funcionando).
+    commercial_contact_opt_out_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    commercial_contact_opt_out_reason: Mapped[str | None] = mapped_column(String(255))

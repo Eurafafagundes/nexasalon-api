@@ -18,6 +18,7 @@ from .professional import Professional, WorkingHours, ScheduleBlock  # noqa: F40
 from .service import Service, ServiceCategory, ProfessionalService  # noqa: F401
 from .client import Client  # noqa: F401
 from .client_observation import ClientObservation  # noqa: F401
+from .client_recovery import ClientRecoveryCycle, ClientRecoveryEvent, OrganizationRecoverySettings  # noqa: F401
 from .customer_account import CustomerAccount, CustomerAccountLink, CustomerRefreshToken  # noqa: F401
 from .appointment import Recurrence, Appointment, AppointmentItem  # noqa: F401
 from .appointment_status_style import AppointmentStatusStyle  # noqa: F401
@@ -55,6 +56,9 @@ __all__ = [
     "ProfessionalService",
     "Client",
     "ClientObservation",
+    "ClientRecoveryCycle",
+    "ClientRecoveryEvent",
+    "OrganizationRecoverySettings",
     "CustomerAccount",
     "CustomerAccountLink",
     "CustomerRefreshToken",

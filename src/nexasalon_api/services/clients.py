@@ -27,7 +27,7 @@ from nexasalon_api.services import order_totals
 # pra contar faltas/cancelamentos. Deliberadamente diferente de
 # `appointment_state_machine.OPERATIONAL_STATUSES` (que inclui
 # FINISHED/NO_SHOW — serve outro propósito, mudança de status em lote).
-_UPCOMING_STATUSES = frozenset(
+UPCOMING_APPOINTMENT_STATUSES = frozenset(
     {
         AppointmentStatus.SCHEDULED,
         AppointmentStatus.CONFIRMED,
@@ -213,7 +213,18 @@ def get_client_history(session: Session, organization_id: uuid.UUID, client_id: 
     # MESMO bug (produto excluído) tinha voltado a acontecer em
     # `services/dashboard.py`/`services/extract.py` justamente porque
     # a fórmula não era centralizada.
-    total_spent = sum((order_totals.order_total(o) for o in orders), Decimal("0"))
+    #
+    # Central de Recuperação de Clientes: "Total gasto" passou a usar
+    # `order_charged_total` (preço − benefício), nunca `order_total`
+    # (valor econômico cheio, ignora benefício/cortesia/fidelidade) —
+    # decisão explícita pra "Total gasto" nunca contar como gasto do
+    # cliente a parte de um serviço concedida de graça. Única definição
+    # de "Total gasto" do sistema: a mesma fórmula é usada aqui (Ficha do
+    # Cliente → Resumo) e na listagem em lote de
+    # `services/client_recovery.py` — nunca duas contas diferentes pro
+    # mesmo conceito. `order_total` (bruto) continua sendo a base de
+    # Faturamento/Extrato/Dashboard, nunca mudou.
+    total_spent = sum((order_totals.order_charged_total(o) for o in orders), Decimal("0"))
     return ClientSummary(
         client_since=client.created_at, visits_count=len(orders), total_spent=total_spent, orders=orders
     )
@@ -263,7 +274,7 @@ def list_clients_with_summary(
     for appointment in appointment_repo.list_for_clients(session, organization_id, client_ids):
         if appointment.status == AppointmentStatus.NO_SHOW:
             has_no_show[appointment.client_id] = True
-        if appointment.status in _UPCOMING_STATUSES and appointment.starts_at is not None:
+        if appointment.status in UPCOMING_APPOINTMENT_STATUSES and appointment.starts_at is not None:
             current = next_appointment_at.get(appointment.client_id)
             if current is None or appointment.starts_at < current:
                 next_appointment_at[appointment.client_id] = appointment.starts_at
@@ -329,7 +340,7 @@ def get_client_profile(session: Session, actor: ActorContext, client_id: uuid.UU
     no_show_count = sum(1 for a in timeline if a.status == AppointmentStatus.NO_SHOW)
     cancelled_count = sum(1 for a in timeline if a.status == AppointmentStatus.CANCELLED)
     upcoming = sorted(
-        (a for a in timeline if a.status in _UPCOMING_STATUSES and a.starts_at is not None),
+        (a for a in timeline if a.status in UPCOMING_APPOINTMENT_STATUSES and a.starts_at is not None),
         key=lambda a: a.starts_at,
     )
     next_appointment = upcoming[0] if upcoming else None
