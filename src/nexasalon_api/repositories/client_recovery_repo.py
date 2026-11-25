@@ -107,8 +107,10 @@ def list_all_for_clients(
     """TODOS os ciclos (qualquer status) de vários clientes de uma vez —
     usado pela lógica de reentrada (`services/client_recovery.py`) pra
     decidir, por cliente, se existe um ciclo ATIVO, ou se o ciclo mais
-    recente encerrado ainda bloqueia reentrada (`suppressed_until`/
-    `opted_out`). Em lote, nunca 1 query por cliente."""
+    recente encerrado como `lost` ainda bloqueia reentrada (só libera
+    com uma visita nova de verdade — ver `_is_blocked_from_new_cycle`)
+    ou como `opted_out` (bloqueio permanente). Em lote, nunca 1 query
+    por cliente."""
     if not client_ids:
         return []
     stmt = select(ClientRecoveryCycle).where(

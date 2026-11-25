@@ -448,19 +448,7 @@ def test_nao_permite_dois_ciclos_ativos_para_o_mesmo_cliente(org_session):
 
 
 def test_concorrencia_real_entre_duas_recepcionistas_criando_o_primeiro_ciclo(org_session):
-    """Corrida real com DUAS conexões/threads de verdade (não só duas
-    chamadas sequenciais na mesma sessão, que nunca exercitam o
-    `IntegrityError`) — auditoria pós-V3: `get_active_for_client_for_
-    update` com `FOR UPDATE` não trava nada quando não existe NENHUMA
-    linha pra travar, então duas recepcionistas registrando o PRIMEIRO
-    contato do MESMO cliente ao mesmo tempo passam as duas por
-    `existing is None`. A thread B é deliberadamente forçada a tentar o
-    próprio INSERT enquanto a thread A já deu `flush` mas ainda não
-    comitou — o Postgres bloqueia o INSERT de B no índice único parcial
-    até A comitar, e só então B descobre a violação de verdade. Prova
-    que o tratamento em `log_contact` funciona sob concorrência real
-    (nunca 2 ciclos, nunca uma excessão não tratada, nunca perde o
-    contato de quem "perde" a corrida)."""
+    """Dois contatos concorrentes registram seus eventos no mesmo ciclo."""
     session, org_id = org_session
     client, *_ = _eligible_client(session, org_id)
     # Captura o id ANTES do commit (nunca depois): `commit()` expira os
@@ -503,9 +491,7 @@ def test_concorrencia_real_entre_duas_recepcionistas_criando_o_primeiro_ciclo(or
             with SessionLocal() as s:
                 s.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_id)})
                 actor_b = _actor(s, org_id)
-                # Libera o commit da A só depois de dar tempo da B já
-                # estar bloqueada tentando o próprio INSERT no lock da
-                # linha (ainda não comitada) da A.
+                # Mantém a primeira transação aberta enquanto B tenta registrar o contato.
                 threading.Timer(0.3, a_may_commit.set).start()
                 cycle = recovery_service.log_contact(
                     s, actor_b, client_id, contact_channel=None,
@@ -545,21 +531,332 @@ def test_concorrencia_real_entre_duas_recepcionistas_criando_o_primeiro_ciclo(or
     assert notes_recorded == {"recepcionista A", "recepcionista B"}
 
 
-def test_sem_interesse_aplica_pausa_e_bloqueia_reentrada_ate_o_prazo(org_session):
+def test_sem_interesse_encerra_imediatamente_e_remove_da_fila(org_session):
+    """Renomeado "Sem interesse no momento" → "Sem interesse" — a
+    carência temporária de 60 dias foi ELIMINADA por completo; o ciclo
+    encerra de vez, sem nenhum campo de tempo controlando reentrada."""
     session, org_id = org_session
     actor = _actor(session, org_id)
     client, *_ = _eligible_client(session, org_id)
 
-    recovery_service.log_contact(
-        session, actor, client.id, contact_channel=RecoveryContactChannel.CALL,
+    cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.NOT_INTERESTED, notes="Não quer mais vir",
+        next_contact_at=None, linked_appointment_id=None,
+    )
+    assert cycle.status == RecoveryCycleStatus.LOST
+    assert cycle.closed_at is not None
+    assert cycle.suppressed_until is None  # nunca mais escrito
+
+    pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=0)
+    assert pending.items == []
+    in_progress = recovery_service.list_recovery_queue(session, actor, subtab="in_progress")
+    assert in_progress.items == []
+    concluded = recovery_service.list_recovery_queue(
+        session, actor, subtab="concluded", concluded_statuses=frozenset({RecoveryCycleStatus.LOST}),
+    )
+    assert [r.client.id for r in concluded.items] == [client.id]
+
+
+@pytest.mark.parametrize("days_elapsed", [60, 90, 120, 365])
+def test_cliente_recusada_nunca_retorna_so_por_tempo_decorrido(org_session, days_elapsed):
+    """Nenhum prazo, por maior que seja, desbloqueia sozinho — só uma
+    visita NOVA de verdade (depois do encerramento do ciclo) libera a
+    reentrada. Testado explicitamente em 60/90/120/365 dias."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    # Última visita BEM mais antiga que qualquer offset testado (até
+    # 365 dias) — senão, empurrar `closed_at` pra trás acabaria
+    # deixando o encerramento ANTES da própria visita original (uma
+    # inversão temporal artificial do teste, nunca um cenário real).
+    client, *_ = _eligible_client(session, org_id, days=400)
+    cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
         contact_result=RecoveryContactResult.NOT_INTERESTED, notes=None,
         next_contact_at=None, linked_appointment_id=None,
     )
-    pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=60)
+    # Simula o encerramento tendo acontecido há muito tempo, sem
+    # precisar esperar o relógio de verdade correr.
+    cycle.closed_at = _NOW - timedelta(days=days_elapsed)
+    session.flush()
+
+    pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=0)
     assert pending.items == []
+    with pytest.raises(ValidationDomainError):
+        recovery_service.log_contact(
+            session, actor, client.id, contact_channel=None,
+            contact_result=RecoveryContactResult.AWAITING_RESPONSE, notes=None,
+            next_contact_at=_NOW + timedelta(days=3), linked_appointment_id=None,
+        )
+
+
+def test_alterar_filtros_nunca_desbloqueia_cliente_recusada(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    client, *_ = _eligible_client(session, org_id, days=65)
+    recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.NOT_INTERESTED, notes=None,
+        next_contact_at=None, linked_appointment_id=None,
+    )
+    for min_days in (0, 30, 60, 90, 120):
+        result = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=min_days)
+        assert result.items == []
+
+
+def test_agendamento_sem_comparecimento_nunca_desbloqueia_cliente_recusada(org_session):
+    """Agendar (e até faltar) nunca move `last_visit_at` — só uma
+    comanda FECHADA de verdade conta como visita nova."""
+    from nexasalon_api.services import appointments as appointments_service
+
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=frozenset({
+        "clients.recovery.view", "clients.recovery.manage", "clients.recovery.view_team",
+        "agenda.edit", "agenda.view_all",
+    }))
+    client, branch, prof, svc = _eligible_client(session, org_id)
+    recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.NOT_INTERESTED, notes=None,
+        next_contact_at=None, linked_appointment_id=None,
+    )
+    future_appt = _appointment(session, org_id, branch.id, client.id, prof.id, svc.id, start_at=_NOW + timedelta(hours=2))
+    appointments_service.update_status(session, actor, future_appt.id, AppointmentStatus.NO_SHOW)
+
+    pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=0)
+    assert pending.items == []
+    with pytest.raises(ValidationDomainError):
+        recovery_service.log_contact(
+            session, actor, client.id, contact_channel=None,
+            contact_result=RecoveryContactResult.AWAITING_RESPONSE, notes=None,
+            next_contact_at=_NOW + timedelta(days=3), linked_appointment_id=None,
+        )
+
+
+def test_novo_atendimento_exige_novo_periodo_de_inatividade(org_session, monkeypatch):
+    from nexasalon_api.api.v1 import client_recovery as recovery_api
+    from nexasalon_api.schemas.client_recovery import ContactLogCreate
+
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    client, branch, prof, svc = _eligible_client(session, org_id)
+    old_cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.NOT_INTERESTED, notes="Primeira recusa",
+        next_contact_at=None, linked_appointment_id=None,
+    )
+
+    # Sem visita nova ainda -> continua bloqueada, inclusive pra abrir
+    # ciclo direto pelo service (nunca só uma restrição de UI).
+    with pytest.raises(ValidationDomainError):
+        recovery_service.log_contact(
+            session, actor, client.id, contact_channel=None,
+            contact_result=RecoveryContactResult.AWAITING_RESPONSE, notes=None,
+            next_contact_at=_NOW + timedelta(days=3), linked_appointment_id=None,
+        )
+
+    visit_at = old_cycle.closed_at + timedelta(seconds=1)
+    _visit(session, org_id, branch.id, client.id, prof.id, svc.id, closed_at=visit_at)
+    recovery_service.update_settings(
+        session, actor, default_no_return_days=7, default_follow_up_days=None,
+        default_snooze_days=None, whatsapp_message_template=None,
+    )
+
+    class TestClock(datetime):
+        current = visit_at + timedelta(days=6)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr(recovery_service, "datetime", TestClock)
+    assert recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=0).items == []
+    with pytest.raises(ValidationDomainError):
+        recovery_api.log_contact(
+            client.id,
+            ContactLogCreate(
+                contact_result=RecoveryContactResult.AWAITING_RESPONSE,
+                next_contact_at=TestClock.current + timedelta(days=3),
+            ),
+            session=session, actor=actor,
+        )
+
+    TestClock.current = visit_at + timedelta(days=7)
+    pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=0)
+    assert [row.client.id for row in pending.items] == [client.id]
+    new_cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.AWAITING_RESPONSE, notes="Novo ciclo após nova visita",
+        next_contact_at=TestClock.current + timedelta(days=3), linked_appointment_id=None,
+    )
+    assert new_cycle.id != old_cycle.id  # ciclo NOVO, nunca reabre o antigo
+
+    refreshed_old = client_recovery_repo.get(session, org_id, old_cycle.id)
+    assert refreshed_old.status == RecoveryCycleStatus.LOST  # histórico intacto
+    cycles = client_recovery_repo.list_all_for_clients(session, org_id, [client.id])
+    assert len(cycles) == 2
+    assert {c.status for c in cycles} == {RecoveryCycleStatus.LOST, RecoveryCycleStatus.IN_PROGRESS}
+
+
+def test_bloqueio_permanente_independe_da_regra_de_sem_interesse(org_session):
+    """Opt-out continua respeitado mesmo após uma visita nova — bem
+    diferente de "sem interesse", que libera com visita nova."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    client, branch, prof, svc = _eligible_client(session, org_id)
+    recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.OPTED_OUT, notes=None,
+        next_contact_at=None, linked_appointment_id=None,
+    )
+    session.refresh(client)
+    assert client.commercial_contact_opt_out_at is not None
+
+    _visit(session, org_id, branch.id, client.id, prof.id, svc.id, closed_at=datetime.now(timezone.utc) + timedelta(seconds=1))
+    pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=0)
+    assert pending.items == []
+    with pytest.raises(ValidationDomainError):
+        recovery_service.log_contact(
+            session, actor, client.id, contact_channel=None,
+            contact_result=RecoveryContactResult.AWAITING_RESPONSE, notes=None,
+            next_contact_at=_NOW + timedelta(days=3), linked_appointment_id=None,
+        )
+
+
+def test_opt_out_de_cliente_ja_recusada_nunca_e_bloqueado(org_session):
+    """Item explícito: o bloqueio permanente precisa SEMPRE poder ser
+    aplicado, inclusive pra um cliente já `lost` sem visita nova — a
+    regra de "sem interesse" nunca pode impedir o opt-out em si."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    client, *_ = _eligible_client(session, org_id)
+    recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.NOT_INTERESTED, notes=None,
+        next_contact_at=None, linked_appointment_id=None,
+    )
+
+    cycle = recovery_service.log_contact(  # nunca levanta, mesmo bloqueada por "lost"
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.OPTED_OUT, notes="Pediu pra não ligarem mais",
+        next_contact_at=None, linked_appointment_id=None,
+    )
+    assert cycle.status == RecoveryCycleStatus.OPTED_OUT
+    session.refresh(client)
+    assert client.commercial_contact_opt_out_at is not None
+
+
+def test_mesmo_cliente_sem_interesse_2x_no_periodo_conta_1x_no_indicador(org_session, monkeypatch):
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    client, branch, prof, svc = _eligible_client(session, org_id)
+    cycle1 = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.NOT_INTERESTED, notes="Recusa 1",
+        next_contact_at=None, linked_appointment_id=None,
+    )
+    visit_at = cycle1.closed_at + timedelta(seconds=1)
+    _visit(session, org_id, branch.id, client.id, prof.id, svc.id, closed_at=visit_at)
+
+    class TestClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (visit_at + timedelta(days=61)).astimezone(tz)
+
+    monkeypatch.setattr(recovery_service, "datetime", TestClock)
+    cycle2 = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.NOT_INTERESTED, notes="Recusa 2",
+        next_contact_at=None, linked_appointment_id=None,
+    )
+    assert cycle1.id != cycle2.id
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=visit_at + timedelta(days=62),
+    )
+    assert summary.not_interested_count == 1  # cliente distinto, uma única vez
+    assert summary.concluded_count == 2  # os 2 ciclos continuam contando aqui
 
     cycles = client_recovery_repo.list_all_for_clients(session, org_id, [client.id])
-    assert cycles[0].suppressed_until > _NOW + timedelta(days=59)  # carência atual: 60 dias
+    assert len(cycles) == 2
+    assert {c.status for c in cycles} == {RecoveryCycleStatus.LOST}
+
+
+@pytest.mark.parametrize("has_active_cycle", [False, True])
+def test_concorrencia_entre_recusa_e_outro_contato_simultaneo(org_session, has_active_cycle):
+    """O contato concorrente deve respeitar a recusa mesmo no primeiro ciclo."""
+    session, org_id = org_session
+    client, *_ = _eligible_client(session, org_id)
+    client_id = client.id  # captura ANTES do commit — ver comentário equivalente acima
+    if has_active_cycle:
+        recovery_service.log_contact(
+            session, _actor(session, org_id), client_id, contact_channel=None,
+            contact_result=RecoveryContactResult.AWAITING_RESPONSE, notes="contato inicial",
+            next_contact_at=_NOW + timedelta(days=3), linked_appointment_id=None,
+        )
+    session.commit()
+
+    results: dict[str, object] = {}
+    errors: dict[str, Exception] = {}
+    a_done = threading.Event()
+    a_may_commit = threading.Event()
+
+    def worker_a() -> None:
+        try:
+            with SessionLocal() as s:
+                s.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_id)})
+                actor_a = _actor(s, org_id)
+                cycle = recovery_service.log_contact(
+                    s, actor_a, client_id, contact_channel=None,
+                    contact_result=RecoveryContactResult.NOT_INTERESTED, notes="recusa concorrente",
+                    next_contact_at=None, linked_appointment_id=None,
+                )
+                results["a_status"] = cycle.status
+                a_done.set()
+                a_may_commit.wait(timeout=10)
+                s.commit()
+        except Exception as exc:
+            errors["a"] = exc
+            a_done.set()
+
+    def worker_b() -> None:
+        try:
+            assert a_done.wait(timeout=10), "thread A nunca sinalizou — timeout"
+            with SessionLocal() as s:
+                s.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_id)})
+                actor_b = _actor(s, org_id)
+                threading.Timer(0.3, a_may_commit.set).start()
+                try:
+                    cycle = recovery_service.log_contact(
+                        s, actor_b, client_id, contact_channel=None,
+                        contact_result=RecoveryContactResult.AWAITING_RESPONSE, notes="tentativa concorrente",
+                        next_contact_at=_NOW + timedelta(days=5), linked_appointment_id=None,
+                    )
+                    results["b_status"] = cycle.status
+                    s.commit()
+                except ValidationDomainError as exc:
+                    results["b_rejected"] = str(exc)
+        except Exception as exc:
+            errors["b"] = exc
+            a_may_commit.set()
+
+    t_a = threading.Thread(target=worker_a)
+    t_b = threading.Thread(target=worker_b)
+    t_a.start()
+    t_b.start()
+    t_a.join(timeout=20)
+    t_b.join(timeout=20)
+
+    assert not errors, f"erro inesperado numa das threads (nunca deveria propagar): {errors}"
+    assert results.get("a_status") == RecoveryCycleStatus.LOST
+    assert "b_rejected" in results  # B foi rejeitada, nunca sobrescreveu nem duplicou
+    assert "b_status" not in results
+
+    with SessionLocal() as verify_session:
+        verify_session.execute(text("SELECT set_config('app.current_org_id', :oid, false)"), {"oid": str(org_id)})
+        cycles = client_recovery_repo.list_all_for_clients(verify_session, org_id, [client_id])
+        assert len(cycles) == 1  # nunca duplicou
+        assert cycles[0].status == RecoveryCycleStatus.LOST  # nunca foi sobrescrita
 
 
 def test_nao_deseja_contato_bloqueia_whatsapp_e_reentrada_permanentemente(org_session):
@@ -1023,14 +1320,23 @@ def test_escopo_de_equipe_aplica_igual_a_recuperados(org_session):
     assert summary_restricted.recovered_count == 1
 
 
-def test_mesmo_cliente_recuperado_2x_no_periodo_conta_1x_no_indicador(org_session):
+def test_mesmo_cliente_recuperado_2x_no_periodo_conta_1x_no_indicador(org_session, monkeypatch):
     """Item explícito do pedido: 2 ciclos `recovered` do MESMO cliente no
     mesmo período contam 1x em `recovered_count` (clientes distintos),
     mas 2x em `concluded_count` (ciclos) — ambos os ciclos continuam
     visíveis no histórico."""
     session, org_id = org_session
     actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
-    client, cycle1, _order1 = _recover_with_order(session, actor, org_id, price=Decimal("90.00"))
+    client, cycle1, order1 = _recover_with_order(session, actor, org_id, price=Decimal("90.00"))
+    second_cycle_at = order1.closed_at + timedelta(days=61)
+
+    class TestClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return second_cycle_at.astimezone(tz)
+
+    monkeypatch.setattr(recovery_service, "datetime", TestClock)
+    monkeypatch.setattr(orders_service, "datetime", TestClock)
 
     # Cliente é recuperado uma SEGUNDA vez dentro do mesmo período —
     # ciclo NOVO (o primeiro já é terminal/`recovered`), nunca reabre o
@@ -1040,7 +1346,7 @@ def test_mesmo_cliente_recuperado_2x_no_periodo_conta_1x_no_indicador(org_sessio
     svc = _service(session, org_id)
     future_appt = _appointment(
         session, org_id, branch.id, client.id, prof.id, svc.id,
-        start_at=_NOW + timedelta(hours=3), price=Decimal("90.00"),
+        start_at=second_cycle_at + timedelta(hours=3), price=Decimal("90.00"),
     )
     recovery_service.log_contact(
         session, actor, client.id, contact_channel=RecoveryContactChannel.WHATSAPP,
@@ -1060,7 +1366,7 @@ def test_mesmo_cliente_recuperado_2x_no_periodo_conta_1x_no_indicador(org_sessio
     )
 
     summary = recovery_service.get_recovery_summary(
-        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=second_cycle_at + timedelta(days=1),
     )
     assert summary.recovered_count == 1  # cliente distinto, uma única vez
     assert summary.concluded_count == 2  # os 2 ciclos continuam contando aqui

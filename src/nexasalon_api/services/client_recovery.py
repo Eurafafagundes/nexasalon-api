@@ -41,11 +41,12 @@ real. Conceitos-chave:
     bundle do navegador)."""
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -103,9 +104,16 @@ _CONCLUDED_STATUSES = frozenset(
 
 _DEFAULT_NO_RETURN_DAYS = 60
 _DEFAULT_FOLLOW_UP_DAYS = 3
-# Carência para reentrada na fila após "sem interesse no momento" — única
-# constante que controla isso (centralizada, nunca espalhada em números
-# mágicos); organizações podem sobrescrever via Configurações.
+# VESTIGIAL (ajuste "Recusou, encerrou"): a carência temporária de
+# reentrada após "Sem interesse" foi ELIMINADA por completo — "sem
+# interesse" agora só desbloqueia com uma visita nova de verdade,
+# nunca por tempo decorrido (ver `_is_blocked_from_new_cycle`). Este
+# valor nunca mais é lido por nenhuma regra; mantido só porque
+# organizações já podem ter uma linha salva em
+# `organization_recovery_settings.default_snooze_days` (nunca excluído
+# — "não excluir configurações armazenadas desnecessariamente"), e o
+# campo continua existindo na leitura/escrita da API por
+# compatibilidade. A tela de Configurações não oferece mais este campo.
 _DEFAULT_SNOOZE_DAYS = 60
 _DEFAULT_WHATSAPP_TEMPLATE = (
     "Olá, {first_name}! Tudo bem? Aqui é {attendant_name}, do {business_name}. Faz um "
@@ -145,6 +153,9 @@ _TERMINAL_RESULTS = frozenset(
 class RecoverySettingsData:
     default_no_return_days: int
     default_follow_up_days: int
+    # VESTIGIAL — nunca mais aplicado a nenhuma regra (ver
+    # `_is_blocked_from_new_cycle`); mantido só pra não descartar
+    # configuração já salva por alguma organização.
     default_snooze_days: int
     whatsapp_message_template: str
 
@@ -273,12 +284,40 @@ def _most_relevant_cycle(cycles: list[ClientRecoveryCycle]) -> tuple[ClientRecov
     return active, most_recent
 
 
-def _is_blocked_from_pending(client: Client, most_recent_cycle: ClientRecoveryCycle | None, now: datetime) -> bool:
-    return client.commercial_contact_opt_out_at is not None or (
-        most_recent_cycle is not None
-        and most_recent_cycle.suppressed_until is not None
-        and most_recent_cycle.suppressed_until > now
-    )
+def _is_blocked_from_new_cycle(
+    client: Client, most_recent_cycle: ClientRecoveryCycle | None, last_visit_at: datetime | None,
+    *, now: datetime, tz: ZoneInfo, no_return_days: int,
+) -> bool:
+    """Aplica a recusa e o prazo de inatividade a partir da última comanda fechada."""
+    if client.commercial_contact_opt_out_at is not None:
+        return True
+    if most_recent_cycle is None:
+        return False
+    if last_visit_at is None:
+        return True
+    if most_recent_cycle.status == RecoveryCycleStatus.LOST and (
+        most_recent_cycle.closed_at is None or last_visit_at <= most_recent_cycle.closed_at
+    ):
+        return True
+    return _days_between(last_visit_at, now, tz) < no_return_days
+
+
+def _assert_can_start_new_cycle(
+    session: Session, organization_id: uuid.UUID, client: Client, now: datetime
+) -> None:
+    all_cycles = client_recovery_repo.list_all_for_clients(session, organization_id, [client.id])
+    _, most_recent_cycle = _most_relevant_cycle(all_cycles)
+    closed_orders = order_repo.list_closed_for_clients(session, organization_id, [client.id])
+    last_visit_at = closed_orders[0].closed_at if closed_orders else None
+    if _is_blocked_from_new_cycle(
+        client, most_recent_cycle, last_visit_at, now=now,
+        tz=_organization_timezone(session, organization_id),
+        no_return_days=get_effective_settings(session, organization_id).default_no_return_days,
+    ):
+        raise ValidationDomainError(
+            "Cliente indisponível para um novo ciclo de recuperação. Verifique o prazo de "
+            "inatividade, se houve novo atendimento após a recusa e a preferência de contato."
+        )
 
 
 def list_recovery_queue(
@@ -403,6 +442,7 @@ def _list_pending_or_in_progress(
     for cycle in client_recovery_repo.list_all_for_clients(session, organization_id, client_ids):
         cycles_by_client.setdefault(cycle.client_id, []).append(cycle)
 
+    no_return_days = get_effective_settings(session, organization_id).default_no_return_days
     rows: list[RecoveryQueueRow] = []
     for client in clients:
         order = last_closed_order.get(client.id)
@@ -413,7 +453,9 @@ def _list_pending_or_in_progress(
         active_cycle, most_recent_cycle = _most_relevant_cycle(cycles)
 
         if active_cycle is None:
-            if _is_blocked_from_pending(client, most_recent_cycle, now):
+            if _is_blocked_from_new_cycle(
+                client, most_recent_cycle, order.closed_at, now=now, tz=tz, no_return_days=no_return_days,
+            ):
                 continue
             if client.id in next_appointment:
                 continue  # agendamento futuro (espontâneo ou não) -> não elegível agora
@@ -631,21 +673,13 @@ def log_contact(
     next_contact_at: datetime | None,
     linked_appointment_id: uuid.UUID | None,
 ) -> ClientRecoveryCycle:
-    """Registrar contato (item 11/12 do pedido) — cria o ciclo na
-    primeira ação real (nunca antes) ou reusa o ciclo ativo existente.
-    `expected_version` não é exigido aqui: diferente de uma EDIÇÃO de
-    conteúdo existente, registrar contato é sempre uma ação NOVA
-    (sempre um `INSERT` em `client_recovery_events`), não há "versão
-    anterior" que outra pessoa possa ter sobrescrito por engano. A
-    concorrência real (duas recepcionistas registrando o PRIMEIRO
-    contato do mesmo cliente ao mesmo tempo, nenhuma linha ainda pra
-    `FOR UPDATE` travar) é resolvida em duas camadas: o índice único
-    parcial do banco (`uq_client_recovery_cycles_org_client_active`,
-    cobrindo `pending`/`in_progress`/`scheduled` desde a migration
-    0062) decide quem "ganha"; quem perde é tratado explicitamente
-    abaixo (`IntegrityError` → relê o ciclo já criado pela outra
-    transação e aplica a mesma transição nele) — nunca um 500/409
-    genérico nem um contato perdido."""
+    """Registra o evento e cria ou atualiza o ciclo sob locks transacionais."""
+    # Serializa contatos mesmo quando não há ciclo ativo para travar.
+    # Uma recusa concorrente precisa estar visível antes de decidir a reentrada.
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"client_recovery:{actor.organization_id}:{client_id}"},
+    )
     client = client_repo.get(session, actor.organization_id, client_id)
     if client is None:
         raise NotFoundError("Cliente não encontrado.")
@@ -671,6 +705,13 @@ def log_contact(
     new_status = _STATUS_BY_RESULT[contact_result]
 
     if existing is None:
+        # "Não deseja receber contatos" (bloqueio PERMANENTE) nunca é
+        # bloqueado por esta regra — item explícito: o opt-out
+        # independe do estado de "sem interesse", precisa sempre poder
+        # ser aplicado (inclusive pra um cliente JÁ `lost` sem visita
+        # nova, que é exatamente o caso mais comum de uso real).
+        if contact_result != RecoveryContactResult.OPTED_OUT:
+            _assert_can_start_new_cycle(session, actor.organization_id, client, now)
         cycle = ClientRecoveryCycle(
             organization_id=actor.organization_id,
             client_id=client_id,
@@ -679,16 +720,8 @@ def log_contact(
             assigned_user_name=actor_name,
         )
         try:
-            # `get_active_for_client_for_update` acima usa `SELECT ...
-            # FOR UPDATE`, mas quando NÃO EXISTE nenhuma linha pra
-            # travar (nenhum ciclo ativo ainda), esse lock não protege
-            # nada — duas recepcionistas registrando o PRIMEIRO contato
-            # do MESMO cliente ao mesmo tempo passam as duas por aqui
-            # vendo `existing=None`. É o índice único parcial do banco
-            # (`uq_client_recovery_cycles_org_client_active`) quem
-            # arbitra a corrida de verdade. `begin_nested` (SAVEPOINT)
-            # isola só este INSERT — uma falha aqui nunca derruba o
-            # resto da transação da request.
+            # O índice da 0062 protege a unicidade no banco. O savepoint
+            # permite reler um ciclo ativo sem invalidar a transação.
             with session.begin_nested():
                 client_recovery_repo.create(session, cycle)
         except IntegrityError:
@@ -721,9 +754,6 @@ def log_contact(
     cycle.next_contact_at = next_contact_at
     if contact_result == RecoveryContactResult.RETURN_SCHEDULED:
         cycle.linked_appointment_id = linked_appointment_id
-    if new_status in (RecoveryCycleStatus.LOST,) and contact_result == RecoveryContactResult.NOT_INTERESTED:
-        settings = get_effective_settings(session, actor.organization_id)
-        cycle.suppressed_until = now + timedelta(days=settings.default_snooze_days)
     if contact_result in _TERMINAL_RESULTS:
         cycle.closed_at = now
         if contact_result == RecoveryContactResult.OPTED_OUT:

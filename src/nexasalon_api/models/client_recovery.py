@@ -90,9 +90,12 @@ class ClientRecoveryCycle(Base, UUIDPKMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("appointments.id", ondelete="SET NULL")
     )
     next_contact_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
-    # Pausa de "sem interesse" (item 12/20 do pedido) — enquanto
-    # `now() < suppressed_until`, o cliente não reentra automaticamente
-    # na fila mesmo que a elegibilidade "dias sem retorno" já bata.
+    # VESTIGIAL (ajuste "Recusou, encerrou") — a carência temporária de
+    # "sem interesse" foi eliminada por completo; `services/
+    # client_recovery.py` nunca mais ESCREVE neste campo (reentrada
+    # após `lost` agora só libera com uma visita nova de verdade, ver
+    # `_is_blocked_from_new_cycle`). Coluna preservada (nunca excluída)
+    # só porque ciclos antigos podem ter um valor histórico aqui.
     suppressed_until: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     closed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
