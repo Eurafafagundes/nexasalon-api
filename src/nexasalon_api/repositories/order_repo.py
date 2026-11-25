@@ -108,32 +108,6 @@ def list_closed_for_clients(session: Session, organization_id: uuid.UUID, client
     return list(session.scalars(stmt).all())
 
 
-def list_for_appointments(
-    session: Session, organization_id: uuid.UUID, appointment_ids: list[uuid.UUID]
-) -> list[Order]:
-    """Comandas FECHADAS vinculadas a vários Appointments de uma vez —
-    Central de Recuperação de Clientes, "Receita recuperada"
-    (`services/client_recovery.py`): resolve em LOTE a Order de cada
-    `ClientRecoveryCycle.linked_appointment_id`, nunca 1 query por
-    ciclo. Só `CLOSED` (mesmo filtro de `list_closed_for_clients`) —
-    uma comanda reaberta (`services/orders.py::reopen_order`, volta pra
-    `OPEN`) PARA de aparecer aqui até fechar de novo, e uma cancelada
-    nunca aparece; "receita recuperada" é sempre o estado ATUAL da
-    comanda, nunca um valor congelado no momento da recuperação."""
-    if not appointment_ids:
-        return []
-    stmt = (
-        select(Order)
-        .options(selectinload(Order.items), selectinload(Order.product_items))
-        .where(
-            Order.organization_id == organization_id,
-            Order.appointment_id.in_(appointment_ids),
-            Order.status == OrderStatus.CLOSED,
-        )
-    )
-    return list(session.scalars(stmt).all())
-
-
 def sum_charged_total_by_client(
     session: Session, organization_id: uuid.UUID, client_ids: list[uuid.UUID]
 ) -> dict[uuid.UUID, Decimal]:

@@ -21,9 +21,10 @@ real. Conceitos-chave:
     próprio: sem ciclo ou `status=pending` → Pendentes; `in_progress`
     com `next_contact_at` ainda no futuro → Acompanhamento;
     `in_progress` com `next_contact_at` vencido → volta pra Pendentes
-    (vencido = precisa de ação agora); qualquer status terminal
-    (`scheduled`/`recovered`/`lost`/`invalid_phone`/`opted_out`/
-    `cancelled`) → Concluídos.
+    (vencido = precisa de ação agora); `scheduled` (retorno marcado,
+    atendimento ainda não realizado) também é Acompanhamento — só é
+    "Concluído" quando o ciclo de fato se encerra (`recovered`/`lost`/
+    `invalid_phone`/`opted_out`/`cancelled`).
 
   - "Total gasto" usa `order_totals.order_charged_total` (preço menos
     benefício) — MESMA fórmula usada na Ficha do Cliente (Resumo),
@@ -77,13 +78,20 @@ from nexasalon_api.repositories import (
     organization_repo,
     user_repo,
 )
-from nexasalon_api.services import order_totals
 from nexasalon_api.services.clients import UPCOMING_APPOINTMENT_STATUSES
 
-_ACTIVE_CYCLE_STATUSES = frozenset({RecoveryCycleStatus.PENDING, RecoveryCycleStatus.IN_PROGRESS})
+# `SCHEDULED` conta como ATIVO (nunca "concluído") — um retorno marcado
+# mas ainda não realizado continua em Acompanhamento, com a ação "Ver
+# agendamento" (item explícito do pedido V3). Precisa estar em sincronia
+# com `client_recovery_repo._ACTIVE_STATUSES` (usado por
+# `get_active_for_client[_for_update]`) — sem isso, registrar um novo
+# contato ou religar um agendamento pra um cliente já `scheduled`
+# encontraria "nenhum ciclo ativo" e criaria um ciclo duplicado.
+_ACTIVE_CYCLE_STATUSES = frozenset(
+    {RecoveryCycleStatus.PENDING, RecoveryCycleStatus.IN_PROGRESS, RecoveryCycleStatus.SCHEDULED}
+)
 _CONCLUDED_STATUSES = frozenset(
     {
-        RecoveryCycleStatus.SCHEDULED,
         RecoveryCycleStatus.RECOVERED,
         RecoveryCycleStatus.LOST,
         RecoveryCycleStatus.INVALID_PHONE,
@@ -94,7 +102,10 @@ _CONCLUDED_STATUSES = frozenset(
 
 _DEFAULT_NO_RETURN_DAYS = 60
 _DEFAULT_FOLLOW_UP_DAYS = 3
-_DEFAULT_SNOOZE_DAYS = 90
+# Carência para reentrada na fila após "sem interesse no momento" — única
+# constante que controla isso (centralizada, nunca espalhada em números
+# mágicos); organizações podem sobrescrever via Configurações.
+_DEFAULT_SNOOZE_DAYS = 60
 _DEFAULT_WHATSAPP_TEMPLATE = (
     "Olá, {first_name}! Tudo bem? Aqui é {attendant_name}, do {business_name}. Faz um "
     "tempinho desde seu último atendimento e gostaríamos de saber se você deseja agendar "
@@ -454,6 +465,11 @@ def _classify_subtab(cycle: ClientRecoveryCycle | None, now: datetime) -> str:
         if cycle.next_contact_at is not None and cycle.next_contact_at <= now:
             return "pending"
         return "in_progress"
+    if cycle.status == RecoveryCycleStatus.SCHEDULED:
+        # Retorno marcado, atendimento ainda não realizado — nunca
+        # "vencido" (não há data de contato pendente, há uma visita
+        # futura real) e nunca "concluído" (só quando a comanda fechar).
+        return "in_progress"
     return "concluded"
 
 
@@ -522,58 +538,28 @@ def _list_concluded(
 class RecoverySummary:
     pending_count: int
     in_progress_count: int
+    # Recuperados/Sem interesse contam CLIENTES DISTINTOS encerrados no
+    # período (nunca ciclos) — se o mesmo cliente tiver 2 ciclos
+    # `recovered` no mesmo período, entra uma única vez aqui, mas conta 2x
+    # em `concluded_count` (ambos os ciclos continuam visíveis no
+    # histórico/Concluídos). Essa distinção é explícita na UI.
     recovered_count: int
     not_interested_count: int
-    # Soma de TODOS os status terminais encerrados no período (badge da
-    # aba Concluídos) — superset de `recovered_count`/`not_interested_count`
-    # (que são só 2 dos 6 status terminais possíveis).
+    # Soma de TODOS os CICLOS com status terminal encerrados no período
+    # (badge da aba Concluídos) — conta ciclos, não clientes distintos.
     concluded_count: int
-    # "Receita recuperada" (item novo) — sempre o valor LÍQUIDO (preço −
-    # benefício, `order_totals.order_charged_total`) das comandas FECHADAS
-    # vinculadas aos ciclos `recovered` encerrados no período. Nunca
-    # estimado: um ciclo recuperado sem comanda fechada correspondente
-    # contribui R$0, nunca um valor inventado.
-    recovered_revenue: Decimal
     date_from: datetime
     date_to: datetime
-
-
-def _recovered_revenue(
-    session: Session, organization_id: uuid.UUID, *, date_from: datetime, date_to: datetime,
-    assigned_user_id: uuid.UUID | None,
-) -> Decimal:
-    """Receita recuperada do período — ver docstring de `RecoverySummary`.
-
-    Deduplicação por `Order.id` (nunca por ciclo/agendamento): resolve
-    primeiro um dict `{order.id: order}` a partir do conjunto (já
-    deduplicado em `set()`) de `linked_appointment_id`s dos ciclos
-    `recovered` do período, e só soma os VALORES desse dict — mesmo que,
-    por hipótese, dois ciclos diferentes apontassem pra mesma comanda,
-    ela entraria uma única vez na soma. `order_repo.list_for_appointments`
-    já filtra só `CLOSED` — lê o estado ATUAL da comanda a cada chamada
-    (nunca um valor congelado no momento da recuperação): uma comanda
-    reaberta some da soma até fechar de novo; uma cancelada nunca conta."""
-    recovered_cycles = client_recovery_repo.list_by_org(
-        session, organization_id, statuses=frozenset({RecoveryCycleStatus.RECOVERED}),
-        assigned_user_id=assigned_user_id,
-    )
-    recovered_cycles = [
-        c for c in recovered_cycles
-        if c.closed_at is not None and date_from <= c.closed_at <= date_to
-    ]
-    appointment_ids = list({c.linked_appointment_id for c in recovered_cycles if c.linked_appointment_id is not None})
-    orders_by_id = {o.id: o for o in order_repo.list_for_appointments(session, organization_id, appointment_ids)}
-    return sum((order_totals.order_charged_total(o) for o in orders_by_id.values()), Decimal(0))
 
 
 def get_recovery_summary(
     session: Session, actor: ActorContext, *, date_from: datetime, date_to: datetime
 ) -> RecoverySummary:
     """4 indicadores (item 3 do pedido). Pendentes/Em acompanhamento são
-    ESTOQUE atual (nunca dependem do período); Recuperados/Receita
-    recuperada/Sem interesse/`concluded_count` são HISTÓRICOS (ciclos
-    cujo `closed_at` cai dentro do período informado) — nunca misturados
-    na mesma conta, exatamente como pedido."""
+    ESTOQUE atual (nunca dependem do período); Recuperados/Sem
+    interesse/`concluded_count` são HISTÓRICOS (ciclos cujo `closed_at`
+    cai dentro do período informado) — nunca misturados na mesma conta,
+    exatamente como pedido."""
     organization_id = actor.organization_id
     can_view_team = "clients.recovery.view_team" in actor.permissions
     assigned_user_id = None if can_view_team else actor.user_id
@@ -609,13 +595,13 @@ def get_recovery_summary(
     closed_counts = client_recovery_repo.count_by_status_in_period(
         session, organization_id, date_from, date_to, assigned_user_id=assigned_user_id,
     )
-    recovered_count = closed_counts.get(RecoveryCycleStatus.RECOVERED, 0)
-    not_interested_count = closed_counts.get(RecoveryCycleStatus.LOST, 0)
     concluded_count = sum(closed_counts.values())
 
-    recovered_revenue = _recovered_revenue(
-        session, organization_id, date_from=date_from, date_to=date_to, assigned_user_id=assigned_user_id,
+    distinct_client_counts = client_recovery_repo.count_distinct_clients_by_status_in_period(
+        session, organization_id, date_from, date_to, assigned_user_id=assigned_user_id,
     )
+    recovered_count = distinct_client_counts.get(RecoveryCycleStatus.RECOVERED, 0)
+    not_interested_count = distinct_client_counts.get(RecoveryCycleStatus.LOST, 0)
 
     return RecoverySummary(
         pending_count=pending_count,
@@ -623,7 +609,6 @@ def get_recovery_summary(
         recovered_count=recovered_count,
         not_interested_count=not_interested_count,
         concluded_count=concluded_count,
-        recovered_revenue=recovered_revenue,
         date_from=date_from,
         date_to=date_to,
     )
@@ -639,7 +624,7 @@ def log_contact(
     actor: ActorContext,
     client_id: uuid.UUID,
     *,
-    contact_channel: RecoveryContactChannel,
+    contact_channel: RecoveryContactChannel | None,
     contact_result: RecoveryContactResult,
     notes: str | None,
     next_contact_at: datetime | None,
@@ -830,6 +815,27 @@ def mark_recovered_if_linked_appointment_completed(
     )
 
 
+def _next_upcoming_appointment_id(
+    session: Session, organization_id: uuid.UUID, client_id: uuid.UUID, *, excluding_appointment_id: uuid.UUID
+) -> uuid.UUID | None:
+    """Mesmo critério de "agendamento futuro válido" já usado em
+    `_list_pending_or_in_progress` (`UPCOMING_APPOINTMENT_STATUSES`),
+    aplicado a um único cliente — usado por
+    `reopen_cycle_if_linked_appointment_cancelled` pra decidir se existe
+    OUTRO agendamento (além do que acabou de ser cancelado/virar falta)
+    antes de devolver o ciclo pra Pendentes."""
+    candidates = [
+        (a.starts_at, a.id)
+        for a in appointment_repo.list_for_clients(session, organization_id, [client_id])
+        if a.id != excluding_appointment_id
+        and a.status in UPCOMING_APPOINTMENT_STATUSES
+        and a.starts_at is not None
+    ]
+    if not candidates:
+        return None
+    return min(candidates)[1]
+
+
 def reopen_cycle_if_linked_appointment_cancelled(
     session: Session, organization_id: uuid.UUID, appointment_id: uuid.UUID
 ) -> None:
@@ -840,14 +846,29 @@ def reopen_cycle_if_linked_appointment_cancelled(
     ou a cliente faltar, ela volta automaticamente para a fila"). Ação
     do SISTEMA — `actor_user_id=NULL`, nunca atribuída a uma pessoa.
     Nunca levanta erro se não houver ciclo vinculado (caminho comum —
-    a maioria dos cancelamentos não tem nada a ver com recuperação)."""
+    a maioria dos cancelamentos não tem nada a ver com recuperação).
+
+    Antes de decidir, checa se o cliente já tem OUTRO agendamento futuro
+    válido (ex.: recepção já remarcou por outro caminho antes de
+    cancelar o antigo) — se tiver, o ciclo permanece `scheduled`,
+    só atualizando o vínculo pro agendamento novo (nunca cria ciclo
+    novo); só volta pra `pending` quando não existe nenhum outro."""
     cycle = client_recovery_repo.get_scheduled_by_linked_appointment(session, organization_id, appointment_id)
     if cycle is None:
         return
     now = datetime.now(timezone.utc)
     previous_status = cycle.status
-    cycle.status = RecoveryCycleStatus.PENDING
-    cycle.linked_appointment_id = None
+
+    other_appointment_id = _next_upcoming_appointment_id(
+        session, organization_id, cycle.client_id, excluding_appointment_id=appointment_id
+    )
+    if other_appointment_id is not None:
+        cycle.linked_appointment_id = other_appointment_id
+        new_status = RecoveryCycleStatus.SCHEDULED
+    else:
+        cycle.status = RecoveryCycleStatus.PENDING
+        cycle.linked_appointment_id = None
+        new_status = RecoveryCycleStatus.PENDING
     cycle.version = cycle.version + 1
     client_recovery_repo.save(session, cycle)
 
@@ -859,7 +880,8 @@ def reopen_cycle_if_linked_appointment_cancelled(
         actor_user_name=None,
         event_type=RecoveryEventType.REOPENED,
         previous_status=previous_status,
-        new_status=RecoveryCycleStatus.PENDING,
+        new_status=new_status,
+        linked_appointment_id=other_appointment_id,
         created_at=now,
     )
     client_recovery_repo.create_event(session, event)

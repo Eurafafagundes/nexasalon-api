@@ -416,10 +416,15 @@ def test_retorno_agendado_com_agendamento_valido_vira_scheduled_e_some_de_penden
     assert cycle.status == RecoveryCycleStatus.SCHEDULED
     assert cycle.linked_appointment_id == future_appt.id
 
+    # Agendado mas ainda não realizado = Acompanhamento (item V3: a ação
+    # "Ver agendamento" vive na aba Acompanhamento, nunca Concluídos —
+    # só é "concluído" quando o ciclo de fato se encerra).
     pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=60)
     assert pending.items == []
+    in_progress = recovery_service.list_recovery_queue(session, actor, subtab="in_progress")
+    assert [r.client.id for r in in_progress.items] == [client.id]
     concluded = recovery_service.list_recovery_queue(session, actor, subtab="concluded")
-    assert [r.client.id for r in concluded.items] == [client.id]
+    assert concluded.items == []
 
 
 def test_nao_permite_dois_ciclos_ativos_para_o_mesmo_cliente(org_session):
@@ -455,7 +460,7 @@ def test_sem_interesse_aplica_pausa_e_bloqueia_reentrada_ate_o_prazo(org_session
     assert pending.items == []
 
     cycles = client_recovery_repo.list_all_for_clients(session, org_id, [client.id])
-    assert cycles[0].suppressed_until > _NOW + timedelta(days=89)
+    assert cycles[0].suppressed_until > _NOW + timedelta(days=59)  # carência atual: 60 dias
 
 
 def test_nao_deseja_contato_bloqueia_whatsapp_e_reentrada_permanentemente(org_session):
@@ -515,6 +520,39 @@ def test_cancelar_agendamento_de_retorno_vinculado_reabre_o_ciclo_automaticament
 
     pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=60)
     assert [r.client.id for r in pending.items] == [client.id]
+
+
+def test_cancelar_retorno_com_outro_agendamento_futuro_mantem_ciclo_e_atualiza_vinculo(org_session):
+    """Lacuna corrigida nesta rodada: se o cliente já tem OUTRO
+    agendamento futuro válido (ex.: a recepção remarcou antes de
+    cancelar o antigo), o ciclo nunca deve voltar pra Pendentes — só
+    atualiza o vínculo pro agendamento novo, permanece Acompanhamento."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    client, branch, prof, svc = _eligible_client(session, org_id)
+    old_appt = _appointment(session, org_id, branch.id, client.id, prof.id, svc.id, start_at=_NOW + timedelta(days=5))
+    other_appt = _appointment(session, org_id, branch.id, client.id, prof.id, svc.id, start_at=_NOW + timedelta(days=10))
+
+    cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=RecoveryContactChannel.WHATSAPP,
+        contact_result=RecoveryContactResult.RETURN_SCHEDULED, notes=None,
+        next_contact_at=None, linked_appointment_id=old_appt.id,
+    )
+    assert cycle.status == RecoveryCycleStatus.SCHEDULED
+
+    recovery_service.reopen_cycle_if_linked_appointment_cancelled(session, org_id, old_appt.id)
+
+    refreshed = client_recovery_repo.get(session, org_id, cycle.id)
+    assert refreshed.status == RecoveryCycleStatus.SCHEDULED  # nunca volta a pendente
+    assert refreshed.linked_appointment_id == other_appt.id  # vínculo atualizado, nunca ciclo novo
+
+    cycles = client_recovery_repo.list_all_for_clients(session, org_id, [client.id])
+    assert len(cycles) == 1  # nunca cria ciclo duplicado
+
+    pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=60)
+    assert pending.items == []
+    in_progress = recovery_service.list_recovery_queue(session, actor, subtab="in_progress")
+    assert [r.client.id for r in in_progress.items] == [client.id]
 
 
 def test_reentrada_automatica_esta_realmente_conectada_ao_cancelamento_real(org_session):
@@ -578,6 +616,145 @@ def test_retorno_atendido_vira_recuperado_quando_comanda_fecha(org_session):
     refreshed = client_recovery_repo.get(session, org_id, cycle.id)
     assert refreshed.status == RecoveryCycleStatus.RECOVERED
     assert refreshed.closed_at is not None
+
+
+# ---------------------------------------------------------------------------
+# Fluxos V3: "Aceitou retornar" sem concluir agendamento, no-show,
+# reagendamento, canal opcional
+# ---------------------------------------------------------------------------
+
+
+def test_aceitou_retornar_sem_concluir_agendamento_preserva_intencao(org_session):
+    """"Aceitou retornar" só registra `interested` (`in_progress`, sem
+    `next_contact_at`) — se o usuário desistir de criar o agendamento
+    (nunca chama `link_return_appointment`), o ciclo PERMANECE assim:
+    nunca vira `scheduled`/`recovered` sozinho, nunca é perdido."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    client, *_ = _eligible_client(session, org_id)
+
+    cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.INTERESTED, notes="Quer voltar, vai escolher o dia depois.",
+        next_contact_at=None, linked_appointment_id=None,
+    )
+    assert cycle.status == RecoveryCycleStatus.IN_PROGRESS
+    assert cycle.next_contact_at is None
+
+    in_progress = recovery_service.list_recovery_queue(session, actor, subtab="in_progress")
+    assert [r.client.id for r in in_progress.items] == [client.id]
+    row = in_progress.items[0]
+    # Distinção que o frontend usa pra escolher "Agendar retorno" (aceitou,
+    # sem data) vs. "Novo contato" (aguardando resposta, com data).
+    assert row.cycle.next_contact_at is None
+
+    refreshed = client_recovery_repo.get(session, org_id, cycle.id)
+    assert refreshed.status == RecoveryCycleStatus.IN_PROGRESS  # nunca promovido sozinho
+
+
+def test_no_show_do_retorno_vinculado_reabre_sem_resetar_ultima_visita(org_session):
+    """Falta no retorno agendado: reabre o ciclo (mesma lógica de
+    cancelamento) mas NUNCA mexe em `last_visit_at`/dias sem retorno —
+    esses continuam derivados da última comanda FECHADA de verdade."""
+    from nexasalon_api.services import appointments as appointments_service
+
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=frozenset({
+        "clients.recovery.view", "clients.recovery.manage", "clients.recovery.view_team",
+        "agenda.edit", "agenda.view_all",
+    }))
+    client, branch, prof, svc = _eligible_client(session, org_id, days=65)
+    future_appt = _appointment(session, org_id, branch.id, client.id, prof.id, svc.id, start_at=_NOW + timedelta(hours=1))
+
+    recovery_service.log_contact(
+        session, actor, client.id, contact_channel=RecoveryContactChannel.WHATSAPP,
+        contact_result=RecoveryContactResult.RETURN_SCHEDULED, notes=None,
+        next_contact_at=None, linked_appointment_id=future_appt.id,
+    )
+
+    appointments_service.update_status(session, actor, future_appt.id, AppointmentStatus.NO_SHOW)
+
+    cycles = client_recovery_repo.list_all_for_clients(session, org_id, [client.id])
+    assert len(cycles) == 1
+    assert cycles[0].status == RecoveryCycleStatus.PENDING
+
+    pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=60)
+    assert len(pending.items) == 1
+    # A falta no retorno NUNCA conta como visita real — dias/última visita
+    # continuam vindo da comanda fechada ORIGINAL (`_eligible_client`).
+    assert pending.items[0].days_since_last_visit == 65
+
+
+def test_reagendamento_preserva_o_mesmo_ciclo(org_session):
+    """Reagendar (mudar horário/profissional do MESMO agendamento, via
+    `update_appointment_item` — nunca cancela+recria) nunca aciona o
+    hook de reentrada nem duplica/perde o ciclo vinculado."""
+    from nexasalon_api.schemas.appointment import AppointmentItemUpdate
+    from nexasalon_api.services import appointments as appointments_service
+
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=frozenset({
+        "clients.recovery.view", "clients.recovery.manage", "clients.recovery.view_team",
+        "agenda.edit", "agenda.view_all",
+    }))
+    client, branch, prof, svc = _eligible_client(session, org_id)
+    future_appt = _appointment(session, org_id, branch.id, client.id, prof.id, svc.id, start_at=_NOW + timedelta(days=5))
+
+    cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=RecoveryContactChannel.WHATSAPP,
+        contact_result=RecoveryContactResult.RETURN_SCHEDULED, notes=None,
+        next_contact_at=None, linked_appointment_id=future_appt.id,
+    )
+    item_id = future_appt.items[0].id
+
+    appointments_service.update_appointment_item(
+        session, actor, future_appt.id, item_id,
+        AppointmentItemUpdate(start_at=_NOW + timedelta(days=8), force_overlap=True),
+    )
+
+    refreshed = client_recovery_repo.get(session, org_id, cycle.id)
+    assert refreshed.status == RecoveryCycleStatus.SCHEDULED
+    assert refreshed.linked_appointment_id == future_appt.id  # mesmo agendamento, mesmo ciclo
+    assert refreshed.version == cycle.version  # hook de reentrada nunca disparou
+
+
+def test_canal_de_contato_omitido_nunca_inventa_valor(org_session):
+    """A UI simplificada de 3 cartões nunca envia `contact_channel` —
+    confirma que o service aceita `None` sem erro e nunca escreve um
+    canal "chutado" no evento/histórico."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    client, *_ = _eligible_client(session, org_id)
+
+    cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.NOT_INTERESTED, notes=None,
+        next_contact_at=None, linked_appointment_id=None,
+    )
+    events = client_recovery_repo.list_events_for_cycle(session, org_id, cycle.id)
+    contact_logged = next(e for e in events if e.event_type.value == "contact_logged")
+    assert contact_logged.contact_channel is None
+
+
+def test_mudanca_de_filtro_de_dias_nunca_altera_ou_fecha_ciclos(org_session):
+    """Trocar o filtro de "sem retorno há pelo menos" é só um corte de
+    leitura — nunca deve mutar/fechar o ciclo nem seu `version`."""
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    client, *_ = _eligible_client(session, org_id, days=65)
+    cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=None,
+        contact_result=RecoveryContactResult.AWAITING_RESPONSE, notes=None,
+        next_contact_at=_NOW + timedelta(days=3), linked_appointment_id=None,
+    )
+    version_before = cycle.version
+
+    for min_days in (30, 60, 90, 120, 0):
+        recovery_service.list_recovery_queue(session, actor, subtab="in_progress", min_days=min_days)
+
+    refreshed = client_recovery_repo.get(session, org_id, cycle.id)
+    assert refreshed.version == version_before
+    assert refreshed.status == RecoveryCycleStatus.IN_PROGRESS
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +822,7 @@ def test_acompanhamento_vencido_volta_para_pendentes(org_session):
 
 
 # ---------------------------------------------------------------------------
-# Receita recuperada
+# Indicadores históricos (Recuperados/Sem interesse/Concluídos)
 # ---------------------------------------------------------------------------
 
 
@@ -702,124 +879,6 @@ _RECOVERY_PERMS = frozenset({
 })
 
 
-def test_receita_recuperada_desconta_beneficio(org_session):
-    session, org_id = org_session
-    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
-    _recover_with_order(session, actor, org_id, price=Decimal("310.00"), benefit=Decimal("50.00"))
-
-    summary = recovery_service.get_recovery_summary(
-        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
-    )
-    assert summary.recovered_count == 1
-    assert summary.recovered_revenue == Decimal("260.00")
-
-
-def test_receita_recuperada_soma_varios_ciclos_sem_duplicar(org_session):
-    session, org_id = org_session
-    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
-    _recover_with_order(session, actor, org_id, price=Decimal("100.00"))
-    _recover_with_order(session, actor, org_id, price=Decimal("150.00"))
-
-    summary = recovery_service.get_recovery_summary(
-        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
-    )
-    assert summary.recovered_count == 2
-    assert summary.recovered_revenue == Decimal("250.00")
-
-
-def test_receita_recuperada_fora_do_periodo_nao_conta(org_session):
-    session, org_id = org_session
-    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
-    _recover_with_order(session, actor, org_id, price=Decimal("100.00"), days_ago_closed=40)
-
-    summary = recovery_service.get_recovery_summary(
-        session, actor, date_from=_NOW - timedelta(days=10), date_to=_NOW,
-    )
-    assert summary.recovered_count == 0
-    assert summary.recovered_revenue == Decimal(0)
-
-
-def test_receita_recuperada_comanda_reaberta_para_de_contar_ate_fechar_de_novo(org_session):
-    from nexasalon_api.schemas.order import OrderReopen
-
-    session, org_id = org_session
-    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
-    _client, _cycle, order = _recover_with_order(session, actor, org_id, price=Decimal("120.00"))
-
-    summary_before = recovery_service.get_recovery_summary(
-        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
-    )
-    assert summary_before.recovered_revenue == Decimal("120.00")
-
-    orders_service.reopen_order(session, actor, order.id, OrderReopen(reason="Correção de preço"))
-    summary_reopened = recovery_service.get_recovery_summary(
-        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
-    )
-    assert summary_reopened.recovered_revenue == Decimal(0)  # comanda aberta não conta
-
-    order.items[0].price = Decimal("200.00")
-    session.flush()
-    cash_register = CashRegister(
-        organization_id=org_id, branch_id=order.branch_id, opened_by=actor.user_id, opened_by_name="Teste",
-        initial_amount=Decimal(0), status=CashRegisterStatus.OPEN,
-    )
-    session.add(cash_register)
-    session.flush()
-    orders_service.close_order(
-        session, actor, order.id,
-        OrderClose(payments=[PaymentCreate(method="pix", amount=Decimal("200.00"), cash_register_id=cash_register.id)]),
-    )
-    summary_after = recovery_service.get_recovery_summary(
-        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
-    )
-    assert summary_after.recovered_revenue == Decimal("200.00")  # valor NOVO, nunca o congelado
-
-
-def test_receita_recuperada_comanda_cancelada_apos_reabrir_nunca_conta(org_session):
-    from nexasalon_api.schemas.order import OrderCancel, OrderReopen
-
-    session, org_id = org_session
-    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
-    _client, cycle, order = _recover_with_order(session, actor, org_id, price=Decimal("120.00"))
-
-    orders_service.reopen_order(session, actor, order.id, OrderReopen(reason="Cliente pediu cancelamento"))
-    orders_service.cancel_order(session, actor, order.id, OrderCancel(reason="Cancelado a pedido da cliente"))
-
-    summary = recovery_service.get_recovery_summary(
-        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
-    )
-    assert summary.recovered_revenue == Decimal(0)
-    # O ciclo em si continua "recovered" (reabertura/cancelamento da
-    # comanda não reabre o ciclo de recuperação automaticamente — regra
-    # separada, só o agendamento cancelado reabre o ciclo).
-    refreshed = client_recovery_repo.get(session, org_id, cycle.id)
-    assert refreshed.status == RecoveryCycleStatus.RECOVERED
-
-
-def test_receita_recuperada_sem_comanda_fechada_conta_recuperado_mas_zero_receita(org_session):
-    session, org_id = org_session
-    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
-    client, branch, prof, svc = _eligible_client(session, org_id)
-    future_appt = _appointment(session, org_id, branch.id, client.id, prof.id, svc.id, start_at=_NOW + timedelta(hours=2))
-    cycle = recovery_service.log_contact(
-        session, actor, client.id, contact_channel=RecoveryContactChannel.WHATSAPP,
-        contact_result=RecoveryContactResult.RETURN_SCHEDULED, notes=None,
-        next_contact_at=None, linked_appointment_id=future_appt.id,
-    )
-    # Força "recuperado" sem nunca ter existido uma comanda fechada
-    # (ex.: atendimento registrado só na agenda, conforme a regra
-    # operacional existente admite) — nunca deve inventar receita.
-    cycle.status = RecoveryCycleStatus.RECOVERED
-    cycle.closed_at = _NOW
-    session.flush()
-
-    summary = recovery_service.get_recovery_summary(
-        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
-    )
-    assert summary.recovered_count == 1
-    assert summary.recovered_revenue == Decimal(0)
-
-
 def test_concluded_count_soma_todos_os_status_terminais_do_periodo(org_session):
     session, org_id = org_session
     actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
@@ -847,10 +906,10 @@ def test_concluded_count_soma_todos_os_status_terminais_do_periodo(org_session):
     assert summary.concluded_count == 3  # recovered + lost + invalid_phone
 
 
-def test_escopo_de_equipe_aplica_igual_a_recuperados_e_receita(org_session):
-    """Correção desta rodada: antes, `recovered_count`/`recovered_revenue`
-    nunca respeitavam `view_team`, só Pendentes/Acompanhamento — agora os
-    3 números do card "Recuperados" sempre descrevem a MESMA população."""
+def test_escopo_de_equipe_aplica_igual_a_recuperados(org_session):
+    """`recovered_count` sempre respeita `view_team`, igual a
+    Pendentes/Acompanhamento — nunca uma população diferente lado a lado
+    no mesmo conjunto de indicadores."""
     session, org_id = org_session
     owner = _actor(session, org_id, permissions=_RECOVERY_PERMS)
     restricted = _actor(session, org_id, permissions=frozenset({
@@ -863,27 +922,72 @@ def test_escopo_de_equipe_aplica_igual_a_recuperados_e_receita(org_session):
         session, restricted, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
     )
     assert summary_restricted.recovered_count == 1
-    assert summary_restricted.recovered_revenue == Decimal("40.00")
 
 
-def test_mascaramento_financeiro_oculta_receita_recuperada_sem_permissao(org_session):
-    """Mesmo contrato de `total_spent`: o SERVIÇO sempre calcula o valor
-    real; é a ROTA quem decide devolver `None` sem `finance.view`."""
+def test_mesmo_cliente_recuperado_2x_no_periodo_conta_1x_no_indicador(org_session):
+    """Item explícito do pedido: 2 ciclos `recovered` do MESMO cliente no
+    mesmo período contam 1x em `recovered_count` (clientes distintos),
+    mas 2x em `concluded_count` (ciclos) — ambos os ciclos continuam
+    visíveis no histórico."""
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    client, cycle1, _order1 = _recover_with_order(session, actor, org_id, price=Decimal("90.00"))
+
+    # Cliente é recuperado uma SEGUNDA vez dentro do mesmo período —
+    # ciclo NOVO (o primeiro já é terminal/`recovered`), nunca reabre o
+    # ciclo anterior.
+    branch = _branch(session, org_id)
+    prof = _professional(session, org_id, branch.id)
+    svc = _service(session, org_id)
+    future_appt = _appointment(
+        session, org_id, branch.id, client.id, prof.id, svc.id,
+        start_at=_NOW + timedelta(hours=3), price=Decimal("90.00"),
+    )
+    recovery_service.log_contact(
+        session, actor, client.id, contact_channel=RecoveryContactChannel.WHATSAPP,
+        contact_result=RecoveryContactResult.RETURN_SCHEDULED, notes=None,
+        next_contact_at=None, linked_appointment_id=future_appt.id,
+    )
+    cash_register = CashRegister(
+        organization_id=org_id, branch_id=branch.id, opened_by=actor.user_id, opened_by_name="Teste",
+        initial_amount=Decimal(0), status=CashRegisterStatus.OPEN,
+    )
+    session.add(cash_register)
+    session.flush()
+    order2 = orders_service.create_order(session, actor, future_appt.id)
+    orders_service.close_order(
+        session, actor, order2.id,
+        OrderClose(payments=[PaymentCreate(method="pix", amount=Decimal("90.00"), cash_register_id=cash_register.id)]),
+    )
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    assert summary.recovered_count == 1  # cliente distinto, uma única vez
+    assert summary.concluded_count == 2  # os 2 ciclos continuam contando aqui
+
+    cycles = client_recovery_repo.list_all_for_clients(session, org_id, [client.id])
+    assert len(cycles) == 2
+    assert {c.status for c in cycles} == {RecoveryCycleStatus.RECOVERED}
+    assert cycle1.id in {c.id for c in cycles}  # ciclo antigo nunca é sobrescrito/apagado
+
+
+def test_mascaramento_financeiro_oculta_total_spent_sem_permissao(org_session):
+    """Mesmo contrato de `recovered_revenue` quando existia: o SERVIÇO
+    sempre calcula o valor real; é a ROTA quem decide devolver `None`
+    sem `finance.view` (nunca o frontend)."""
     from nexasalon_api.api.v1 import client_recovery as recovery_api
 
     session, org_id = org_session
-    owner = _actor(session, org_id, permissions=_RECOVERY_PERMS)
-    _recover_with_order(session, owner, org_id, price=Decimal("90.00"))
-
-    restricted = _actor(session, org_id, permissions=frozenset({
-        "clients.recovery.view", "clients.recovery.view_team",
+    actor = _actor(session, org_id, permissions=frozenset({
+        "clients.recovery.view", "clients.recovery.manage", "clients.recovery.view_team",
     }))
-    result = recovery_api.get_recovery_summary(
-        date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
-        session=session, actor=restricted,
+    _eligible_client(session, org_id)
+
+    result = recovery_api.list_recovery_queue(
+        subtab="pending", min_days=60, max_days=None, page=1, page_size=50, session=session, actor=actor,
     )
-    assert result.recovered_revenue is None
-    assert result.recovered_count == 1  # contagem nunca é financeira, continua visível
+    assert result.items[0].total_spent is None  # sem finance.view
 
 
 # ---------------------------------------------------------------------------

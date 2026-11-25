@@ -27,7 +27,10 @@ class ContactLogCreate(BaseModel):
     só aqui — a regra depende do valor de outro campo); nunca aceita
     data no passado."""
 
-    contact_channel: RecoveryContactChannel
+    # Opcional — a UI simplificada de 3 cartões não pede o canal; nunca
+    # inventamos um valor quando não informado (fica `None`, preservado
+    # assim no histórico, já é `nullable` no banco).
+    contact_channel: RecoveryContactChannel | None = None
     contact_result: RecoveryContactResult
     notes: str | None = Field(default=None, max_length=CONTACT_NOTES_MAX_LENGTH)
     next_contact_at: datetime | None = None
@@ -119,12 +122,12 @@ class RecoveryQueueResponse(BaseModel):
 class RecoverySummaryRead(BaseModel):
     pending_count: int
     in_progress_count: int
+    # Clientes distintos encerrados como recuperado/sem interesse no
+    # período (nunca ciclos) — `concluded_count` abaixo é que conta
+    # ciclos, ver `services/client_recovery.py::RecoverySummary`.
     recovered_count: int
     not_interested_count: int
     concluded_count: int
-    # `None` sem `finance.view` — mesmo contrato de `total_spent` em
-    # `RecoveryQueueRowRead` (a rota decide, nunca o frontend).
-    recovered_revenue: Decimal | None
     date_from: datetime
     date_to: datetime
 

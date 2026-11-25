@@ -138,7 +138,6 @@ def get_recovery_summary(
         pending_count=summary.pending_count, in_progress_count=summary.in_progress_count,
         recovered_count=summary.recovered_count, not_interested_count=summary.not_interested_count,
         concluded_count=summary.concluded_count,
-        recovered_revenue=summary.recovered_revenue if _can_view_finance(actor) else None,
         date_from=summary.date_from, date_to=summary.date_to,
     )
 
