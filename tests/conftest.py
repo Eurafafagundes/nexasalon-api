@@ -35,10 +35,22 @@ _ADMIN_URL = f"postgresql+psycopg://postgres:@{_host}:{_port}/nexasalon_test"
 
 # migrations rodam com o usuário dono do schema (postgres), nunca com o
 # role restrito que a API usa — mesma separação de papéis do README.
+#
+# "heads" (plural), não "head": o repositório local pode ter DUAS
+# revisões de topo ao mesmo tempo — a branch principal e a branch local
+# ainda não commitada da Comissão Condicional (migrations 0053/0054,
+# nunca commitadas/aplicadas em produção, ver CLAUDE.md). Enquanto essa
+# branch existir sem commitar, o código ORM do working tree (ex.:
+# `models/enums.py`/`models/service.py`) já declara as colunas dela —
+# qualquer teste que toque `Client`/`Service`/`ProfessionalService`
+# quebraria com "column does not exist" se o banco de teste só tivesse a
+# branch principal. "heads" aplica as duas, igual ao ambiente de
+# demonstração local — nunca afeta produção/commit, só este Postgres
+# descartável de teste.
 _migration_env = os.environ.copy()
 _migration_env["NEXASALON_DATABASE_URL"] = _ADMIN_URL
 _result = subprocess.run(
-    ["alembic", "upgrade", "head"],
+    ["alembic", "upgrade", "heads"],
     cwd=str(REPO_ROOT),
     env=_migration_env,
     capture_output=True,
