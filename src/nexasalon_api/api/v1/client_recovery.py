@@ -100,6 +100,8 @@ def list_recovery_queue(
     has_phone: bool | None = None,
     overdue_only: bool = False,
     concluded_status: RecoveryCycleStatus | None = None,
+    last_procedure_service_id: uuid.UUID | None = None,
+    last_professional_id: uuid.UUID | None = None,
     sort: RecoverySort = "days_desc",
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
@@ -110,6 +112,7 @@ def list_recovery_queue(
         session, actor, subtab=subtab, min_days=min_days, max_days=max_days, search=search,
         assigned_user_id=assigned_user_id, has_phone=has_phone, overdue_only=overdue_only,
         concluded_statuses=(frozenset({concluded_status}) if concluded_status else None),
+        last_procedure_service_id=last_procedure_service_id, last_professional_id=last_professional_id,
         sort=sort, page=page, page_size=page_size,
     )
     can_view_contact = client_can_view_contact(actor.permissions)
@@ -134,6 +137,8 @@ def get_recovery_summary(
     return RecoverySummaryRead(
         pending_count=summary.pending_count, in_progress_count=summary.in_progress_count,
         recovered_count=summary.recovered_count, not_interested_count=summary.not_interested_count,
+        concluded_count=summary.concluded_count,
+        recovered_revenue=summary.recovered_revenue if _can_view_finance(actor) else None,
         date_from=summary.date_from, date_to=summary.date_to,
     )
 

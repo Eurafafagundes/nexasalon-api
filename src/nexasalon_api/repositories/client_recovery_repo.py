@@ -183,11 +183,18 @@ def list_events_for_client(
 
 
 def count_by_status_in_period(
-    session: Session, organization_id: uuid.UUID, start: datetime, end: datetime
+    session: Session, organization_id: uuid.UUID, start: datetime, end: datetime,
+    *, assigned_user_id: uuid.UUID | None = None,
 ) -> dict[RecoveryCycleStatus, int]:
-    """Usado pelo "Recuperados"/"Sem interesse" (indicadores HISTÓRICOS,
-    com período explícito, item 3 do pedido) — conta ciclos ENCERRADOS
-    (`closed_at` dentro do período) por status, nunca o estoque atual.
+    """Usado pelo "Recuperados"/"Sem interesse"/"Receita recuperada"
+    (indicadores HISTÓRICOS, com período explícito, item 3 do pedido) —
+    conta ciclos ENCERRADOS (`closed_at` dentro do período) por status,
+    nunca o estoque atual. `assigned_user_id` (opcional) aplica o MESMO
+    escopo de equipe de `list_by_org`/`get_recovery_summary` — correção:
+    antes desta chamada não ser escopada, um ator sem
+    `clients.recovery.view_team` via contagem de Recuperados/Sem
+    interesse da organização INTEIRA mas Pendentes/Acompanhamento só da
+    própria fila, uma inconsistência visível lado a lado no mesmo card.
     Implementado como `list_by_org` + contagem em Python (volume por
     organização/período é pequeno — dezenas a poucas centenas de ciclos
     encerrados por mês, nunca milhares)."""
@@ -197,5 +204,7 @@ def count_by_status_in_period(
         ClientRecoveryCycle.closed_at >= start,
         ClientRecoveryCycle.closed_at <= end,
     )
+    if assigned_user_id is not None:
+        stmt = stmt.where(ClientRecoveryCycle.assigned_user_id == assigned_user_id)
     counts = Counter(session.scalars(stmt).all())
     return dict(counts)

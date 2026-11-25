@@ -15,10 +15,12 @@ from nexasalon_api.core.actor import ActorContext
 from nexasalon_api.core.db import SessionLocal
 from nexasalon_api.core.exceptions import ConflictError, ValidationDomainError
 from nexasalon_api.models.appointment import Appointment, AppointmentItem
+from nexasalon_api.models.cash_register import CashRegister
 from nexasalon_api.models.client import Client
 from nexasalon_api.models.enums import (
     AppointmentStatus,
     BenefitType,
+    CashRegisterStatus,
     OrderStatus,
     RecoveryContactChannel,
     RecoveryContactResult,
@@ -30,7 +32,9 @@ from nexasalon_api.models.organization import Branch, Organization
 from nexasalon_api.models.professional import Professional
 from nexasalon_api.models.service import Service
 from nexasalon_api.repositories import client_recovery_repo
+from nexasalon_api.schemas.order import OrderClose, PaymentCreate
 from nexasalon_api.services import client_recovery as recovery_service
+from nexasalon_api.services import orders as orders_service
 
 _NOW = datetime.now(timezone.utc)
 
@@ -541,11 +545,6 @@ def test_reentrada_automatica_esta_realmente_conectada_ao_cancelamento_real(org_
 
 def test_retorno_atendido_vira_recuperado_quando_comanda_fecha(org_session):
     """Integração real com `services/orders.py::close_order`."""
-    from nexasalon_api.models.cash_register import CashRegister
-    from nexasalon_api.models.enums import CashRegisterStatus
-    from nexasalon_api.schemas.order import OrderClose, PaymentCreate
-    from nexasalon_api.services import orders as orders_service
-
     session, org_id = org_session
     actor = _actor(session, org_id, permissions=frozenset({
         "clients.recovery.view", "clients.recovery.manage", "clients.recovery.view_team",
@@ -643,3 +642,291 @@ def test_acompanhamento_vencido_volta_para_pendentes(org_session):
     pending = recovery_service.list_recovery_queue(session, actor, subtab="pending", min_days=60)
     assert len(pending.items) == 1
     assert pending.items[0].is_overdue is True
+
+
+# ---------------------------------------------------------------------------
+# Receita recuperada
+# ---------------------------------------------------------------------------
+
+
+def _recover_with_order(session, actor, org_id, *, price=Decimal("120.00"), benefit=None, days_ago_closed=0):
+    """Fluxo completo e real (via service layer, não ORM solto):
+    cliente elegível -> agendamento de retorno -> `log_contact`
+    (RETURN_SCHEDULED) -> comanda criada/fechada -> hook vira o ciclo
+    `recovered`. Devolve `(client, cycle, order)`."""
+    client, branch, prof, svc = _eligible_client(session, org_id)
+    future_appt = _appointment(
+        session, org_id, branch.id, client.id, prof.id, svc.id,
+        start_at=_NOW + timedelta(hours=2), price=price,
+    )
+    cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=RecoveryContactChannel.WHATSAPP,
+        contact_result=RecoveryContactResult.RETURN_SCHEDULED, notes=None,
+        next_contact_at=None, linked_appointment_id=future_appt.id,
+    )
+    cash_register = CashRegister(
+        organization_id=org_id, branch_id=branch.id, opened_by=actor.user_id, opened_by_name="Teste",
+        initial_amount=Decimal(0), status=CashRegisterStatus.OPEN,
+    )
+    session.add(cash_register)
+    session.flush()
+    order = orders_service.create_order(session, actor, future_appt.id)
+    # `orders_service.create_order` (serviço real) calcula o próprio
+    # `order_number` direto do banco (`max(...)+1`), sem olhar pro
+    # contador global `_order_number_counter` deste arquivo de teste —
+    # ressincroniza aqui pra uma PRÓXIMA chamada de `_closed_order`/
+    # `_eligible_client` (mesmo org/sessão) nunca reutilizar um número
+    # que o serviço real já gravou.
+    global _order_number_counter
+    _order_number_counter = max(_order_number_counter, order.order_number)
+    if benefit is not None:
+        item = order.items[0]
+        item.benefit_type = BenefitType.LOYALTY
+        item.benefit_amount = benefit
+        session.flush()
+    charged = price - (benefit or Decimal(0))
+    orders_service.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method="pix", amount=charged, cash_register_id=cash_register.id)] if charged > 0 else []),
+    )
+    if days_ago_closed:
+        order.closed_at = _NOW - timedelta(days=days_ago_closed)
+        session.flush()
+    cycle = client_recovery_repo.get(session, org_id, cycle.id)
+    return client, cycle, order
+
+
+_RECOVERY_PERMS = frozenset({
+    "clients.recovery.view", "clients.recovery.manage", "clients.recovery.view_team",
+    "orders.manage", "finance.manage", "orders.reopen", "orders.cancel",
+})
+
+
+def test_receita_recuperada_desconta_beneficio(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    _recover_with_order(session, actor, org_id, price=Decimal("310.00"), benefit=Decimal("50.00"))
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    assert summary.recovered_count == 1
+    assert summary.recovered_revenue == Decimal("260.00")
+
+
+def test_receita_recuperada_soma_varios_ciclos_sem_duplicar(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    _recover_with_order(session, actor, org_id, price=Decimal("100.00"))
+    _recover_with_order(session, actor, org_id, price=Decimal("150.00"))
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    assert summary.recovered_count == 2
+    assert summary.recovered_revenue == Decimal("250.00")
+
+
+def test_receita_recuperada_fora_do_periodo_nao_conta(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    _recover_with_order(session, actor, org_id, price=Decimal("100.00"), days_ago_closed=40)
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=10), date_to=_NOW,
+    )
+    assert summary.recovered_count == 0
+    assert summary.recovered_revenue == Decimal(0)
+
+
+def test_receita_recuperada_comanda_reaberta_para_de_contar_ate_fechar_de_novo(org_session):
+    from nexasalon_api.schemas.order import OrderReopen
+
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    _client, _cycle, order = _recover_with_order(session, actor, org_id, price=Decimal("120.00"))
+
+    summary_before = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    assert summary_before.recovered_revenue == Decimal("120.00")
+
+    orders_service.reopen_order(session, actor, order.id, OrderReopen(reason="Correção de preço"))
+    summary_reopened = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    assert summary_reopened.recovered_revenue == Decimal(0)  # comanda aberta não conta
+
+    order.items[0].price = Decimal("200.00")
+    session.flush()
+    cash_register = CashRegister(
+        organization_id=org_id, branch_id=order.branch_id, opened_by=actor.user_id, opened_by_name="Teste",
+        initial_amount=Decimal(0), status=CashRegisterStatus.OPEN,
+    )
+    session.add(cash_register)
+    session.flush()
+    orders_service.close_order(
+        session, actor, order.id,
+        OrderClose(payments=[PaymentCreate(method="pix", amount=Decimal("200.00"), cash_register_id=cash_register.id)]),
+    )
+    summary_after = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    assert summary_after.recovered_revenue == Decimal("200.00")  # valor NOVO, nunca o congelado
+
+
+def test_receita_recuperada_comanda_cancelada_apos_reabrir_nunca_conta(org_session):
+    from nexasalon_api.schemas.order import OrderCancel, OrderReopen
+
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    _client, cycle, order = _recover_with_order(session, actor, org_id, price=Decimal("120.00"))
+
+    orders_service.reopen_order(session, actor, order.id, OrderReopen(reason="Cliente pediu cancelamento"))
+    orders_service.cancel_order(session, actor, order.id, OrderCancel(reason="Cancelado a pedido da cliente"))
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    assert summary.recovered_revenue == Decimal(0)
+    # O ciclo em si continua "recovered" (reabertura/cancelamento da
+    # comanda não reabre o ciclo de recuperação automaticamente — regra
+    # separada, só o agendamento cancelado reabre o ciclo).
+    refreshed = client_recovery_repo.get(session, org_id, cycle.id)
+    assert refreshed.status == RecoveryCycleStatus.RECOVERED
+
+
+def test_receita_recuperada_sem_comanda_fechada_conta_recuperado_mas_zero_receita(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    client, branch, prof, svc = _eligible_client(session, org_id)
+    future_appt = _appointment(session, org_id, branch.id, client.id, prof.id, svc.id, start_at=_NOW + timedelta(hours=2))
+    cycle = recovery_service.log_contact(
+        session, actor, client.id, contact_channel=RecoveryContactChannel.WHATSAPP,
+        contact_result=RecoveryContactResult.RETURN_SCHEDULED, notes=None,
+        next_contact_at=None, linked_appointment_id=future_appt.id,
+    )
+    # Força "recuperado" sem nunca ter existido uma comanda fechada
+    # (ex.: atendimento registrado só na agenda, conforme a regra
+    # operacional existente admite) — nunca deve inventar receita.
+    cycle.status = RecoveryCycleStatus.RECOVERED
+    cycle.closed_at = _NOW
+    session.flush()
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    assert summary.recovered_count == 1
+    assert summary.recovered_revenue == Decimal(0)
+
+
+def test_concluded_count_soma_todos_os_status_terminais_do_periodo(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    _recover_with_order(session, actor, org_id, price=Decimal("50.00"))  # recovered
+
+    client2, *_ = _eligible_client(session, org_id)
+    recovery_service.log_contact(
+        session, actor, client2.id, contact_channel=RecoveryContactChannel.CALL,
+        contact_result=RecoveryContactResult.NOT_INTERESTED, notes=None,
+        next_contact_at=None, linked_appointment_id=None,
+    )  # lost
+
+    client3, *_ = _eligible_client(session, org_id)
+    recovery_service.log_contact(
+        session, actor, client3.id, contact_channel=RecoveryContactChannel.CALL,
+        contact_result=RecoveryContactResult.INVALID_PHONE, notes=None,
+        next_contact_at=None, linked_appointment_id=None,
+    )  # invalid_phone
+
+    summary = recovery_service.get_recovery_summary(
+        session, actor, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    assert summary.recovered_count == 1
+    assert summary.not_interested_count == 1
+    assert summary.concluded_count == 3  # recovered + lost + invalid_phone
+
+
+def test_escopo_de_equipe_aplica_igual_a_recuperados_e_receita(org_session):
+    """Correção desta rodada: antes, `recovered_count`/`recovered_revenue`
+    nunca respeitavam `view_team`, só Pendentes/Acompanhamento — agora os
+    3 números do card "Recuperados" sempre descrevem a MESMA população."""
+    session, org_id = org_session
+    owner = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    restricted = _actor(session, org_id, permissions=frozenset({
+        "clients.recovery.view", "clients.recovery.manage", "orders.manage", "finance.manage",
+    }))
+    _recover_with_order(session, owner, org_id, price=Decimal("90.00"))
+    _recover_with_order(session, restricted, org_id, price=Decimal("40.00"))
+
+    summary_restricted = recovery_service.get_recovery_summary(
+        session, restricted, date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+    )
+    assert summary_restricted.recovered_count == 1
+    assert summary_restricted.recovered_revenue == Decimal("40.00")
+
+
+def test_mascaramento_financeiro_oculta_receita_recuperada_sem_permissao(org_session):
+    """Mesmo contrato de `total_spent`: o SERVIÇO sempre calcula o valor
+    real; é a ROTA quem decide devolver `None` sem `finance.view`."""
+    from nexasalon_api.api.v1 import client_recovery as recovery_api
+
+    session, org_id = org_session
+    owner = _actor(session, org_id, permissions=_RECOVERY_PERMS)
+    _recover_with_order(session, owner, org_id, price=Decimal("90.00"))
+
+    restricted = _actor(session, org_id, permissions=frozenset({
+        "clients.recovery.view", "clients.recovery.view_team",
+    }))
+    result = recovery_api.get_recovery_summary(
+        date_from=_NOW - timedelta(days=1), date_to=_NOW + timedelta(days=1),
+        session=session, actor=restricted,
+    )
+    assert result.recovered_revenue is None
+    assert result.recovered_count == 1  # contagem nunca é financeira, continua visível
+
+
+# ---------------------------------------------------------------------------
+# Filtros por procedimento/profissional (aplicados antes da paginação)
+# ---------------------------------------------------------------------------
+
+
+def test_filtro_por_procedimento_atua_sobre_toda_populacao_antes_de_paginar(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    prof_a = _professional(session, org_id, branch.id, "Ianka")
+    prof_b = _professional(session, org_id, branch.id, "Ingrid")
+    svc_corte = _service(session, org_id, "Corte")
+    svc_escova = _service(session, org_id, "Escova")
+    client_a = _client(session, org_id, "Cliente Corte")
+    client_b = _client(session, org_id, "Cliente Escova")
+    _visit(session, org_id, branch.id, client_a.id, prof_a.id, svc_corte.id, closed_at=_NOW - timedelta(days=65), service_name="Corte")
+    _visit(session, org_id, branch.id, client_b.id, prof_b.id, svc_escova.id, closed_at=_NOW - timedelta(days=65), service_name="Escova")
+
+    result = recovery_service.list_recovery_queue(
+        session, actor, subtab="pending", min_days=60, last_procedure_service_id=svc_corte.id, page=1, page_size=1,
+    )
+    # `total` reflete a população FILTRADA inteira, mesmo com page_size=1
+    # (prova que o filtro roda antes do corte de paginação, nunca depois).
+    assert result.total == 1
+    assert result.items[0].client.id == client_a.id
+
+
+def test_filtro_por_profissional_atua_sobre_toda_populacao_antes_de_paginar(org_session):
+    session, org_id = org_session
+    actor = _actor(session, org_id)
+    branch = _branch(session, org_id)
+    prof_a = _professional(session, org_id, branch.id, "Ianka")
+    prof_b = _professional(session, org_id, branch.id, "Ingrid")
+    svc = _service(session, org_id)
+    client_a = _client(session, org_id, "Cliente Ianka")
+    client_b = _client(session, org_id, "Cliente Ingrid")
+    _visit(session, org_id, branch.id, client_a.id, prof_a.id, svc.id, closed_at=_NOW - timedelta(days=65), professional_name="Ianka")
+    _visit(session, org_id, branch.id, client_b.id, prof_b.id, svc.id, closed_at=_NOW - timedelta(days=66), professional_name="Ingrid")
+
+    result = recovery_service.list_recovery_queue(
+        session, actor, subtab="pending", min_days=60, last_professional_id=prof_b.id, page=1, page_size=1,
+    )
+    assert result.total == 1
+    assert result.items[0].client.id == client_b.id

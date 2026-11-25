@@ -77,6 +77,7 @@ from nexasalon_api.repositories import (
     organization_repo,
     user_repo,
 )
+from nexasalon_api.services import order_totals
 from nexasalon_api.services.clients import UPCOMING_APPOINTMENT_STATUSES
 
 _ACTIVE_CYCLE_STATUSES = frozenset({RecoveryCycleStatus.PENDING, RecoveryCycleStatus.IN_PROGRESS})
@@ -217,6 +218,11 @@ class RecoveryQueueRow:
     days_since_last_visit: int | None
     last_professional_names: list[str]
     last_service_names: list[str]
+    # Ids correspondentes (mesma ordem/origem de `last_*_names`) — usados
+    # só para filtrar por procedimento/profissional (nunca por nome, que
+    # pode colidir entre registros diferentes).
+    last_service_ids: list[uuid.UUID]
+    last_professional_ids: list[uuid.UUID]
     next_appointment_at: datetime | None
     total_spent: Decimal
     is_overdue: bool
@@ -230,10 +236,21 @@ class RecoveryQueueResult:
     page_size: int
 
 
-def _order_professional_and_service_names(order) -> tuple[list[str], list[str]]:
-    professionals = list(dict.fromkeys(item.professional_name for item in order.items))
-    services = list(dict.fromkeys(item.service_name for item in order.items))
-    return professionals, services
+@dataclass(frozen=True)
+class _OrderItemSummary:
+    professional_names: list[str]
+    service_names: list[str]
+    professional_ids: list[uuid.UUID]
+    service_ids: list[uuid.UUID]
+
+
+def _summarize_order_items(order) -> _OrderItemSummary:
+    return _OrderItemSummary(
+        professional_names=list(dict.fromkeys(item.professional_name for item in order.items)),
+        service_names=list(dict.fromkeys(item.service_name for item in order.items)),
+        professional_ids=list(dict.fromkeys(item.professional_id for item in order.items)),
+        service_ids=list(dict.fromkeys(item.service_id for item in order.items)),
+    )
 
 
 def _most_relevant_cycle(cycles: list[ClientRecoveryCycle]) -> tuple[ClientRecoveryCycle | None, ClientRecoveryCycle | None]:
@@ -264,10 +281,15 @@ def list_recovery_queue(
     has_phone: bool | None = None,
     overdue_only: bool = False,
     concluded_statuses: frozenset[RecoveryCycleStatus] | None = None,
+    last_procedure_service_id: uuid.UUID | None = None,
+    last_professional_id: uuid.UUID | None = None,
     sort: str = "days_desc",
     page: int = 1,
     page_size: int = 20,
 ) -> RecoveryQueueResult:
+    """Todos os filtros abaixo (dias, procedimento, profissional) são
+    aplicados sobre a população ELEGÍVEL INTEIRA, sempre ANTES do corte
+    de paginação no final — nunca sobre a página já fatiada."""
     if subtab not in ("pending", "in_progress", "concluded"):
         raise ValueError(f"subtab inválida: {subtab!r}")
 
@@ -292,6 +314,10 @@ def list_recovery_queue(
         rows = [r for r in rows if r.days_since_last_visit is not None and r.days_since_last_visit >= min_days]
     if max_days is not None:
         rows = [r for r in rows if r.days_since_last_visit is not None and r.days_since_last_visit <= max_days]
+    if last_procedure_service_id is not None:
+        rows = [r for r in rows if last_procedure_service_id in r.last_service_ids]
+    if last_professional_id is not None:
+        rows = [r for r in rows if last_professional_id in r.last_professional_ids]
 
     rows = _sort_rows(rows, sort)
 
@@ -402,15 +428,17 @@ def _list_pending_or_in_progress(
         if overdue_only and not is_overdue:
             continue
 
-        professionals, services = _order_professional_and_service_names(order)
+        summary = _summarize_order_items(order)
         rows.append(
             RecoveryQueueRow(
                 client=client,
                 cycle=active_cycle,
                 last_visit_at=order.closed_at,
                 days_since_last_visit=_days_between(order.closed_at, now, tz) if order.closed_at else None,
-                last_professional_names=professionals,
-                last_service_names=services,
+                last_professional_names=summary.professional_names,
+                last_service_names=summary.service_names,
+                last_service_ids=summary.service_ids,
+                last_professional_ids=summary.professional_ids,
                 next_appointment_at=next_appointment.get(client.id),
                 total_spent=total_spent_by_client.get(client.id, Decimal(0)),
                 is_overdue=is_overdue,
@@ -469,7 +497,7 @@ def _list_concluded(
             if needle and needle not in client.name.lower():
                 continue
         order = last_closed_order.get(client.id)
-        professionals, services = _order_professional_and_service_names(order) if order is not None else ([], [])
+        summary = _summarize_order_items(order) if order is not None else _OrderItemSummary([], [], [], [])
         rows.append(
             RecoveryQueueRow(
                 client=client,
@@ -478,8 +506,10 @@ def _list_concluded(
                 days_since_last_visit=(
                     _days_between(order.closed_at, now, tz) if order is not None and order.closed_at else None
                 ),
-                last_professional_names=professionals,
-                last_service_names=services,
+                last_professional_names=summary.professional_names,
+                last_service_names=summary.service_names,
+                last_service_ids=summary.service_ids,
+                last_professional_ids=summary.professional_ids,
                 next_appointment_at=None,
                 total_spent=total_spent_by_client.get(client.id, Decimal(0)),
                 is_overdue=False,
@@ -494,17 +524,56 @@ class RecoverySummary:
     in_progress_count: int
     recovered_count: int
     not_interested_count: int
+    # Soma de TODOS os status terminais encerrados no período (badge da
+    # aba Concluídos) — superset de `recovered_count`/`not_interested_count`
+    # (que são só 2 dos 6 status terminais possíveis).
+    concluded_count: int
+    # "Receita recuperada" (item novo) — sempre o valor LÍQUIDO (preço −
+    # benefício, `order_totals.order_charged_total`) das comandas FECHADAS
+    # vinculadas aos ciclos `recovered` encerrados no período. Nunca
+    # estimado: um ciclo recuperado sem comanda fechada correspondente
+    # contribui R$0, nunca um valor inventado.
+    recovered_revenue: Decimal
     date_from: datetime
     date_to: datetime
+
+
+def _recovered_revenue(
+    session: Session, organization_id: uuid.UUID, *, date_from: datetime, date_to: datetime,
+    assigned_user_id: uuid.UUID | None,
+) -> Decimal:
+    """Receita recuperada do período — ver docstring de `RecoverySummary`.
+
+    Deduplicação por `Order.id` (nunca por ciclo/agendamento): resolve
+    primeiro um dict `{order.id: order}` a partir do conjunto (já
+    deduplicado em `set()`) de `linked_appointment_id`s dos ciclos
+    `recovered` do período, e só soma os VALORES desse dict — mesmo que,
+    por hipótese, dois ciclos diferentes apontassem pra mesma comanda,
+    ela entraria uma única vez na soma. `order_repo.list_for_appointments`
+    já filtra só `CLOSED` — lê o estado ATUAL da comanda a cada chamada
+    (nunca um valor congelado no momento da recuperação): uma comanda
+    reaberta some da soma até fechar de novo; uma cancelada nunca conta."""
+    recovered_cycles = client_recovery_repo.list_by_org(
+        session, organization_id, statuses=frozenset({RecoveryCycleStatus.RECOVERED}),
+        assigned_user_id=assigned_user_id,
+    )
+    recovered_cycles = [
+        c for c in recovered_cycles
+        if c.closed_at is not None and date_from <= c.closed_at <= date_to
+    ]
+    appointment_ids = list({c.linked_appointment_id for c in recovered_cycles if c.linked_appointment_id is not None})
+    orders_by_id = {o.id: o for o in order_repo.list_for_appointments(session, organization_id, appointment_ids)}
+    return sum((order_totals.order_charged_total(o) for o in orders_by_id.values()), Decimal(0))
 
 
 def get_recovery_summary(
     session: Session, actor: ActorContext, *, date_from: datetime, date_to: datetime
 ) -> RecoverySummary:
     """4 indicadores (item 3 do pedido). Pendentes/Em acompanhamento são
-    ESTOQUE atual (nunca dependem do período); Recuperados/Sem interesse
-    são HISTÓRICOS (ciclos ENCERRADOS dentro do período informado) —
-    nunca misturados na mesma conta, exatamente como pedido."""
+    ESTOQUE atual (nunca dependem do período); Recuperados/Receita
+    recuperada/Sem interesse/`concluded_count` são HISTÓRICOS (ciclos
+    cujo `closed_at` cai dentro do período informado) — nunca misturados
+    na mesma conta, exatamente como pedido."""
     organization_id = actor.organization_id
     can_view_team = "clients.recovery.view_team" in actor.permissions
     assigned_user_id = None if can_view_team else actor.user_id
@@ -538,16 +607,23 @@ def get_recovery_summary(
     )
 
     closed_counts = client_recovery_repo.count_by_status_in_period(
-        session, organization_id, date_from, date_to
+        session, organization_id, date_from, date_to, assigned_user_id=assigned_user_id,
     )
     recovered_count = closed_counts.get(RecoveryCycleStatus.RECOVERED, 0)
     not_interested_count = closed_counts.get(RecoveryCycleStatus.LOST, 0)
+    concluded_count = sum(closed_counts.values())
+
+    recovered_revenue = _recovered_revenue(
+        session, organization_id, date_from=date_from, date_to=date_to, assigned_user_id=assigned_user_id,
+    )
 
     return RecoverySummary(
         pending_count=pending_count,
         in_progress_count=in_progress_count,
         recovered_count=recovered_count,
         not_interested_count=not_interested_count,
+        concluded_count=concluded_count,
+        recovered_revenue=recovered_revenue,
         date_from=date_from,
         date_to=date_to,
     )

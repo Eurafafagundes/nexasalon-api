@@ -121,6 +121,10 @@ class RecoverySummaryRead(BaseModel):
     in_progress_count: int
     recovered_count: int
     not_interested_count: int
+    concluded_count: int
+    # `None` sem `finance.view` — mesmo contrato de `total_spent` em
+    # `RecoveryQueueRowRead` (a rota decide, nunca o frontend).
+    recovered_revenue: Decimal | None
     date_from: datetime
     date_to: datetime
 
