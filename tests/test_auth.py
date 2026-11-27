@@ -1790,3 +1790,153 @@ def test_cross_tenant_nao_acessa_membership_de_outra_organizacao(client, scenari
     me_resp = client.get("/api/v1/auth/me", headers=_auth_headers(token_b))
     assert me_resp.json()["organization"]["id"] == str(scenario.org_b_id)
     assert me_resp.json()["organization"]["id"] != str(scenario.org_a_id)
+
+
+# ---------------------------------------------------------------------
+# Validação adicional solicitada antes da publicação: concorrência real,
+# atividade em segundo plano, desativação com access token ainda válido,
+# isolamento multi-tenant através da janela de graça.
+# ---------------------------------------------------------------------
+
+
+def test_refresh_concorrente_com_conexoes_reais_nunca_derruba_a_sessao_legitima(scenario):
+    """Reproduz a causa raiz original SEM simulação sequencial: N
+    THREADS de verdade, cada uma abrindo sua PRÓPRIA conexão real com o
+    Postgres (via `SessionLocal()`), apresentando o MESMO refresh token
+    recém-emitido ao mesmo tempo de verdade (barreira de threading, não
+    só "uma chamada depois da outra" dentro do mesmo processo
+    single-threaded como os testes anteriores). As 3 camadas de defesa
+    (lock de linha + janela de graça + checagens de limite) precisam
+    resolver isso sem derrubar a sessão: pela ordem causal da cadeia
+    (cada rotação só pode começar depois que a anterior comitou), as N
+    chamadas devem ser serializadas pelo lock de linha e TODAS devem
+    suceder, cada uma recebendo um par de tokens novo e válido — nenhuma
+    cai no caminho de "roubo" (reuso fora da janela de graça), porque a
+    cadeia inteira de N rotações comitadas em sequência leva muito menos
+    que os 10s da janela."""
+    import threading
+
+    from nexasalon_api.services import auth as auth_service
+
+    boot_client = TestClient(app)
+    boot_client.post(
+        "/api/v1/auth/login", json={"email": scenario.single_org_email, "password": scenario.password}
+    )
+    raw_refresh = boot_client.cookies.get(settings.refresh_cookie_name)
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    results: list[object] = [None] * n_threads
+
+    def worker(i: int) -> None:
+        barrier.wait()  # força as N threads chamarem refresh() o mais próximo possível uma da outra
+        try:
+            results[i] = auth_service.refresh(raw_refresh)
+        except Exception as exc:  # noqa: BLE001 - captura qualquer resultado (sucesso ou erro) pra avaliar depois
+            results[i] = exc
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    successes = [r for r in results if hasattr(r, "access_token")]
+    failures = [r for r in results if isinstance(r, Exception)]
+    assert not failures, f"corrida concorrente com conexões reais derrubou chamada(s): {failures}"
+    assert len(successes) == n_threads, (
+        f"esperava que as {n_threads} chamadas concorrentes (serializadas pelo lock de linha, "
+        f"todas dentro da janela de graça) tivessem sucesso; só {len(successes)} tiveram"
+    )
+
+    # A sessão resultante continua de verdade utilizável no final da
+    # cadeia — não é um token "morto" só porque sobreviveu à corrida.
+    final = auth_service.refresh(successes[-1].refresh_token)
+    assert final.access_token
+
+
+def test_chamadas_autenticadas_comuns_nao_renovam_last_used_at_do_refresh_token(client, scenario):
+    """`last_used_at` só avança numa rotação de refresh BEM-SUCEDIDA.
+    Nenhuma chamada autenticada só por ACCESS TOKEN (ex.: GET /auth/me,
+    repetida) toca `refresh_tokens` de forma alguma — garante que
+    "atividade em segundo plano" que nunca passa por /auth/refresh
+    jamais estende a sessão artificialmente."""
+    body = _login(client, scenario.single_org_email, scenario.password)
+    raw_refresh = client.cookies.get(settings.refresh_cookie_name)
+    access_token = body["tokens"]["access_token"]
+
+    last_used_before = _refresh_token_column(raw_refresh, "last_used_at")
+    assert last_used_before is not None
+
+    for _ in range(5):
+        resp = client.get("/api/v1/auth/me", headers=_auth_headers(access_token))
+        assert resp.status_code == 200
+
+    last_used_after = _refresh_token_column(raw_refresh, "last_used_at")
+    assert last_used_after == last_used_before
+
+
+def test_desativacao_derruba_access_token_ainda_valido_em_qualquer_endpoint(client, scenario):
+    """Diferente do logout manual (que só revoga o REFRESH token — o
+    access token já emitido continua criptograficamente válido até seu
+    próprio `exp`, por design: é stateless e de vida curta, ver
+    core/security.py), desativar a membership precisa cortar o acesso
+    NA HORA, mesmo pra um access token que ainda não expirou — porque
+    `api/deps.py::_get_real_current_actor` reconfere o status da
+    membership em TODO request, não só no refresh."""
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    owner_access = owner_body["tokens"]["access_token"]
+
+    recep_client = TestClient(app)
+    recep_login = recep_client.post(
+        "/api/v1/auth/login", json={"email": scenario.recep_email, "password": scenario.password}
+    ).json()
+    recep_access = recep_login["tokens"]["access_token"]
+
+    me_before = recep_client.get("/api/v1/auth/me", headers=_auth_headers(recep_access))
+    assert me_before.status_code == 200
+
+    deactivate_resp = client.patch(
+        f"/api/v1/users/{scenario.recep_membership_id}/deactivate",
+        headers=_auth_headers(owner_access),
+    )
+    assert deactivate_resp.status_code == 200, deactivate_resp.text
+
+    # MESMO access token (não expirou, mesma assinatura/claims) — agora
+    # falha, porque a membership foi revalidada no banco a cada request.
+    me_after = recep_client.get("/api/v1/auth/me", headers=_auth_headers(recep_access))
+    assert me_after.status_code == 403
+
+
+def test_refresh_preserva_organizacao_e_membership_mesmo_na_corrida_benigna(scenario):
+    """O isolamento multi-tenant não pode se perder nem no caminho NOVO
+    (corrida benigna/janela de graça): a ponta da cadeia rotacionada
+    continua emitindo um access token com o MESMO org_id/membership_id
+    do token original — nunca o de outra organização do mesmo usuário
+    multi-org (`multi_org_user` tem membership ativa em A e em B)."""
+    race_client = TestClient(app)
+    login_body = race_client.post(
+        "/api/v1/auth/login", json={"email": scenario.multi_org_email, "password": scenario.password}
+    ).json()
+    select_resp = race_client.post(
+        "/api/v1/auth/select-organization",
+        json={"org_selection_token": login_body["org_selection_token"], "organization_id": str(scenario.org_a_id)},
+    )
+    assert select_resp.status_code == 200
+    raw_refresh = race_client.cookies.get(settings.refresh_cookie_name)
+
+    from nexasalon_api.services import auth as auth_service
+
+    # Rotaciona pela rota HTTP normal -> raw_refresh fica revogado,
+    # ainda dentro da janela de graça.
+    race_client.post("/api/v1/auth/refresh", headers=_csrf_headers())
+
+    # Reapresenta o token original (corrida benigna) e confere que a
+    # sessão devolvida continua presa à ORG A, nunca à ORG B.
+    result = auth_service.refresh(raw_refresh)
+    assert str(result.organization_id) == str(scenario.org_a_id)
+    assert str(result.organization_id) != str(scenario.org_b_id)
+
+    payload = jwt.decode(result.access_token, options={"verify_signature": False})
+    assert payload["org_id"] == str(scenario.org_a_id)
+    assert payload["membership_id"] == str(scenario.multi_membership_a_id)

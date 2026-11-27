@@ -24,6 +24,17 @@ recebem `session_started_at = last_used_at = now()` — ganham um ciclo
 novo de 12h/7 dias a partir do deploy, em vez de forçar um relogin em
 massa imediato.
 
+Coordenação migration/deploy (regra 4.1 do CLAUDE.md — precedente das
+migrations 0058/0059): as 2 colunas levam `server_default=now()`,
+mesmo sendo preenchidas explicitamente pelo código novo em TODO
+INSERT. Sem o default, esta migration deixaria de ser "aditiva e
+retrocompatível" — se aplicada ANTES do deploy do código novo (ordem
+seguro padrão para mudança de schema aditiva), um login/refresh
+servido pelo código ANTIGO ainda em produção (que não conhece estas
+colunas) quebraria com violação de NOT NULL no INSERT. Com o default,
+esse INSERT antigo continua funcionando (Postgres preenche `now()`
+sozinho) durante a janela entre migration e deploy.
+
 Revision ID: 0063
 Revises: 0062
 Create Date: 2026-11-26
@@ -43,11 +54,13 @@ _TABLE_NAME = "refresh_tokens"
 def upgrade() -> None:
     op.add_column(
         _TABLE_NAME,
-        sa.Column("session_started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "session_started_at", sa.DateTime(timezone=True), nullable=True, server_default=sa.text("now()")
+        ),
     )
     op.add_column(
         _TABLE_NAME,
-        sa.Column("last_used_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_used_at", sa.DateTime(timezone=True), nullable=True, server_default=sa.text("now()")),
     )
 
     # Backfill: sessões existentes ganham um ciclo novo a partir de
@@ -57,6 +70,9 @@ def upgrade() -> None:
         f"WHERE session_started_at IS NULL"
     )
 
+    # `server_default` é preservado por este ALTER (só muda a
+    # constraint NOT NULL) — continua valendo pra qualquer INSERT do
+    # código antigo que não mencione estas colunas.
     op.alter_column(_TABLE_NAME, "session_started_at", nullable=False)
     op.alter_column(_TABLE_NAME, "last_used_at", nullable=False)
 

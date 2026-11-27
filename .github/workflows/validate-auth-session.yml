@@ -1,0 +1,60 @@
+name: Validação — sessão de autenticação (Task B)
+
+# Só dispara nesta branch exclusiva de validação — nunca em main, nunca
+# em push normal de outra branch. NÃO aciona deploy no Render nem na
+# Vercel (nenhuma das duas plataformas observa esta branch; o deploy
+# delas continua atrelado só a `main`, intocado por este workflow).
+on:
+  push:
+    branches:
+      - test/validacao-sessao-auth-0063
+  workflow_dispatch: {}
+
+jobs:
+  auth-session-validation:
+    name: Testes de autenticação, concorrência e migration 0063
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # pgserver (Postgres descartável embutido, usado por
+          # tests/conftest.py e pelos testes de migration) só publica
+          # wheel pra manylinux/macOS em cp38-cp312 — nunca pra Windows,
+          # e ainda não pra 3.13. 3.12 é a versão mais nova com wheel
+          # disponível.
+          python-version: "3.12"
+
+      - name: Instalar dependências (extras de dev do pyproject.toml + ruff/mypy, usados localmente mas não declarados ali)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install ruff==0.16.4 mypy==2.3.1
+
+      - name: ruff (lint)
+        run: ruff check src/nexasalon_api
+
+      - name: mypy (type check)
+        run: mypy src/nexasalon_api
+
+      # Nenhuma credencial/dado de produção entra aqui: pgserver sobe um
+      # Postgres ISOLADO e TEMPORÁRIO (processo embutido, apagado ao fim
+      # do job), com um papel de banco criado do zero — nunca aponta pro
+      # Neon. Ver tests/conftest.py (fixture de sessão, usada pela suíte
+      # de autenticação) e tests/test_migration_0063_*.py (fixture
+      # própria, mesmo princípio, usada só pra testar a migration em
+      # isolamento total).
+      - name: Suíte completa de autenticação (login, refresh, RBAC, CSRF, rate limit)
+        run: pytest tests/test_auth.py -v
+
+      - name: Migration 0063 — upgrade, downgrade, backfill e compatibilidade com o backend publicado
+        run: pytest tests/test_migration_0063_refresh_token_session_lifetime.py -v
+
+      # Camada extra de confiança (fora do escopo mínimo pedido, mas
+      # barata em CI): confirma que as mudanças de Task B não regrediram
+      # nenhum outro módulo do backend. Nunca toca a Comissão Condicional
+      # (migrations locais 0053/0054 nunca foram commitadas — não existem
+      # nesta branch/checkout).
+      - name: Regressão completa do backend (bônus)
+        run: pytest --deselect tests/test_migration_0063_refresh_token_session_lifetime.py -q
