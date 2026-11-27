@@ -102,7 +102,7 @@ jobs:
             > pytest_full.log 2>&1
           code=$?
           if [ "$code" -ne 0 ]; then
-            encoded=$(tail -n 80 pytest_full.log | sed ':a;N;$!ba;s/\n/%0A/g')
-            echo "::error title=regressao completa falhou (exit $code)::$encoded"
+            summary=$(grep -E "^(FAILED|ERROR) " pytest_full.log | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=Lista completa de falhas - regressao completa::$summary"
           fi
           exit $code
