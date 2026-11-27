@@ -5,16 +5,36 @@ SEMPRE vem do contexto autenticado, nunca de parâmetro de URL/body cru —
 mesma regra usada na Etapa 2C."""
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from nexasalon_api.core.exceptions import ConflictError, NotFoundError, ValidationDomainError
-from nexasalon_api.core.security import create_invite_token, create_password_reset_token, hash_password
+from nexasalon_api.core.exceptions import (
+    ConflictError,
+    NotFoundError,
+    ValidationDomainError,
+)
+from nexasalon_api.core.security import (
+    create_invite_token,
+    create_password_reset_token,
+    hash_password,
+)
 from nexasalon_api.models.enums import AuditAction, MembershipStatus, PermissionEffect
-from nexasalon_api.models.identity import MembershipPermissionOverride, OrganizationMembership, User
+from nexasalon_api.models.identity import (
+    MembershipPermissionOverride,
+    OrganizationMembership,
+    User,
+)
 from nexasalon_api.models.rbac import Permission
-from nexasalon_api.repositories import audit_log_repo, membership_repo, professional_repo, rbac_repo, user_repo
+from nexasalon_api.repositories import (
+    audit_log_repo,
+    membership_repo,
+    professional_repo,
+    rbac_repo,
+    refresh_token_repo,
+    user_repo,
+)
 from nexasalon_api.services.auth import compute_effective_permissions
 
 # "Usuário Master" (rótulo de produto do role OWNER) nunca é identificado
@@ -211,6 +231,14 @@ def set_membership_status(
 
     membership.status = status
     membership_repo.save(session, membership)
+
+    # Revogação EXPLÍCITA e auditável: toda sessão de refresh token
+    # desta pessoa morre imediatamente, mesmo uma que ainda não tenha
+    # feito nenhuma chamada (antes, o corte dependia só da revalidação
+    # implícita na próxima request/refresh — ainda próxima do imediato,
+    # mas nunca uma ação própria e auditável como esta).
+    if old_status == MembershipStatus.ACTIVE and status != MembershipStatus.ACTIVE:
+        refresh_token_repo.revoke_all_for_user(session, membership.user_id, datetime.now(timezone.utc))
 
     session.flush()
     audit_log_repo.create(

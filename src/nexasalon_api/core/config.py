@@ -64,7 +64,23 @@ class Settings(BaseSettings):
 
     jwt_secret: str = _INSECURE_DEFAULT_JWT_SECRET
     access_token_ttl_minutes: int = 15
-    refresh_token_ttl_days: int = 30
+    # Limite ABSOLUTO da sessão (funcionário), contado a partir de
+    # `RefreshToken.session_started_at` — nunca resetado por rotação,
+    # ao contrário do antigo comportamento "30 dias a partir do último
+    # refresh". Ver `refresh_token_inactivity_hours` pro limite por
+    # ociosidade (os dois são checados juntos em `services/auth.py::refresh`).
+    refresh_token_ttl_days: int = 7
+    # Sessão (funcionário) expira se ficar mais que isto sem nenhum
+    # `/auth/refresh` bem-sucedido — checado contra `last_used_at`.
+    refresh_token_inactivity_hours: int = 12
+    # Janela de tolerância a reuso do refresh token (padrão "reuse
+    # interval", à la Auth0): um token apresentado de novo dentro deste
+    # intervalo após ser rotacionado é tratado como corrida benigna do
+    # próprio usuário/navegador (mutex/lock entre abas falhou ou não
+    # existe nesse navegador), nunca como roubo — a cadeia é seguida até
+    # a ponta válida e rotacionada a partir dela. Fora da janela, reuso
+    # continua sendo tratado como roubo real (revoga tudo), sem mudança.
+    refresh_token_reuse_grace_seconds: int = 10
     org_selection_token_ttl_minutes: int = 5
     invite_token_ttl_days: int = 7
     # Ajuste pós-Etapa L — persistência segura da sessão da CLIENTE final

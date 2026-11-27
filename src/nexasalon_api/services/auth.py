@@ -44,6 +44,7 @@ from nexasalon_api.core.security import (
     hash_password,
     verify_password,
 )
+from nexasalon_api.models.auth import RefreshToken
 from nexasalon_api.models.enums import MembershipStatus
 from nexasalon_api.models.identity import OrganizationMembership
 from nexasalon_api.models.organization import Organization
@@ -166,6 +167,8 @@ def issue_session_tokens(
         token_hash=hash_opaque_token(raw_refresh),
         issued_at=now,
         expires_at=now + timedelta(days=settings.refresh_token_ttl_days),
+        session_started_at=now,
+        last_used_at=now,
     )
 
     return SessionTokens(
@@ -261,35 +264,89 @@ def select_organization(
     )
 
 
+_REUSE_GRACE_MAX_CHAIN_HOPS = 20
+
+
+def _walk_to_valid_tip(session: Session, token: RefreshToken) -> RefreshToken | None:
+    """Segue `replaced_by_id` a partir de um token JÁ revogado até achar
+    a ponta ainda válida (não revogada) da cadeia, travando cada salto
+    (`FOR UPDATE`) — usado só dentro da janela de graça de reuso (ver
+    `refresh`), nunca fora dela. Devolve `None` se a cadeia termina sem
+    nenhuma ponta válida (ex.: a sessão foi mesmo revogada por completo
+    depois — logout manual ou desativação — e não há nada pra devolver;
+    o chamador cai no caminho de revogação total nesse caso)."""
+    current: RefreshToken | None = token
+    for _ in range(_REUSE_GRACE_MAX_CHAIN_HOPS):
+        if current is None or current.replaced_by_id is None:
+            return None
+        current = refresh_token_repo.get_by_id_for_update(session, current.replaced_by_id)
+        if current is not None and current.revoked_at is None:
+            return current
+    return None
+
+
 def refresh(raw_refresh_token: str) -> SessionTokens:
     """Rotação com detecção de reuso: cada refresh consome (revoga) o
     token apresentado e emite um novo. Se um token JÁ revogado for
-    apresentado de novo, tratamos como possível vazamento/roubo e
-    revogamos TODOS os refresh tokens ativos do usuário — a próxima
-    tentativa de refresh de qualquer sessão antiga também falhará,
-    forçando novo login."""
+    apresentado de novo FORA da janela de graça (`refresh_token_reuse_grace_seconds`),
+    tratamos como possível vazamento/roubo e revogamos TODOS os refresh
+    tokens ativos do usuário — a próxima tentativa de refresh de
+    qualquer sessão antiga também falhará, forçando novo login.
+
+    DENTRO da janela de graça, o reuso é tratado como uma corrida
+    benigna do próprio usuário/navegador (duas abas ou requisições
+    apresentando o mesmo token quase ao mesmo tempo, sem mutex/lock no
+    frontend, ou em um navegador sem suporte a `navigator.locks`) —
+    seguimos a cadeia até a ponta ainda válida e rotacionamos a partir
+    dela (nunca reusamos o segredo já consumido, que nunca fica
+    armazenado em claro). Padrão reconhecido como "reuse interval"
+    (ex.: Auth0), não um afrouxamento de segurança: só neutraliza
+    corridas do próprio usuário, nunca ajuda quem apresente o cookie
+    roubado fora dessa janela de poucos segundos.
+
+    Além do limite de uso único, a sessão agora tem um limite ABSOLUTO
+    (`refresh_token_ttl_days`, contado desde `session_started_at` —
+    nunca resetado por rotação) e um limite por INATIVIDADE
+    (`refresh_token_inactivity_hours`, contado desde `last_used_at`)."""
     token_hash = hash_opaque_token(raw_refresh_token)
     now = datetime.now(timezone.utc)
 
     session = SessionLocal()
     try:
-        token = refresh_token_repo.get_by_hash(session, token_hash)
+        # Lock de linha: serializa chamadas concorrentes apresentando o
+        # MESMO token (a causa raiz dos logouts prematuros) — a segunda
+        # chamada só destrava depois que a primeira comitar a rotação,
+        # e então já vê `revoked_at` preenchido (cai na janela de graça
+        # abaixo, em vez de uma corrida real).
+        token = refresh_token_repo.get_by_hash_for_update(session, token_hash)
         if token is None:
             session.commit()
             raise UnauthorizedError("Refresh token inválido.")
 
         if token.revoked_at is not None:
-            revoked_count = refresh_token_repo.revoke_all_for_user(
-                session, token.user_id, now
+            grace_deadline = token.revoked_at + timedelta(
+                seconds=settings.refresh_token_reuse_grace_seconds
             )
-            session.commit()
-            raise UnauthorizedError(
-                f"Refresh token já utilizado. {revoked_count} sessão(ões) revogada(s) por segurança."
-            )
+            valid_tip = _walk_to_valid_tip(session, token) if now <= grace_deadline else None
+            if valid_tip is None:
+                revoked_count = refresh_token_repo.revoke_all_for_user(
+                    session, token.user_id, now
+                )
+                session.commit()
+                raise UnauthorizedError(
+                    f"Refresh token já utilizado. {revoked_count} sessão(ões) revogada(s) por segurança."
+                )
+            # Corrida benigna: rotaciona a partir da ponta válida da
+            # cadeia, nunca a partir do segredo já consumido.
+            token = valid_tip
 
         if token.expires_at <= now:
             session.commit()
-            raise UnauthorizedError("Refresh token expirado.")
+            raise UnauthorizedError("Sessão expirada — faça login novamente.")
+
+        if now - token.last_used_at > timedelta(hours=settings.refresh_token_inactivity_hours):
+            session.commit()
+            raise UnauthorizedError("Sessão expirada por inatividade — faça login novamente.")
 
         user_id = token.user_id
         organization_id = token.organization_id
@@ -332,7 +389,11 @@ def refresh(raw_refresh_token: str) -> SessionTokens:
             membership_id=membership_id,
             token_hash=hash_opaque_token(new_raw_refresh),
             issued_at=now,
-            expires_at=now + timedelta(days=settings.refresh_token_ttl_days),
+            # `session_started_at` propagado sem alteração — nunca
+            # resetado por rotação, é o que sustenta o limite ABSOLUTO.
+            expires_at=token.session_started_at + timedelta(days=settings.refresh_token_ttl_days),
+            session_started_at=token.session_started_at,
+            last_used_at=now,
         )
         refresh_token_repo.mark_rotated(session, token, new_token, now)
 

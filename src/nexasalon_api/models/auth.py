@@ -39,6 +39,14 @@ class RefreshToken(Base, UUIDPKMixin):
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Gravado uma única vez no login e propagado sem alteração por toda
+    # a cadeia de rotações (nunca resetado a cada `refresh`) — é o que
+    # permite um limite ABSOLUTO de sessão de verdade, diferente de
+    # `issued_at`/`expires_at`, que mudam a cada rotação.
+    session_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Atualizado a cada rotação com sucesso — mede inatividade da sessão
+    # (independente do limite absoluto acima).
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     replaced_by_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("refresh_tokens.id", ondelete="SET NULL")
     )

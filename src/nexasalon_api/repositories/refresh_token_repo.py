@@ -12,6 +12,30 @@ def get_by_hash(session: Session, token_hash: str) -> RefreshToken | None:
     return session.scalars(stmt).first()
 
 
+def get_by_hash_for_update(session: Session, token_hash: str) -> RefreshToken | None:
+    """Busca com lock de linha (`FOR UPDATE`) — serializa chamadas de
+    `refresh` concorrentes que apresentem o MESMO refresh token (a causa
+    raiz dos logouts prematuros: duas abas/requisições expirando o
+    access token quase ao mesmo tempo, sem mutex/lock no frontend). A
+    segunda chamada bloqueia até a primeira cometer a rotação; ao
+    destravar, já vê o token revogado e cai na janela de graça de reuso
+    em `services/auth.py::refresh`, em vez de uma corrida real contra o
+    próprio banco."""
+    stmt = select(RefreshToken).where(RefreshToken.token_hash == token_hash).with_for_update()
+    return session.scalars(stmt).first()
+
+
+def get_by_id_for_update(session: Session, token_id: uuid.UUID) -> RefreshToken | None:
+    """Busca com lock de linha (`FOR UPDATE`) — usada para andar a
+    cadeia `replaced_by_id` até a ponta válida durante a janela de
+    graça de reuso em `services/auth.py::refresh`, evitando uma corrida
+    nova dentro da própria correção de corrida (duas requisições
+    simultâneas seguindo a mesma cadeia não podem rotacionar a partir
+    do mesmo nó)."""
+    stmt = select(RefreshToken).where(RefreshToken.id == token_id).with_for_update()
+    return session.scalars(stmt).first()
+
+
 def create(
     session: Session,
     *,
@@ -21,6 +45,8 @@ def create(
     token_hash: str,
     issued_at: datetime,
     expires_at: datetime,
+    session_started_at: datetime,
+    last_used_at: datetime,
 ) -> RefreshToken:
     token = RefreshToken(
         user_id=user_id,
@@ -29,6 +55,8 @@ def create(
         token_hash=token_hash,
         issued_at=issued_at,
         expires_at=expires_at,
+        session_started_at=session_started_at,
+        last_used_at=last_used_at,
     )
     session.add(token)
     session.flush()

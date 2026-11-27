@@ -208,6 +208,38 @@ def _auth_headers(access_token: str) -> dict:
     return {"Authorization": f"Bearer {access_token}"}
 
 
+def _backdate_refresh_token(raw_token: str, *, sql_delta: str) -> None:
+    """Empurra campos de tempo de UM refresh token (pelo valor bruto do
+    cookie) pra trás, direto no banco — simula a passagem do tempo sem
+    depender do relógio real (mesmo padrão de `_make_stale` em
+    `test_cash_register_config.py`). `refresh_tokens` não tem RLS (ver
+    docstring do modelo), então não precisa de `app.current_org_id`."""
+    from nexasalon_api.core.security import hash_opaque_token
+
+    session = SessionLocal()
+    try:
+        session.execute(
+            text(f"UPDATE refresh_tokens SET {sql_delta} WHERE token_hash = :h"),
+            {"h": hash_opaque_token(raw_token)},
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
+def _refresh_token_column(raw_token: str, column: str):
+    from nexasalon_api.core.security import hash_opaque_token
+
+    session = SessionLocal()
+    try:
+        return session.execute(
+            text(f"SELECT {column} FROM refresh_tokens WHERE token_hash = :h"),
+            {"h": hash_opaque_token(raw_token)},
+        ).scalar()
+    finally:
+        session.close()
+
+
 # ---------------------------------------------------------------------
 # Login
 # ---------------------------------------------------------------------
@@ -357,39 +389,167 @@ def test_refresh_sem_cookie(client):
     assert resp.status_code == 401
 
 
-def test_refresh_reuso_de_token_ja_rotacionado_revoga_tudo(client, scenario):
-    _login(client, scenario.single_org_email, scenario.password)
-
-    first = client.post("/api/v1/auth/refresh", headers=_csrf_headers())
-    assert first.status_code == 200
-    cookie_after_first_refresh = client.cookies.get(settings.refresh_cookie_name)
-
-    # Simula reapresentar um refresh token JÁ rotacionado: chama o
-    # service diretamente com o valor bruto do cookie ANTES da primeira
-    # rotação (o TestClient só guarda o cookie ATUAL, não o histórico —
-    # por isso pegamos o valor antigo via um segundo client isolado que
-    # nunca chamou /refresh).
-    from nexasalon_api.services import auth as auth_service
-
+def test_refresh_reuso_fora_da_janela_de_graca_revoga_tudo(client, scenario):
+    """Reuso de um token JÁ rotacionado, mas FORA da janela de graça
+    (`refresh_token_reuse_grace_seconds`, 10s por padrão) continua
+    sendo tratado como roubo real: revoga TODA a sessão do usuário,
+    igual ao comportamento de sempre. A janela de graça (próximo teste)
+    só perdoa reuso QUASE imediato — nunca este caso."""
     # refaz o login noutro client só pra capturar o refresh_token bruto
     # (setado como cookie) antes de qualquer rotação
     client2 = TestClient(app)
-    body2 = client2.post(
+    client2.post(
         "/api/v1/auth/login", json={"email": scenario.single_org_email, "password": scenario.password}
-    ).json()
+    )
+    old_raw_refresh = client2.cookies.get(settings.refresh_cookie_name)
+    client2.post("/api/v1/auth/refresh", headers=_csrf_headers())  # rotaciona -> old_raw_refresh fica revogado
+    new_raw_refresh = client2.cookies.get(settings.refresh_cookie_name)
+
+    # Empurra o revoked_at de old_raw_refresh pra bem fora da janela de
+    # graça — simula reuso tardio, não uma corrida entre abas.
+    _backdate_refresh_token(old_raw_refresh, sql_delta="revoked_at = revoked_at - interval '1 minute'")
+
+    from nexasalon_api.core.exceptions import UnauthorizedError
+    from nexasalon_api.services import auth as auth_service
+
+    with pytest.raises(UnauthorizedError):
+        auth_service.refresh(old_raw_refresh)
+
+    # o token novo (emitido pela rotação) também foi revogado em cascata
+    with pytest.raises(UnauthorizedError):
+        auth_service.refresh(new_raw_refresh)
+
+
+def test_refresh_reuso_dentro_da_janela_de_graca_e_corrida_benigna(client, scenario):
+    """Reuso QUASE imediato (dentro de `refresh_token_reuse_grace_seconds`)
+    de um token já rotacionado é tratado como corrida benigna do
+    próprio usuário/navegador (duas abas/requisições disputando o mesmo
+    token, sem mutex/lock no frontend, ou em navegador sem suporte a
+    `navigator.locks`) — NUNCA como roubo. Em vez de revogar tudo, a
+    sessão é rotacionada de novo a partir da ponta válida da cadeia,
+    devolvendo um par de tokens novo e funcional pro "perdedor" da
+    corrida. Esta é a causa raiz do logout prematuro relatado pelas
+    recepcionistas, corrigida aqui como última camada de defesa (além
+    do mutex/lock do frontend)."""
+    client2 = TestClient(app)
+    client2.post(
+        "/api/v1/auth/login", json={"email": scenario.single_org_email, "password": scenario.password}
+    )
     old_raw_refresh = client2.cookies.get(settings.refresh_cookie_name)
     client2.post("/api/v1/auth/refresh", headers=_csrf_headers())  # rotaciona -> old_raw_refresh fica revogado
 
-    import pytest as _pytest
+    from nexasalon_api.services import auth as auth_service
+
+    # Reapresenta o token já rotacionado IMEDIATAMENTE (sem backdating)
+    # — ainda dentro da janela de graça padrão (10s).
+    result = auth_service.refresh(old_raw_refresh)
+
+    assert result.access_token
+    assert result.refresh_token
+    assert result.refresh_token != old_raw_refresh
+
+    # A sessão devolvida pra corrida benigna continua utilizável de
+    # verdade — não é um token "morto" nem revogado em cascata.
+    second = auth_service.refresh(result.refresh_token)
+    assert second.access_token
+
+
+def test_refresh_apos_12h_de_inatividade_e_negado(client, scenario):
+    _login(client, scenario.single_org_email, scenario.password)
+    raw_refresh = client.cookies.get(settings.refresh_cookie_name)
+    _backdate_refresh_token(raw_refresh, sql_delta="last_used_at = last_used_at - interval '13 hours'")
+
     from nexasalon_api.core.exceptions import UnauthorizedError
+    from nexasalon_api.services import auth as auth_service
 
-    with _pytest.raises(UnauthorizedError):
-        auth_service.refresh(old_raw_refresh)
+    with pytest.raises(UnauthorizedError):
+        auth_service.refresh(raw_refresh)
 
-    new_raw_refresh = client2.cookies.get(settings.refresh_cookie_name)
-    # o token novo (emitido pela rotação) também foi revogado em cascata
-    with _pytest.raises(UnauthorizedError):
-        auth_service.refresh(new_raw_refresh)
+
+def test_refresh_dentro_de_12h_de_inatividade_continua_funcionando(client, scenario):
+    """Regressão: não confundir "dentro do limite" com "fora" — 11h de
+    ociosidade (menos que as 12h permitidas) ainda deve renovar
+    normalmente."""
+    _login(client, scenario.single_org_email, scenario.password)
+    raw_refresh = client.cookies.get(settings.refresh_cookie_name)
+    _backdate_refresh_token(raw_refresh, sql_delta="last_used_at = last_used_at - interval '11 hours'")
+
+    from nexasalon_api.services import auth as auth_service
+
+    result = auth_service.refresh(raw_refresh)
+    assert result.access_token
+
+
+def test_refresh_apos_7_dias_absolutos_e_negado_mesmo_com_uso_continuo(client, scenario):
+    """Limite ABSOLUTO (7 dias desde `session_started_at`) nunca é
+    estendido por rotações frequentes — ao contrário do comportamento
+    antigo ("30 dias a partir do ÚLTIMO refresh"), que na prática nunca
+    expirava enquanto a pessoa continuasse usando o sistema."""
+    _login(client, scenario.single_org_email, scenario.password)
+    raw_refresh = client.cookies.get(settings.refresh_cookie_name)
+    # Simula a PRÓPRIA sessão tendo começado há 8 dias, mas usada
+    # agorinha mesmo (last_used_at intocado) — isola do limite de
+    # inatividade, prova que é o limite ABSOLUTO que está derrubando.
+    _backdate_refresh_token(
+        raw_refresh,
+        sql_delta=(
+            "session_started_at = session_started_at - interval '8 days', "
+            "expires_at = expires_at - interval '8 days'"
+        ),
+    )
+
+    from nexasalon_api.core.exceptions import UnauthorizedError
+    from nexasalon_api.services import auth as auth_service
+
+    with pytest.raises(UnauthorizedError):
+        auth_service.refresh(raw_refresh)
+
+
+def test_session_started_at_nunca_muda_entre_rotacoes(client, scenario):
+    """`session_started_at` é gravado uma vez no login e propagado SEM
+    ALTERAÇÃO por toda a cadeia de rotações — é o que sustenta o limite
+    absoluto de verdade (ver teste anterior)."""
+    _login(client, scenario.single_org_email, scenario.password)
+    raw_refresh = client.cookies.get(settings.refresh_cookie_name)
+    original_started_at = _refresh_token_column(raw_refresh, "session_started_at")
+    assert original_started_at is not None
+
+    client.post("/api/v1/auth/refresh", headers=_csrf_headers())
+    rotated_once = client.cookies.get(settings.refresh_cookie_name)
+    assert _refresh_token_column(rotated_once, "session_started_at") == original_started_at
+
+    client.post("/api/v1/auth/refresh", headers=_csrf_headers())
+    rotated_twice = client.cookies.get(settings.refresh_cookie_name)
+    assert _refresh_token_column(rotated_twice, "session_started_at") == original_started_at
+
+
+def test_desativar_membership_revoga_refresh_token_imediatamente(client, scenario):
+    """`/users/{id}/deactivate` agora chama `revoke_all_for_user`
+    explicitamente — a sessão de refresh da recepcionista desativada
+    morre na hora, mesmo que ela não tenha feito nenhuma chamada desde
+    a desativação (antes, o corte dependia só da revalidação implícita
+    na PRÓXIMA request/refresh — quase imediato, mas nunca uma ação
+    própria e auditável)."""
+    owner_body = _login(client, scenario.single_org_email, scenario.password)
+    owner_access = owner_body["tokens"]["access_token"]
+
+    recep_client = TestClient(app)
+    recep_client.post(
+        "/api/v1/auth/login", json={"email": scenario.recep_email, "password": scenario.password}
+    )
+    recep_raw_refresh = recep_client.cookies.get(settings.refresh_cookie_name)
+
+    deactivate_resp = client.patch(
+        f"/api/v1/users/{scenario.recep_membership_id}/deactivate",
+        headers=_auth_headers(owner_access),
+    )
+    assert deactivate_resp.status_code == 200, deactivate_resp.text
+
+    from nexasalon_api.core.exceptions import UnauthorizedError
+    from nexasalon_api.services import auth as auth_service
+
+    with pytest.raises(UnauthorizedError):
+        auth_service.refresh(recep_raw_refresh)
 
 
 def test_refresh_token_invalido_via_service(scenario):
