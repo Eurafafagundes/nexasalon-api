@@ -49,8 +49,10 @@ jobs:
           pytest tests/test_auth.py -v > pytest_auth.log 2>&1
           code=$?
           if [ "$code" -ne 0 ]; then
-            encoded=$(tail -n 80 pytest_auth.log | sed ':a;N;$!ba;s/\n/%0A/g')
-            echo "::error title=pytest tests/test_auth.py falhou (exit $code)::$encoded"
+            summary=$(grep -E "^(FAILED|ERROR) " pytest_auth.log | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=Lista completa de falhas - test_auth.py::$summary"
+            encoded=$(tail -n 100 pytest_auth.log | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=pytest tests/test_auth.py falhou (exit $code) - ultimas 100 linhas::$encoded"
           fi
           exit $code
 
@@ -60,8 +62,10 @@ jobs:
           pytest tests/test_migration_0063_refresh_token_session_lifetime.py -v > pytest_migration.log 2>&1
           code=$?
           if [ "$code" -ne 0 ]; then
-            encoded=$(tail -n 80 pytest_migration.log | sed ':a;N;$!ba;s/\n/%0A/g')
-            echo "::error title=pytest migration 0063 falhou (exit $code)::$encoded"
+            summary=$(grep -E "^(FAILED|ERROR) " pytest_migration.log | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=Lista completa de falhas - migration 0063::$summary"
+            encoded=$(tail -n 100 pytest_migration.log | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error title=pytest migration 0063 falhou (exit $code) - ultimas 100 linhas::$encoded"
           fi
           exit $code
 
